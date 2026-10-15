@@ -30,6 +30,8 @@ pub(crate) enum Routed {
         repo: Option<super::cloud::CloudRepo>,
         /// `agent` or `plan` when this handoff sends a task. Ask and other pager modes are omitted.
         mode: Option<String>,
+        /// Images from the prompt. Only a send carries them.
+        images: Vec<super::cloud::CloudImage>,
         /// `session/prompt` id to answer when the cloud handoff is done.
         prompt_rpc_id: Option<Value>,
         prompt_id: Option<String>,
@@ -223,10 +225,12 @@ impl CursorAdapter {
                     .and_then(|session| session.cloud_agent_id.clone());
                 let mut cloud_handoff = false;
                 let mut cloud_task = None;
+                let mut cloud_images = Vec::new();
                 if let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) {
                     cloud_handoff = protocol::prompt_is_cloud_handoff(params);
                     if cloud_handoff {
                         cloud_task = protocol::cloud_task_text(params);
+                        cloud_images = super::cloud::images_from_prompt(params.get("prompt"));
                         if let Some(task) = cloud_task.as_mut() {
                             let control = task.is_empty()
                                 || task.eq_ignore_ascii_case("status")
@@ -252,7 +256,15 @@ impl CursorAdapter {
                     let Some(session_id) = session_id.clone() else {
                         return end.into_iter().map(Routed::ToClient).collect();
                     };
-                    let request = cloud_request(cloud_task);
+                    let bare = cloud_task.as_ref().is_none_or(|task| task.is_empty());
+                    let mut request = cloud_request(cloud_task);
+                    if matches!(request, CloudRequest::Refresh) && bare && !cloud_images.is_empty()
+                    {
+                        request = CloudRequest::Send("Look at the attached image.".to_owned());
+                    }
+                    if !matches!(request, CloudRequest::Send(_)) {
+                        cloud_images.clear();
+                    }
                     if matches!(request, CloudRequest::Refresh | CloudRequest::Cancel)
                         && cloud_agent_id.is_none()
                     {
@@ -270,6 +282,7 @@ impl CursorAdapter {
                         session_id: session_id.clone(),
                         repo: self.cloud_repo(cloud_agent_id.as_deref(), &session_id),
                         mode: self.cloud_mode(&session_id, &request),
+                        images: cloud_images,
                         agent_id: cloud_agent_id,
                         request,
                         prompt_rpc_id: id,

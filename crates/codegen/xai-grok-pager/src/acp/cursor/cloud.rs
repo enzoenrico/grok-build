@@ -282,7 +282,91 @@ pub(crate) struct CloudRepo {
     pub starting_ref: Option<String>,
 }
 
-pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>, mode: Option<&str>) -> String {
+/// One image on a cloud prompt. The API takes either bytes or an http(s) URL, at most five.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CloudImage {
+    pub data: String,
+    pub mime_type: String,
+    pub url: Option<String>,
+}
+
+const CLOUD_IMAGE_LIMIT: usize = 5;
+const MAX_CLOUD_IMAGE_BYTES: usize = 15 * 1024 * 1024;
+
+pub(crate) fn images_from_prompt(prompt: Option<&Value>) -> Vec<CloudImage> {
+    let Some(blocks) = prompt.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut images = Vec::new();
+    for block in blocks {
+        if images.len() == CLOUD_IMAGE_LIMIT {
+            break;
+        }
+        if block.get("type").and_then(Value::as_str) != Some("image") {
+            continue;
+        }
+        if let Some(image) = cloud_image(block) {
+            images.push(image);
+        }
+    }
+    images
+}
+
+fn cloud_image(block: &Value) -> Option<CloudImage> {
+    let mime = block
+        .get("mimeType")
+        .or_else(|| block.get("mime_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let data = block.get("data").and_then(Value::as_str).unwrap_or("");
+    let url = http_image_url(block.get("uri").and_then(Value::as_str));
+    if supported_cloud_mime(mime)
+        && !data.is_empty()
+        && base64_payload_bytes(data) <= MAX_CLOUD_IMAGE_BYTES
+    {
+        return Some(CloudImage {
+            data: data.to_owned(),
+            mime_type: mime.to_owned(),
+            url: None,
+        });
+    }
+    url.map(|url| CloudImage {
+        data: String::new(),
+        mime_type: String::new(),
+        url: Some(url),
+    })
+}
+
+fn supported_cloud_mime(mime: &str) -> bool {
+    matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp")
+}
+
+fn http_image_url(uri: Option<&str>) -> Option<String> {
+    let uri = uri?.trim();
+    if uri.starts_with("https://") || uri.starts_with("http://") {
+        Some(uri.to_owned())
+    } else {
+        None
+    }
+}
+
+fn base64_payload_bytes(data: &str) -> usize {
+    data.trim_end_matches('=').len().saturating_mul(3) / 4
+}
+
+fn image_json(image: &CloudImage) -> Value {
+    match &image.url {
+        Some(url) if image.data.is_empty() => json!({ "url": url }),
+        _ => json!({ "data": image.data, "mimeType": image.mime_type }),
+    }
+}
+
+pub(crate) fn create_body(
+    text: &str,
+    repo: Option<&CloudRepo>,
+    mode: Option<&str>,
+    images: &[CloudImage],
+) -> String {
     let mut body = json!({ "prompt": { "text": text } });
     if let Some(repo) = repo {
         let mut entry = json!({ "url": repo.url });
@@ -292,6 +376,7 @@ pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>, mode: Option<&st
         body["repos"] = json!([entry]);
     }
     attach_cloud_mode(&mut body, mode);
+    attach_images(&mut body, images);
     body.to_string()
 }
 
@@ -301,6 +386,19 @@ fn attach_cloud_mode(body: &mut Value, mode: Option<&str>) {
     {
         body["mode"] = json!(mode);
     }
+}
+
+fn attach_images(body: &mut Value, images: &[CloudImage]) {
+    if images.is_empty() {
+        return;
+    }
+    let Some(prompt) = body.get_mut("prompt").and_then(Value::as_object_mut) else {
+        return;
+    };
+    prompt.insert(
+        "images".to_owned(),
+        Value::Array(images.iter().map(image_json).collect()),
+    );
 }
 
 pub(crate) fn normalize_git_remote(remote: &str) -> Option<String> {
@@ -391,9 +489,10 @@ fn git_output(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
     }
 }
 
-pub(crate) fn follow_up_body(text: &str, mode: Option<&str>) -> String {
+pub(crate) fn follow_up_body(text: &str, mode: Option<&str>, images: &[CloudImage]) -> String {
     let mut body = json!({ "prompt": { "text": text } });
     attach_cloud_mode(&mut body, mode);
+    attach_images(&mut body, images);
     body.to_string()
 }
 
@@ -571,15 +670,16 @@ pub(crate) fn dispatch(
     text: &str,
     repo: Option<&CloudRepo>,
     mode: Option<&str>,
+    images: &[CloudImage],
 ) -> Result<CloudAgent, String> {
     let (url, body) = match agent_id {
         Some(id) => (
             format!("{api_base}/v1/agents/{id}/runs"),
-            follow_up_body(text, mode),
+            follow_up_body(text, mode, images),
         ),
         None => (
             format!("{api_base}/v1/agents"),
-            create_body(text, repo, mode),
+            create_body(text, repo, mode, images),
         ),
     };
     let raw = match request("POST", &url, auth, Some(&body)) {
@@ -971,7 +1071,7 @@ mod tests {
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module", None, None).unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module", None, None, &[]).unwrap();
         assert_eq!(created.id, "bc-1");
         assert_eq!(
             created.url.as_deref(),
@@ -979,7 +1079,7 @@ mod tests {
         );
         assert_eq!(created.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(created.result.as_deref(), Some("Refactored auth."));
-        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None).unwrap();
+        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None, &[]).unwrap();
         assert_eq!(follow.id, "bc-1");
         assert_eq!(follow.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(follow.result.as_deref(), Some("Added the tests."));
@@ -1084,7 +1184,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme", None, None).unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme", None, None, &[]).unwrap();
         assert_eq!(created.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(created.result, None);
         assert!(!run_is_terminal(created.run_status.as_deref()));
@@ -1336,7 +1436,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None).unwrap();
+        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None, &[]).unwrap();
         assert_eq!(agent.id, "bc-1");
         assert_eq!(agent.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(
@@ -1430,6 +1530,7 @@ data: {}
             "refactor the auth module",
             None,
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(created.id, "bc-1");
@@ -1445,18 +1546,63 @@ data: {}
                 starting_ref: None,
             }),
             Some("plan"),
+            &[],
         ))
         .unwrap();
         assert_eq!(created["mode"], "plan");
         assert_eq!(created["prompt"]["text"], "draft it");
         assert_eq!(created["repos"][0]["url"], "https://github.com/acme/app");
-        let follow: Value = serde_json::from_str(&follow_up_body("ship it", Some("agent"))).unwrap();
+        let follow: Value =
+            serde_json::from_str(&follow_up_body("ship it", Some("agent"), &[])).unwrap();
         assert_eq!(follow["mode"], "agent");
         assert_eq!(follow["prompt"]["text"], "ship it");
-        let ask: Value = serde_json::from_str(&create_body("look", None, Some("ask"))).unwrap();
+        let ask: Value = serde_json::from_str(&create_body("look", None, Some("ask"), &[])).unwrap();
         assert!(ask.get("mode").is_none());
-        let plain: Value = serde_json::from_str(&follow_up_body("look", None)).unwrap();
+        let plain: Value = serde_json::from_str(&follow_up_body("look", None, &[])).unwrap();
         assert!(plain.get("mode").is_none());
+    }
+
+    #[test]
+    fn prompt_images_keep_five_supported_pictures() {
+        let with_url = images_from_prompt(Some(&json!([{
+            "type": "image",
+            "data": "abc",
+            "mimeType": "image/jpeg",
+            "uri": "https://example.com/a.jpg"
+        }])));
+        assert_eq!(with_url[0].data, "abc");
+        assert!(with_url[0].url.is_none());
+
+        let mut blocks = vec![
+            json!({"type": "image", "data": "abc", "mimeType": "image/png"}),
+            json!({"type": "image", "data": "zzz", "mimeType": "image/bmp"}),
+            json!({"type": "image", "uri": "https://example.com/shot.webp"}),
+            json!({"type": "image", "uri": "file:///tmp/shot.png"}),
+        ];
+        for _ in 0..4 {
+            blocks.push(json!({"type": "image", "data": "more", "mimeType": "image/gif"}));
+        }
+        let images = images_from_prompt(Some(&Value::Array(blocks)));
+        assert_eq!(images.len(), 5);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert_eq!(images[1].url.as_deref(), Some("https://example.com/shot.webp"));
+        assert_eq!(images[2].mime_type, "image/gif");
+
+        let body: Value =
+            serde_json::from_str(&create_body("fix it", None, None, &images[..2])).unwrap();
+        assert_eq!(body["prompt"]["images"][0]["data"], "abc");
+        assert_eq!(body["prompt"]["images"][0]["mimeType"], "image/png");
+        assert!(body["prompt"]["images"][0].get("url").is_none());
+        assert_eq!(body["prompt"]["images"][1]["url"], "https://example.com/shot.webp");
+        assert!(body["prompt"]["images"][1].get("data").is_none());
+
+        let huge = "A".repeat(MAX_CLOUD_IMAGE_BYTES / 3 * 4 + 16);
+        let dropped = images_from_prompt(Some(&json!([{
+            "type": "image",
+            "data": huge,
+            "mimeType": "image/png"
+        }])));
+        assert!(dropped.is_empty());
     }
 
     #[test]
@@ -1526,6 +1672,7 @@ data: {}
             "refactor the auth module",
             Some(&repo),
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(created.result.as_deref(), Some("on the repo"));

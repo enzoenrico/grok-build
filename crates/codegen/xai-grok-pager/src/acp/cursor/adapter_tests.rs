@@ -419,6 +419,7 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
         prompt_id,
         repo,
         mode,
+        images,
     } = &sent[0]
     else {
         panic!("expected a cloud handoff: {sent:?}");
@@ -430,6 +431,7 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
     assert_eq!(prompt_id, &None);
     assert!(repo.is_none());
     assert_eq!(mode, &None);
+    assert!(images.is_empty());
 
     adapter.note_cloud_agent("s1", "bc-123");
     let local = adapter.outbound(
@@ -922,4 +924,76 @@ fn cloud_handoff_sends_plan_mode_and_keeps_it_through_ask() {
         panic!("expected the mode update to reach the next task: {sent:?}");
     };
     assert_eq!(mode.as_deref(), Some("plan"));
+}
+
+#[test]
+fn cloud_handoff_sends_attached_images() {
+    let mut adapter = CursorAdapter::new(None, false);
+    let prompt = json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "s1",
+            "prompt": [
+                {"type": "text", "text": "& fix the button"},
+                {"type": "image", "data": "abc", "mimeType": "image/png"},
+                {"type": "image", "data": "zzz", "mimeType": "image/bmp"},
+                {"type": "image", "uri": "https://example.com/shot.webp"}
+            ]
+        }
+    });
+    let sent = adapter.outbound(&prompt.to_string());
+    let Routed::Cloud { request, images, .. } = &sent[0] else {
+        panic!("expected a cloud task with images: {sent:?}");
+    };
+    assert_eq!(request, &CloudRequest::Send("fix the button".to_owned()));
+    assert_eq!(images.len(), 2);
+    assert_eq!(images[0].data, "abc");
+    assert_eq!(images[0].mime_type, "image/png");
+    assert!(images[0].url.is_none());
+    assert_eq!(images[1].url.as_deref(), Some("https://example.com/shot.webp"));
+
+    let bare = json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "s1",
+            "prompt": [
+                {"type": "text", "text": "&"},
+                {"type": "image", "data": "abc", "mimeType": "image/gif"}
+            ]
+        }
+    });
+    let sent = adapter.outbound(&bare.to_string());
+    let Routed::Cloud { request, images, .. } = &sent[0] else {
+        panic!("expected the image to start a task: {sent:?}");
+    };
+    assert_eq!(
+        request,
+        &CloudRequest::Send("Look at the attached image.".to_owned())
+    );
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].mime_type, "image/gif");
+
+    adapter.note_cloud_agent("s1", "bc-1");
+    let status = json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "s1",
+            "prompt": [
+                {"type": "text", "text": "& status"},
+                {"type": "image", "data": "abc", "mimeType": "image/png"}
+            ]
+        }
+    });
+    let sent = adapter.outbound(&status.to_string());
+    let Routed::Cloud { request, images, .. } = &sent[0] else {
+        panic!("expected a status refresh: {sent:?}");
+    };
+    assert_eq!(request, &CloudRequest::Refresh);
+    assert!(images.is_empty());
 }
