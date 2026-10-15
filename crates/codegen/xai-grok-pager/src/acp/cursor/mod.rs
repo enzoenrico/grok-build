@@ -48,6 +48,10 @@ fn cloud_handoff_notice(
                 text.push('\n');
                 text.push_str(pr);
             }
+            if let Some(branch) = &agent.branch {
+                text.push('\n');
+                text.push_str(branch);
+            }
             (text, Some(agent))
         }
         Err(err) => (format!("Cloud agent handoff failed. {err}\n"), None),

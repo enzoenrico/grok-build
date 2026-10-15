@@ -22,6 +22,7 @@ pub(crate) struct CloudAgent {
     pub run_status: Option<String>,
     pub result: Option<String>,
     pub pr_url: Option<String>,
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +33,9 @@ pub(crate) enum CloudEvent {
         status: String,
         text: String,
         pr_url: Option<String>,
+        branch: Option<String>,
     },
+    Thinking(String),
     Error { message: String },
 }
 
@@ -51,6 +54,7 @@ pub(crate) fn event_text(event: &CloudEvent, saw_assistant: bool) -> Option<Stri
             status,
             text,
             pr_url,
+            branch,
         } => {
             let mut msg = format!("Run {status}.\n");
             if !saw_assistant && !text.is_empty() {
@@ -63,8 +67,13 @@ pub(crate) fn event_text(event: &CloudEvent, saw_assistant: bool) -> Option<Stri
                 msg.push_str(url);
                 msg.push('\n');
             }
+            if let Some(branch) = branch {
+                msg.push_str(branch);
+                msg.push('\n');
+            }
             Some(msg)
         }
+        CloudEvent::Thinking(text) => Some(text.clone()),
         CloudEvent::Error { message } => Some(format!("Cloud agent run failed. {message}\n")),
     }
 }
@@ -415,6 +424,7 @@ pub(crate) fn parse_cloud_response(body: &str) -> Result<CloudAgent, String> {
         run_status,
         result,
         pr_url: pr_url(&value),
+        branch: git_place(&value),
     })
 }
 
@@ -429,6 +439,27 @@ fn pr_url(value: &Value) -> Option<String> {
         {
             return Some(url.to_owned());
         }
+    }
+    None
+}
+
+fn git_place(value: &Value) -> Option<String> {
+    for pointer in ["/run/git/branches", "/git/branches"] {
+        let Some(branches) = value.pointer(pointer).and_then(Value::as_array) else {
+            continue;
+        };
+        let Some(branch) = branches.first() else {
+            continue;
+        };
+        let name = branch.get("branch").and_then(Value::as_str).unwrap_or("");
+        let repo = branch.get("repoUrl").and_then(Value::as_str).unwrap_or("");
+        let line = match (repo.is_empty(), name.is_empty()) {
+            (true, true) => continue,
+            (false, true) => repo.to_owned(),
+            (true, false) => name.to_owned(),
+            (false, false) => format!("{repo} {name}"),
+        };
+        return Some(line);
     }
     None
 }
@@ -476,6 +507,9 @@ fn refresh(api_base: &str, auth: &CloudAuth, agent: &mut CloudAgent) -> Result<(
     if agent.pr_url.is_none() {
         agent.pr_url = pr_url(&run);
     }
+    if agent.branch.is_none() {
+        agent.branch = git_place(&run);
+    }
     Ok(())
 }
 
@@ -491,6 +525,7 @@ pub(crate) fn refresh_existing(
         run_status: None,
         result: None,
         pr_url: None,
+        branch: None,
     };
     refresh(api_base, auth, &mut agent)?;
     Ok(agent)
@@ -636,6 +671,11 @@ fn decode_event(event: &str, data: &str) -> Option<CloudEvent> {
                 None
             }
         }
+        "thinking" => value
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| CloudEvent::Thinking(text.to_owned())),
         "result" => Some(CloudEvent::Result {
             status: value
                 .get("status")
@@ -648,6 +688,7 @@ fn decode_event(event: &str, data: &str) -> Option<CloudEvent> {
                 .unwrap_or("")
                 .to_owned(),
             pr_url: pr_url(&value),
+            branch: git_place(&value),
         }),
         "error" => Some(CloudEvent::Error {
             message: value
@@ -971,6 +1012,7 @@ data: {}
                     status: "FINISHED".to_owned(),
                     text: "Added README.md.".to_owned(),
                     pr_url: Some("https://github.com/acme/app/pull/123".to_owned()),
+                    branch: None,
                 },
             ]
         );
@@ -992,6 +1034,28 @@ data: {}
                 "Tool read_file\n".to_owned(),
                 "Run FINISHED.\nhttps://github.com/acme/app/pull/123\n".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn a_stream_result_names_the_pushed_branch_and_keeps_thinking() {
+        let thinking = super::decode_event("thinking", r#"{"text":"Looking at the README."}"#).unwrap();
+        let result = super::decode_event(
+            "result",
+            r#"{"status":"FINISHED","text":"Added README.md","git":{"branches":[{"repoUrl":"github.com/your-org/your-repo","branch":"cursor/add-readme-a1b2"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event_text(&thinking, false).as_deref(),
+            Some("Looking at the README.")
+        );
+        assert_eq!(
+            event_text(&result, false).as_deref(),
+            Some("Run FINISHED.\nAdded README.md\ngithub.com/your-org/your-repo cursor/add-readme-a1b2\n")
+        );
+        assert_eq!(
+            event_text(&result, true).as_deref(),
+            Some("Run FINISHED.\ngithub.com/your-org/your-repo cursor/add-readme-a1b2\n")
         );
     }
 
