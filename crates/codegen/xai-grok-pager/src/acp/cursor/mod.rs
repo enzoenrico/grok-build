@@ -10,7 +10,6 @@ pub use startup::materialize_startup;
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -23,54 +22,9 @@ use super::leader_bridge::bridge_channels;
 use super::spawn::{SpawnedAgent, spawn_runtime_thread};
 use adapter::{CursorAdapter, Routed};
 
-pub const BACKEND_ENV: &str = "GROK_BACKEND";
 pub const CURSOR_AGENT_BIN_ENV: &str = "GROK_CURSOR_AGENT_BIN";
 const DEFAULT_CURSOR_AGENT_BIN: &str = "cursor-agent";
 const CHILD_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// Which agent runtime serves the pager.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum BackendKind {
-    /// The embedded grok shell (or a grok leader).
-    #[default]
-    Grok,
-    /// `cursor-agent acp` as a subprocess.
-    Cursor,
-}
-
-impl BackendKind {
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "grok" | "shell" => Some(Self::Grok),
-            "cursor" | "cursor-agent" => Some(Self::Cursor),
-            _ => None,
-        }
-    }
-
-    pub fn is_cursor(self) -> bool {
-        self == Self::Cursor
-    }
-}
-
-/// Precedence: `--backend`, then `GROK_BACKEND`, then `[cli] backend`, then grok.
-pub fn resolve_backend(cli: Option<BackendKind>, raw_config: &toml::Value) -> BackendKind {
-    if let Some(kind) = cli {
-        return kind;
-    }
-    if let Some(kind) = std::env::var(BACKEND_ENV)
-        .ok()
-        .as_deref()
-        .and_then(BackendKind::parse)
-    {
-        return kind;
-    }
-    raw_config
-        .get("cli")
-        .and_then(|cli| cli.get("backend"))
-        .and_then(toml::Value::as_str)
-        .and_then(BackendKind::parse)
-        .unwrap_or_default()
-}
 
 /// How to launch the Cursor agent (`<program> <args...> acp`) and how to talk to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,40 +37,19 @@ pub struct CursorAgentCommand {
     pub forward_mcp_servers: bool,
 }
 
-static CURSOR_BACKEND_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// Whether this process is serving the pager through `cursor-agent`.
-pub fn is_active() -> bool {
-    CURSOR_BACKEND_ACTIVE.load(Ordering::Relaxed)
-}
-
 /// Persist the pager's default-model choice as `[cursor] model`; an empty id clears it.
 pub fn persist_default_model(model_id: &str) -> Result<()> {
-    let path =
-        xai_grok_shell::util::grok_home::grok_home().join(xai_grok_config::USER_CONFIG_FILENAME);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc = content
-        .parse::<toml_edit::DocumentMut>()
-        .with_context(|| format!("parse {}", path.display()))?;
-    let section = doc
-        .entry("cursor")
-        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
-        .as_table_mut()
-        .context("[cursor] in config.toml is not a table")?;
-    if model_id.is_empty() {
-        section.remove("model");
+    let value = if model_id.is_empty() {
+        None
     } else {
-        section.insert("model", toml_edit::value(model_id));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, doc.to_string()).with_context(|| format!("write {}", path.display()))
+        Some(toml_edit::Value::from(model_id))
+    };
+    crate::config_toml_edit::set_config_key("cursor", "model", value).map_err(anyhow::Error::from)
 }
 
 impl CursorAgentCommand {
-    /// `GROK_CURSOR_AGENT_BIN` or `[cursor] bin` pick the binary; `[cursor] args` are passed before `acp`.
-    pub fn from_config(raw_config: &toml::Value, yolo: bool) -> Self {
+    /// `bin_env` (`GROK_CURSOR_AGENT_BIN`) or `[cursor] bin` pick the binary. `[cursor] args` stay as written.
+    pub fn from_config(raw_config: &toml::Value, bin_env: Option<std::ffi::OsString>) -> Self {
         let section = raw_config.get("cursor");
         let default_model = section
             .and_then(|s| s.get("model"))
@@ -128,7 +61,7 @@ impl CursorAgentCommand {
             .and_then(|s| s.get("forward_mcp_servers"))
             .and_then(toml::Value::as_bool)
             .unwrap_or(false);
-        let program = std::env::var_os(CURSOR_AGENT_BIN_ENV)
+        let program = bin_env
             .map(PathBuf::from)
             .or_else(|| {
                 section
@@ -137,7 +70,7 @@ impl CursorAgentCommand {
                     .map(PathBuf::from)
             })
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CURSOR_AGENT_BIN));
-        let mut args: Vec<String> = section
+        let args = section
             .and_then(|s| s.get("args"))
             .and_then(toml::Value::as_array)
             .map(|a| {
@@ -147,16 +80,32 @@ impl CursorAgentCommand {
                     .collect()
             })
             .unwrap_or_default();
-        if yolo && !args.iter().any(|a| matches!(a.as_str(), "--yolo" | "--force" | "-f")) {
-            args.push("--yolo".to_owned());
-        }
-        args.push("acp".to_owned());
         Self {
             program,
             args,
             default_model,
             forward_mcp_servers,
         }
+    }
+
+    /// Program, configured args, `--yolo` when asked and not already forced, then `acp`.
+    pub fn tokio_command(&self, yolo: bool) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.program);
+        cmd.args(&self.args);
+        if yolo
+            && !self
+                .args
+                .iter()
+                .any(|a| matches!(a.as_str(), "--yolo" | "--force" | "-f"))
+        {
+            cmd.arg("--yolo");
+        }
+        cmd.arg("acp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        xai_tty_utils::detach_command(&mut cmd);
+        cmd
     }
 }
 
@@ -168,6 +117,7 @@ pub async fn spawn_cursor_agent(
     command: CursorAgentCommand,
     app_cancel: &CancellationToken,
     auth_manager: Arc<xai_grok_login::AuthManager>,
+    yolo: bool,
 ) -> Result<SpawnedAgent> {
     let agent_cancel = app_cancel.child_token();
     let (to_agent_tx, to_agent_rx) = mpsc::unbounded_channel::<String>();
@@ -183,6 +133,7 @@ pub async fn spawn_cursor_agent(
     let (spawned_tx, spawned_rx) = oneshot::channel();
     let io = CursorIo {
         command,
+        yolo,
         to_agent_rx,
         to_client_tx,
         cancel: agent_cancel.clone(),
@@ -214,7 +165,6 @@ pub async fn spawn_cursor_agent(
         }
     }
 
-    CURSOR_BACKEND_ACTIVE.store(true, Ordering::Relaxed);
     Ok(SpawnedAgent {
         thread_handle,
         channel: bridge.channel,
@@ -225,6 +175,7 @@ pub async fn spawn_cursor_agent(
 
 struct CursorIo {
     command: CursorAgentCommand,
+    yolo: bool,
     to_agent_rx: mpsc::UnboundedReceiver<String>,
     to_client_tx: mpsc::UnboundedSender<String>,
     cancel: CancellationToken,
@@ -235,19 +186,15 @@ impl CursorIo {
     async fn run(self, spawned_tx: oneshot::Sender<Result<()>>) -> Result<()> {
         let CursorIo {
             command,
+            yolo,
             mut to_agent_rx,
             to_client_tx,
             cancel,
             app_cancel,
         } = self;
 
-        let mut cmd = tokio::process::Command::new(&command.program);
-        cmd.args(&command.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        xai_tty_utils::detach_command(&mut cmd);
+        let mut cmd = command.tokio_command(yolo);
+        cmd.stderr(Stdio::piped());
         let mut child = match cmd.spawn().with_context(|| {
             format!(
                 "failed to start the Cursor agent ({}); install it with `curl https://cursor.com/install -fsS | bash` \
@@ -374,46 +321,56 @@ impl CursorIo {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
 
-    fn config(toml: &str) -> toml::Value {
-        toml::from_str(toml).unwrap()
+    fn config(toml_text: &str) -> toml::Value {
+        toml::from_str(toml_text).unwrap()
+    }
+
+    fn argv(cmd: &CursorAgentCommand, yolo: bool) -> Vec<String> {
+        cmd.tokio_command(yolo)
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
-    fn cli_flag_beats_config() {
-        let cfg = config("[cli]\nbackend = \"cursor\"");
-        assert_eq!(resolve_backend(Some(BackendKind::Grok), &cfg), BackendKind::Grok);
-    }
-
-    #[test]
-    fn config_selects_cursor() {
-        if std::env::var_os(BACKEND_ENV).is_some() {
-            return;
-        }
-        let cfg = config("[cli]\nbackend = \"cursor\"");
-        assert_eq!(resolve_backend(None, &cfg), BackendKind::Cursor);
-        assert_eq!(resolve_backend(None, &config("")), BackendKind::Grok);
-    }
-
-    #[test]
-    fn command_uses_config_args_and_appends_acp() {
-        if std::env::var_os(CURSOR_AGENT_BIN_ENV).is_some() {
-            return;
-        }
+    fn command_reads_config_and_bin_env() {
         let cfg = config(
             "[cursor]\nbin = \"/opt/agent\"\nargs = [\"--trust\"]\nmodel = \"gpt-5.5\"\nforward_mcp_servers = true",
         );
-        let cmd = CursorAgentCommand::from_config(&cfg, true);
+        let cmd = CursorAgentCommand::from_config(&cfg, None);
         assert_eq!(cmd.program, PathBuf::from("/opt/agent"));
-        assert_eq!(cmd.args, vec!["--trust", "--yolo", "acp"]);
+        assert_eq!(cmd.args, vec!["--trust"]);
         assert_eq!(cmd.default_model.as_deref(), Some("gpt-5.5"));
         assert!(cmd.forward_mcp_servers);
 
-        let cmd = CursorAgentCommand::from_config(&config(""), false);
+        let from_env = CursorAgentCommand::from_config(&cfg, Some(OsString::from("/env/agent")));
+        assert_eq!(from_env.program, PathBuf::from("/env/agent"));
+        assert_eq!(from_env.args, vec!["--trust"]);
+
+        let cmd = CursorAgentCommand::from_config(&config(""), None);
         assert_eq!(cmd.program, PathBuf::from(DEFAULT_CURSOR_AGENT_BIN));
-        assert_eq!(cmd.args, vec!["acp"]);
+        assert!(cmd.args.is_empty());
         assert_eq!(cmd.default_model, None);
         assert!(!cmd.forward_mcp_servers);
+    }
+
+    #[test]
+    fn tokio_command_appends_yolo_and_acp() {
+        let cmd =
+            CursorAgentCommand::from_config(&config("[cursor]\nargs = [\"--trust\"]\n"), None);
+        assert_eq!(argv(&cmd, true), ["--trust", "--yolo", "acp"]);
+        assert_eq!(argv(&cmd, false), ["--trust", "acp"]);
+
+        let forced =
+            CursorAgentCommand::from_config(&config("[cursor]\nargs = [\"--force\"]\n"), None);
+        assert_eq!(argv(&forced, true), ["--force", "acp"]);
+
+        let already = CursorAgentCommand::from_config(&config("[cursor]\nargs = [\"-f\"]\n"), None);
+        assert_eq!(argv(&already, true), ["-f", "acp"]);
     }
 }

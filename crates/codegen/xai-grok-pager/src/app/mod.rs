@@ -801,14 +801,14 @@ pub async fn run(
     );
     let prefetch_elapsed = startup_start.elapsed();
     let requested_confinement = xai_grok_sandbox::requested_confinement_profile();
-    let backend = crate::acp::cursor::resolve_backend(args.backend, &raw_config);
+    let backend = crate::acp::backend::AgentBackend::resolve(args.backend, &raw_config);
     let LeaderMode {
         use_leader,
         policy_disable_reason,
         disabled_by_confinement,
     } = resolve_leader_mode(
         args.leader,
-        args.no_leader || backend.is_cursor(),
+        args.no_leader || backend.kind().is_cursor(),
         &raw_config,
         remote_settings.as_ref(),
         true,
@@ -863,18 +863,20 @@ pub async fn run(
     let intent = args
         .session_startup_intent()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut materialize_ctx = session_startup::MaterializeCtx::from_pager_args(&args);
-    materialize_ctx.restore_progress_on_stdout =
-        std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let materialized = if backend.is_cursor() {
-        let cwd = std::env::current_dir()
-            .map_err(|e| anyhow::anyhow!("Failed to get cwd: {e}"))?
-            .to_string_lossy()
-            .into_owned();
-        let command = crate::acp::cursor::CursorAgentCommand::from_config(&raw_config, false);
-        crate::acp::cursor::materialize_startup(&command, intent, &cwd).await?
-    } else {
-        session_startup::materialize_startup(materialize_ctx, intent).await?
+    let materialized = match &backend {
+        crate::acp::backend::AgentBackend::Cursor(cmd) => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| anyhow::anyhow!("Failed to get cwd: {e}"))?
+                .to_string_lossy()
+                .into_owned();
+            crate::acp::cursor::materialize_startup(cmd, intent, &cwd).await?
+        }
+        crate::acp::backend::AgentBackend::Grok => {
+            let mut materialize_ctx = session_startup::MaterializeCtx::from_pager_args(&args);
+            materialize_ctx.restore_progress_on_stdout =
+                std::io::IsTerminal::is_terminal(&std::io::stdout());
+            session_startup::materialize_startup(materialize_ctx, intent).await?
+        }
     };
     if args.chat()
         && let session_startup::MaterializedStartup::Resume { session_id, .. } = &materialized
@@ -977,6 +979,7 @@ pub async fn run(
         status_line: false,
         backend,
     };
+    let backend_kind = connect_flags.backend.kind();
     let mut config_watcher = crate::appearance::ConfigWatcher::start().await?;
     let alt_screen_config_mode = config_watcher.current().alt_screen;
     let term_ctx = crate::terminal::terminal_context();
@@ -1202,6 +1205,7 @@ pub async fn run(
         tracing_handle,
         &mut config_watcher,
         &effective_args,
+        backend_kind,
         session_cwd,
         remote_settings,
         term_state,

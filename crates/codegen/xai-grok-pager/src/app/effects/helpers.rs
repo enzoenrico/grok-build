@@ -500,6 +500,8 @@ pub(crate) struct SessionFlags {
     /// Startup resume target deferred to the worktree handler after missing local id/title resolution.
     /// Worktree failure messages append the no-match hint only when the failing target equals this value.
     pub resume_local_miss: Option<String>,
+    /// Resolved agent runtime. `default_model` writes `[cursor] model` when this is Cursor.
+    pub backend: crate::acp::backend::BackendKind,
 }
 impl SessionFlags {
     /// Resolve the agent profile name from the flags.
@@ -987,6 +989,7 @@ pub(super) async fn send_authenticate(
 pub(crate) async fn persist_setting(
     key: crate::settings::SettingKey,
     value: crate::settings::SettingValue,
+    backend: crate::acp::backend::BackendKind,
 ) -> Result<(), String> {
     use crate::settings::SettingValue;
     fn kind_mismatch(key: &str, expected: &str, got: &SettingValue) -> String {
@@ -1181,7 +1184,7 @@ pub(crate) async fn persist_setting(
             let SettingValue::String(s) = value else {
                 return Err(kind_mismatch("default_model", "String", &value));
             };
-            if crate::acp::cursor::is_active() {
+            if backend.is_cursor() {
                 return crate::acp::cursor::persist_default_model(&s).map_err(|e| format!("{e:#}"));
             }
             xai_grok_shell::util::config::set_default_model(s)

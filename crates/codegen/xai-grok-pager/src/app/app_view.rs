@@ -1026,6 +1026,8 @@ pub struct AppView {
     pub startup_warnings: Vec<crate::startup::StartupWarning>,
     /// Whether the user authenticated with an API key (shown in the version badge).
     pub is_api_key_auth: bool,
+    /// Resolved agent runtime. Settings persistence reads this instead of a process global.
+    pub backend: crate::acp::backend::BackendKind,
     /// Latest version string from a background update check.
     /// Set when a newer version is detected; rendered as a notification on the welcome screen.
     pub pending_update_version: Option<String>,
@@ -1552,6 +1554,7 @@ impl AppView {
             reconnect_pending: false,
             startup_warnings: Vec::new(),
             is_api_key_auth: false,
+            backend: crate::acp::backend::BackendKind::Grok,
             pending_update_version: None,
             foreign_resume_launch_generation: 0,
             foreign_resume_launch: None,

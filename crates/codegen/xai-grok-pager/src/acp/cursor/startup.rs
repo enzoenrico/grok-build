@@ -32,7 +32,9 @@ pub async fn materialize_startup(
     match intent {
         SessionStartupIntent::NewAuto => Ok(MaterializedStartup::NewAuto),
         SessionStartupIntent::NewWithId { .. } => {
-            anyhow::bail!("--session-id is not supported by the Cursor backend (Cursor assigns chat ids)")
+            anyhow::bail!(
+                "--session-id is not supported by the Cursor backend (Cursor assigns chat ids)"
+            )
         }
         SessionStartupIntent::ForkFrom { .. } => {
             anyhow::bail!("--fork-session is not supported by the Cursor backend")
@@ -49,9 +51,8 @@ pub async fn materialize_startup(
             let picked = match session_id.as_deref() {
                 Some(title) => pick_by_title(&sessions, title)
                     .with_context(|| format!("No Cursor chat titled '{title}' in {cwd}"))?,
-                None if most_recent_for_cwd => {
-                    most_recent(&sessions).with_context(|| format!("No Cursor chats found in {cwd}"))?
-                }
+                None if most_recent_for_cwd => most_recent(&sessions)
+                    .with_context(|| format!("No Cursor chats found in {cwd}"))?,
                 None => anyhow::bail!("nothing to resume"),
             };
             Ok(resume(picked.session_id.clone(), picked.title.clone()))
@@ -79,26 +80,30 @@ fn pick_by_title<'a>(sessions: &'a [CursorSession], title: &str) -> Option<&'a C
     let title = title.trim();
     sessions
         .iter()
-        .filter(|s| s.title.as_deref().is_some_and(|t| t.trim().eq_ignore_ascii_case(title)))
+        .filter(|s| {
+            s.title
+                .as_deref()
+                .is_some_and(|t| t.trim().eq_ignore_ascii_case(title))
+        })
         .max_by(|a, b| a.updated_at.cmp(&b.updated_at))
 }
 
 /// One-shot `cursor-agent acp` call: `initialize` then `session/list` for `cwd`.
-pub(crate) async fn list_sessions(command: &CursorAgentCommand, cwd: &str) -> Result<Vec<CursorSession>> {
+pub(crate) async fn list_sessions(
+    command: &CursorAgentCommand,
+    cwd: &str,
+) -> Result<Vec<CursorSession>> {
     tokio::time::timeout(LIST_TIMEOUT, list_sessions_inner(command, cwd))
         .await
         .context("timed out listing Cursor chats")?
 }
 
-async fn list_sessions_inner(command: &CursorAgentCommand, cwd: &str) -> Result<Vec<CursorSession>> {
-    let mut cmd = tokio::process::Command::new(&command.program);
-    cmd.args(&command.args)
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    xai_tty_utils::detach_command(&mut cmd);
+async fn list_sessions_inner(
+    command: &CursorAgentCommand,
+    cwd: &str,
+) -> Result<Vec<CursorSession>> {
+    let mut cmd = command.tokio_command(false);
+    cmd.current_dir(cwd).stderr(Stdio::null());
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to start {}", command.program.display()))?;

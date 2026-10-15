@@ -3,6 +3,7 @@
 //! This module spawns the agent process, initializes the protocol, authenticates, and provides the channel for communication.
 /// Shared plan-file size cap for the pager keep.
 pub(crate) const MAX_PLAN_FILE_BYTES: usize = 256 * 1024;
+pub mod backend;
 pub mod cursor;
 pub mod leader_bridge;
 pub mod meta;
@@ -174,7 +175,7 @@ pub struct ConnectFlags {
     /// Ignored when `default_yolo_mode` is true.
     pub default_auto_mode: bool,
     /// Agent runtime: the embedded grok shell, or `cursor-agent acp`.
-    pub backend: cursor::BackendKind,
+    pub backend: backend::AgentBackend,
 }
 /// Connect to an agent: spawn, initialize, authenticate.
 pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<AcpConnection> {
@@ -221,18 +222,10 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
         leader: LeaderMode::Standalone,
         interactivity: Interactivity::Interactive,
     });
-    let spawned = if flags.backend.is_cursor() {
-        let auth_manager = spawn::boot_auth_manager(
-            &xai_grok_shell::util::grok_home::grok_home(),
-            &agent_config,
-        );
-        let command =
-            cursor::CursorAgentCommand::from_config(&raw_config, flags.default_yolo_mode);
-        cursor::spawn_cursor_agent(command, cancel, auth_manager).await?
-    } else {
-        let memory_config = agent_config.memory_config.clone();
-        spawn::spawn_grok_shell(agent_config, cancel, memory_config).await?
-    };
+    let spawned = flags
+        .backend
+        .spawn(agent_config, cancel, flags.default_yolo_mode)
+        .await?;
     let auth_manager = spawned.auth_manager.clone();
     initialize_connection(AgentEndpoint::from(spawned), &flags, auth_manager).await
 }

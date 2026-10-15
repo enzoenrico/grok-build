@@ -2273,9 +2273,10 @@ pub(crate) fn execute(
                 );
         }
         Effect::PersistSetting { key, value, rollback_value } => {
+            let backend = session_flags.backend;
             tasks
                 .spawn(async move {
-                    match persist_setting(key, value.clone()).await {
+                    match persist_setting(key, value.clone(), backend).await {
                         Ok(()) => {
                             TaskResult::SettingPersisted {
                                 key,

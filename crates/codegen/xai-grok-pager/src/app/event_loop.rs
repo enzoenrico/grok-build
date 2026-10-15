@@ -1038,6 +1038,7 @@ pub(crate) async fn run(
     tracing_handle: crate::tracing::TracingHandle,
     config_watcher: &mut ConfigWatcher,
     args: &PagerArgs,
+    backend: crate::acp::backend::BackendKind,
     session_cwd: Option<std::path::PathBuf>,
     remote_settings: Option<xai_grok_shell::util::config::RemoteSettings>,
     mut term_state: TerminalState,
@@ -1060,6 +1061,7 @@ pub(crate) async fn run(
             terminal.backend_mut().writer_mut().escape_writer(),
         )
     };
+    app.backend = backend;
     app.pending_startup = Some(pending_startup);
     app.tracing_rx = Some(tracing_handle.rx);
     app.last_known_terminal_rows = crossterm::terminal::size().map(|(_, r)| r).unwrap_or(0);
@@ -3916,6 +3918,7 @@ pub(crate) fn session_flags_for_effects(
         screen_mode_label: Some(app.screen_mode.meta_label()),
         is_api_key_auth: app.is_api_key_auth,
         resume_local_miss: app.resume_local_miss.clone(),
+        backend: app.backend,
     }
 }
 /// Dispatch `action`, re-process `event` through the updated view, return one combined effect list.

@@ -760,7 +760,7 @@ pub struct PagerArgs {
     /// Agent backend: `grok` (default) or `cursor` (runs `cursor-agent acp`).
     /// Also settable via `GROK_BACKEND` or `[cli] backend` in config.toml.
     #[arg(long = "backend", value_enum, value_name = "BACKEND")]
-    pub backend: Option<crate::acp::cursor::BackendKind>,
+    pub backend: Option<crate::acp::backend::BackendKind>,
     /// Initial prompt for the interactive session, e.g. `grok "fix the bug"` or `grok --worktree=feat "create this feature"`.
     #[arg(
         value_name = "PROMPT",
