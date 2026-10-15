@@ -32,6 +32,8 @@ pub(crate) enum Routed {
         mode: Option<String>,
         /// Images from the prompt. Only a send carries them.
         images: Vec<super::cloud::CloudImage>,
+        /// Cursor model id for the first cloud create. Follow-ups omit it.
+        model: Option<String>,
         /// `session/prompt` id to answer when the cloud handoff is done.
         prompt_rpc_id: Option<Value>,
         prompt_id: Option<String>,
@@ -94,6 +96,8 @@ struct CursorSession {
     cwd: Option<String>,
     /// Last Cursor conversation mode the cloud API accepts (`agent` or `plan`).
     mode: Option<String>,
+    /// Cursor model id for this session, including parameter brackets when present.
+    model: Option<String>,
 }
 
 impl CursorAdapter {
@@ -182,6 +186,11 @@ impl CursorAdapter {
                 {
                     self.preferred_model = Some(resolved.clone());
                     *model = Value::String(resolved);
+                }
+                if let Some(session_id) = msg.pointer("/params/sessionId").and_then(Value::as_str)
+                    && let Some(model) = msg.pointer("/params/modelId").and_then(Value::as_str)
+                {
+                    self.remember_model(session_id, model);
                 }
             }
             "session/set_mode" => {
@@ -282,6 +291,7 @@ impl CursorAdapter {
                         session_id: session_id.clone(),
                         repo: self.cloud_repo(cloud_agent_id.as_deref(), &session_id),
                         mode: self.cloud_mode(&session_id, &request),
+                        model: self.cloud_model(cloud_agent_id.as_deref(), &session_id, &request),
                         images: cloud_images,
                         agent_id: cloud_agent_id,
                         request,
@@ -419,11 +429,20 @@ impl CursorAdapter {
                         self.remember_skills(session_id, result.get("availableCommands"));
                     }
                     self.record_models(result);
-                    if let (Some(session_id), Some(requested)) = (session_id, requested_model)
-                        && let Some(set_model) =
-                            self.apply_requested_model(result, &session_id, &requested)
-                    {
-                        out.push(Routed::ToAgent(set_model));
+                    if let Some(session_id) = session_id {
+                        if let Some(requested) = requested_model
+                            && let Some(set_model) =
+                                self.apply_requested_model(result, &session_id, &requested)
+                        {
+                            out.push(Routed::ToAgent(set_model));
+                        }
+                        if let Some(model) = result
+                            .get("models")
+                            .and_then(|models| models.get("currentModelId"))
+                            .and_then(Value::as_str)
+                        {
+                            self.remember_model(&session_id, model);
+                        }
                     }
                 }
             }
@@ -547,6 +566,35 @@ impl CursorAdapter {
                 .sessions
                 .get(session_id)
                 .and_then(|session| session.mode.clone()),
+            CloudRequest::Refresh | CloudRequest::Cancel => None,
+        }
+    }
+
+    fn remember_model(&mut self, session_id: &str, model_id: &str) {
+        let model_id = model_id.trim();
+        if model_id.is_empty() {
+            return;
+        }
+        self.sessions
+            .entry(session_id.to_owned())
+            .or_default()
+            .model = Some(model_id.to_owned());
+    }
+
+    fn cloud_model(
+        &self,
+        agent_id: Option<&str>,
+        session_id: &str,
+        request: &CloudRequest,
+    ) -> Option<String> {
+        if agent_id.is_some() {
+            return None;
+        }
+        match request {
+            CloudRequest::Send(_) => self
+                .sessions
+                .get(session_id)
+                .and_then(|session| session.model.clone()),
             CloudRequest::Refresh | CloudRequest::Cancel => None,
         }
     }

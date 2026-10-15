@@ -361,10 +361,54 @@ fn image_json(image: &CloudImage) -> Value {
     }
 }
 
+pub(crate) struct CloudModel {
+    pub id: String,
+    pub params: Vec<(String, String)>,
+}
+
+pub(crate) fn cloud_model_from_id(model_id: &str) -> Option<CloudModel> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return None;
+    }
+    let (id, params) = match model_id.split_once('[') {
+        Some((id, rest)) => {
+            let rest = rest.strip_suffix(']').unwrap_or(rest);
+            let params = rest
+                .split(',')
+                .filter_map(|part| {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        return None;
+                    }
+                    let (key, value) = part.split_once('=').unwrap_or((part, "true"));
+                    let key = key.trim();
+                    if key.is_empty() {
+                        None
+                    } else {
+                        Some((key.to_owned(), value.trim().to_owned()))
+                    }
+                })
+                .collect();
+            (id.trim(), params)
+        }
+        None => (model_id, Vec::new()),
+    };
+    if id.is_empty() {
+        None
+    } else {
+        Some(CloudModel {
+            id: id.to_owned(),
+            params,
+        })
+    }
+}
+
 pub(crate) fn create_body(
     text: &str,
     repo: Option<&CloudRepo>,
     mode: Option<&str>,
+    model: Option<&str>,
     images: &[CloudImage],
 ) -> String {
     let mut body = json!({ "prompt": { "text": text } });
@@ -376,8 +420,25 @@ pub(crate) fn create_body(
         body["repos"] = json!([entry]);
     }
     attach_cloud_mode(&mut body, mode);
+    attach_cloud_model(&mut body, model);
     attach_images(&mut body, images);
     body.to_string()
+}
+
+fn attach_cloud_model(body: &mut Value, model: Option<&str>) {
+    let Some(model) = model.and_then(cloud_model_from_id) else {
+        return;
+    };
+    let mut entry = json!({ "id": model.id });
+    if !model.params.is_empty() {
+        let params: Vec<Value> = model
+            .params
+            .iter()
+            .map(|(id, value)| json!({ "id": id, "value": value }))
+            .collect();
+        entry["params"] = Value::Array(params);
+    }
+    body["model"] = entry;
 }
 
 fn attach_cloud_mode(body: &mut Value, mode: Option<&str>) {
@@ -670,6 +731,7 @@ pub(crate) fn dispatch(
     text: &str,
     repo: Option<&CloudRepo>,
     mode: Option<&str>,
+    model: Option<&str>,
     images: &[CloudImage],
 ) -> Result<CloudAgent, String> {
     let (url, body) = match agent_id {
@@ -679,7 +741,7 @@ pub(crate) fn dispatch(
         ),
         None => (
             format!("{api_base}/v1/agents"),
-            create_body(text, repo, mode, images),
+            create_body(text, repo, mode, model, images),
         ),
     };
     let raw = match request("POST", &url, auth, Some(&body)) {
@@ -1071,7 +1133,7 @@ mod tests {
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module", None, None, &[]).unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module", None, None, None, &[]).unwrap();
         assert_eq!(created.id, "bc-1");
         assert_eq!(
             created.url.as_deref(),
@@ -1079,7 +1141,7 @@ mod tests {
         );
         assert_eq!(created.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(created.result.as_deref(), Some("Refactored auth."));
-        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None, &[]).unwrap();
+        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None, None, &[]).unwrap();
         assert_eq!(follow.id, "bc-1");
         assert_eq!(follow.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(follow.result.as_deref(), Some("Added the tests."));
@@ -1184,7 +1246,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme", None, None, &[]).unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme", None, None, None, &[]).unwrap();
         assert_eq!(created.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(created.result, None);
         assert!(!run_is_terminal(created.run_status.as_deref()));
@@ -1436,7 +1498,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None, &[]).unwrap();
+        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None, None, &[]).unwrap();
         assert_eq!(agent.id, "bc-1");
         assert_eq!(agent.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(
@@ -1530,6 +1592,7 @@ data: {}
             "refactor the auth module",
             None,
             None,
+            None,
             &[],
         )
         .unwrap();
@@ -1546,6 +1609,7 @@ data: {}
                 starting_ref: None,
             }),
             Some("plan"),
+            None,
             &[],
         ))
         .unwrap();
@@ -1556,10 +1620,37 @@ data: {}
             serde_json::from_str(&follow_up_body("ship it", Some("agent"), &[])).unwrap();
         assert_eq!(follow["mode"], "agent");
         assert_eq!(follow["prompt"]["text"], "ship it");
-        let ask: Value = serde_json::from_str(&create_body("look", None, Some("ask"), &[])).unwrap();
+        let ask: Value =
+            serde_json::from_str(&create_body("look", None, Some("ask"), None, &[])).unwrap();
         assert!(ask.get("mode").is_none());
         let plain: Value = serde_json::from_str(&follow_up_body("look", None, &[])).unwrap();
         assert!(plain.get("mode").is_none());
+    }
+
+    #[test]
+    fn a_parameterized_model_id_becomes_cloud_model_params() {
+        let body: Value = serde_json::from_str(&create_body(
+            "draft it",
+            None,
+            Some("plan"),
+            Some("grok-4.7[context=256k,fast=true]"),
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(body["model"]["id"], "grok-4.7");
+        assert_eq!(body["model"]["params"][0]["id"], "context");
+        assert_eq!(body["model"]["params"][0]["value"], "256k");
+        assert_eq!(body["model"]["params"][1]["id"], "fast");
+        assert_eq!(body["model"]["params"][1]["value"], "true");
+        assert_eq!(body["mode"], "plan");
+        let plain: Value =
+            serde_json::from_str(&create_body("draft it", None, None, Some("composer-2"), &[]))
+                .unwrap();
+        assert_eq!(plain["model"]["id"], "composer-2");
+        assert!(plain["model"].get("params").is_none());
+        let follow: Value =
+            serde_json::from_str(&follow_up_body("ship it", None, &[])).unwrap();
+        assert!(follow.get("model").is_none());
     }
 
     #[test]
@@ -1589,7 +1680,7 @@ data: {}
         assert_eq!(images[2].mime_type, "image/gif");
 
         let body: Value =
-            serde_json::from_str(&create_body("fix it", None, None, &images[..2])).unwrap();
+            serde_json::from_str(&create_body("fix it", None, None, None, &images[..2])).unwrap();
         assert_eq!(body["prompt"]["images"][0]["data"], "abc");
         assert_eq!(body["prompt"]["images"][0]["mimeType"], "image/png");
         assert!(body["prompt"]["images"][0].get("url").is_none());
@@ -1671,6 +1762,7 @@ data: {}
             None,
             "refactor the auth module",
             Some(&repo),
+            None,
             None,
             &[],
         )
