@@ -930,6 +930,31 @@ mod tests {
         };
         assert_eq!(child_session_id, "child-1");
         assert_eq!(status, "completed");
+
+        for (state, expected) in [
+            ("failed", "failed"),
+            ("cancelled", "cancelled"),
+            ("disconnected", "failed"),
+        ] {
+            let done = json!({
+                "method": "session/update",
+                "params": {
+                    "sessionId": "parent",
+                    "update": {
+                        "sessionUpdate": "subagent_state_update",
+                        "subagentSessionId": "child-1",
+                        "state": state
+                    }
+                }
+            });
+            let ext = cursor_subagent_ext(&done).unwrap();
+            let parsed: SessionUpdate =
+                serde_json::from_value(ext["params"]["update"].clone()).unwrap();
+            let SessionUpdate::SubagentFinished { status, .. } = parsed else {
+                panic!("expected SubagentFinished for {state}");
+            };
+            assert_eq!(status, expected, "{state}");
+        }
     }
 
     #[test]

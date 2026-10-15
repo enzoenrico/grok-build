@@ -493,6 +493,56 @@
         let info = agent.subagent_sessions.get("child-1").unwrap();
         assert!(info.is_finished());
         assert_eq!(info.attempt.status.as_deref(), Some("completed"));
+
+        let dropped = serde_json::json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "subagent_spawned",
+                    "subagentSessionId": "child-2",
+                    "name": "explore",
+                    "task": "Read the logs"
+                }
+            }
+        });
+        let ext = crate::acp::cursor::protocol::cursor_subagent_ext(&dropped).unwrap();
+        let method = ext["method"].as_str().unwrap().trim_start_matches('_');
+        let raw = serde_json::value::to_raw_value(&ext["params"]).unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        assert!(handle(
+            AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+                request: acp::ExtNotification::new(method, raw.into()),
+                response_tx: tx,
+            }),
+            &mut app,
+        ));
+        let disconnected = serde_json::json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "subagent_state_update",
+                    "subagentSessionId": "child-2",
+                    "state": "disconnected"
+                }
+            }
+        });
+        let ext = crate::acp::cursor::protocol::cursor_subagent_ext(&disconnected).unwrap();
+        let method = ext["method"].as_str().unwrap().trim_start_matches('_');
+        let raw = serde_json::value::to_raw_value(&ext["params"]).unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        assert!(handle(
+            AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+                request: acp::ExtNotification::new(method, raw.into()),
+                response_tx: tx,
+            }),
+            &mut app,
+        ));
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let info = agent.subagent_sessions.get("child-2").unwrap();
+        assert!(info.is_finished());
+        assert_eq!(info.attempt.status.as_deref(), Some("failed"));
     }
 
     #[test]
