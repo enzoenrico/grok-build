@@ -589,11 +589,21 @@ pub(crate) fn dispatch(
     Ok(agent)
 }
 
-pub(crate) fn recovered_run_text(agent: &CloudAgent) -> Option<String> {
+pub(crate) fn recovered_run_text(agent: &CloudAgent, include_reply: bool) -> Option<String> {
     let terminal = run_is_terminal(agent.run_status.as_deref());
-    let reply = agent.result.as_deref().filter(|text| !text.is_empty());
-    if !terminal && reply.is_none() {
+    let reply = agent
+        .result
+        .as_deref()
+        .filter(|text| include_reply && !text.is_empty());
+    if agent.run_status.is_none() && reply.is_none() && agent.pr_url.is_none() && agent.branch.is_none()
+    {
         return None;
+    }
+    if !terminal && reply.is_none() && agent.pr_url.is_none() && agent.branch.is_none() {
+        return agent
+            .run_status
+            .as_deref()
+            .map(|status| format!("Run {status}.\n"));
     }
     let mut msg = format!("Run {}.\n", agent.run_status.as_deref().unwrap_or(""));
     if let Some(text) = reply {
@@ -621,7 +631,11 @@ pub(crate) fn follow_run_or_recover(
     mut on_text: impl FnMut(String),
 ) -> Result<(), String> {
     let mut saw_assistant = false;
+    let mut saw_result = false;
     let followed = follow_run(api_base, auth, agent_id, run_id, |event| {
+        if matches!(event, CloudEvent::Result { .. }) {
+            saw_result = true;
+        }
         let text = event_text(&event, saw_assistant);
         if matches!(event, CloudEvent::Assistant(_)) {
             saw_assistant = true;
@@ -630,18 +644,22 @@ pub(crate) fn follow_run_or_recover(
             on_text(text);
         }
     });
-    match followed {
-        Ok(()) => Ok(()),
-        Err(err) => match refresh_existing(api_base, auth, agent_id) {
-            Ok(agent) => match recovered_run_text(&agent) {
-                Some(text) => {
-                    on_text(text);
-                    Ok(())
-                }
-                None => Err(err),
-            },
-            Err(_) => Err(err),
-        },
+    if matches!(followed, Ok(()) if saw_result) {
+        return Ok(());
+    }
+    let err = followed.err();
+    match refresh_existing(api_base, auth, agent_id) {
+        Ok(agent) => {
+            if let Some(text) = recovered_run_text(&agent, !saw_assistant) {
+                on_text(text);
+                Ok(())
+            } else if let Some(err) = err {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        }
+        Err(refresh_err) => Err(err.unwrap_or(refresh_err)),
     }
 }
 
@@ -1156,6 +1174,43 @@ data: {}
             texts,
             vec!["Run FINISHED.\nAdded the tests.\ngithub.com/acme/app cursor/tests\n".to_owned()]
         );
+    }
+
+    #[test]
+    fn an_empty_stream_reads_the_run_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let replies = [
+                ("200 OK", ""),
+                (
+                    "200 OK",
+                    r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","latestRunId":"run-1"}"#,
+                ),
+                ("200 OK", r#"{"id":"run-1","status":"RUNNING"}"#),
+            ];
+            for (status, body) in replies {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let _ = sock.read(&mut buf).unwrap();
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let base = format!("http://{addr}");
+        let mut texts = Vec::new();
+        follow_run_or_recover(
+            &base,
+            &CloudAuth::Basic("test-key".to_owned()),
+            "bc-1",
+            "run-1",
+            |text| texts.push(text),
+        )
+        .unwrap();
+        assert_eq!(texts, vec!["Run RUNNING.\n".to_owned()]);
     }
 
     #[test]
