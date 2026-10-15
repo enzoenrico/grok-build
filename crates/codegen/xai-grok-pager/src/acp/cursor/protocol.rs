@@ -279,14 +279,23 @@ pub(crate) fn cursor_subagent_ext(msg: &Value) -> Option<Value> {
     let session_id = params.get("sessionId").and_then(Value::as_str)?;
     let child = update.get("subagentSessionId").and_then(Value::as_str)?;
     let body = match update.get("sessionUpdate").and_then(Value::as_str)? {
-        "subagent_spawned" => json!({
-            "sessionUpdate": "subagent_spawned",
-            "subagent_id": child,
-            "parent_session_id": session_id,
-            "child_session_id": child,
-            "subagent_type": update.get("name").and_then(Value::as_str).unwrap_or("subagent"),
-            "description": update.get("task").and_then(Value::as_str).unwrap_or(""),
-        }),
+        "subagent_spawned" => {
+            let mut body = json!({
+                "sessionUpdate": "subagent_spawned",
+                "subagent_id": child,
+                "parent_session_id": session_id,
+                "child_session_id": child,
+                "subagent_type": update.get("name").and_then(Value::as_str).unwrap_or("subagent"),
+                "description": update.get("task").and_then(Value::as_str).unwrap_or(""),
+            });
+            if let Some(model) = update
+                .pointer("/_meta/cursor/model")
+                .and_then(Value::as_str)
+            {
+                body["model"] = json!(model);
+            }
+            body
+        }
         "subagent_state_update" => {
             let state = update.get("state").and_then(Value::as_str).unwrap_or("");
             if subagent_state_is_terminal(state) {
@@ -987,7 +996,8 @@ mod tests {
                     "sessionUpdate": "subagent_spawned",
                     "subagentSessionId": "child-1",
                     "name": "explore",
-                    "task": "Find auth"
+                    "task": "Find auth",
+                    "_meta": {"cursor": {"model": "composer-2", "toolCallId": "call-1"}}
                 }
             }
         });
@@ -1000,6 +1010,7 @@ mod tests {
             child_session_id,
             subagent_type,
             description,
+            model,
             ..
         } = parsed
         else {
@@ -1010,6 +1021,7 @@ mod tests {
         assert_eq!(child_session_id, "child-1");
         assert_eq!(subagent_type, "explore");
         assert_eq!(description, "Find auth");
+        assert_eq!(model.as_deref(), Some("composer-2"));
 
         let done = json!({
             "method": "session/update",

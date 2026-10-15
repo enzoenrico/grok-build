@@ -446,7 +446,8 @@
                     "sessionUpdate": "subagent_spawned",
                     "subagentSessionId": "child-1",
                     "name": "explore",
-                    "task": "Find auth"
+                    "task": "Find auth",
+                    "_meta": {"cursor": {"model": "composer-2"}}
                 }
             }
         });
@@ -467,6 +468,7 @@
             .expect("child session registered");
         assert_eq!(info.description.as_ref(), "Find auth");
         assert_eq!(info.subagent_type.as_ref(), "explore");
+        assert_eq!(info.attempt.model.as_deref(), Some("composer-2"));
         assert!(agent.subagent_views.contains_key("child-1"));
 
         let finished = serde_json::json!({
