@@ -69,6 +69,12 @@ pub(crate) struct CursorAdapter {
     forward_mcp_servers: bool,
     sessions: HashMap<String, CursorSession>,
     bridge_wait: HashMap<String, protocol::PendingBridge>,
+    /// `cursor_login` has succeeded for this agent process.
+    cursor_authenticated: bool,
+    /// In-flight `authenticate` id, either injected or rewritten from the pager.
+    auth_request_id: Option<String>,
+    /// `session/new` and `session/load` lines waiting for that authenticate call.
+    held_for_auth: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -166,6 +172,17 @@ impl CursorAdapter {
                     protocol::rewrite_mode_value(mode, false);
                 }
             }
+            "authenticate" => {
+                if let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) {
+                    params.insert(
+                        "methodId".to_owned(),
+                        Value::String("cursor_login".to_owned()),
+                    );
+                }
+                if let Some(id) = &id {
+                    self.auth_request_id = Some(id_key(id));
+                }
+            }
             "session/prompt" => {
                 let session_id = msg
                     .pointer("/params/sessionId")
@@ -243,6 +260,11 @@ impl CursorAdapter {
             }
             _ => {}
         }
+        if matches!(method.as_str(), "session/new" | "session/load") && !self.cursor_authenticated
+        {
+            self.held_for_auth.push(msg.to_string());
+            return self.start_cursor_auth();
+        }
         vec![Routed::ToAgent(msg.to_string())]
     }
 
@@ -291,6 +313,9 @@ impl CursorAdapter {
         let Some(id) = msg.get("id").cloned() else {
             return vec![Routed::ToClient(line.to_owned())];
         };
+        if self.auth_request_id.as_ref() == Some(&id_key(&id)) {
+            return self.finish_cursor_auth(&msg);
+        }
         if id
             .as_str()
             .is_some_and(|s| s.starts_with(INTERNAL_ID_PREFIX))
@@ -409,6 +434,62 @@ impl CursorAdapter {
                 self.remember_skills(&session_id, update.get("availableCommands"));
             }
         }
+    }
+
+    fn start_cursor_auth(&mut self) -> Vec<Routed> {
+        if self.cursor_authenticated || self.auth_request_id.is_some() {
+            return Vec::new();
+        }
+        let id = format!("{INTERNAL_ID_PREFIX}auth");
+        self.auth_request_id = Some(id_key(&Value::String(id.clone())));
+        vec![Routed::ToAgent(
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "authenticate",
+                "params": { "methodId": "cursor_login" }
+            })
+            .to_string(),
+        )]
+    }
+
+    fn finish_cursor_auth(&mut self, msg: &Value) -> Vec<Routed> {
+        let injected = msg
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with(INTERNAL_ID_PREFIX));
+        self.auth_request_id = None;
+        if msg.get("error").is_some() {
+            let held = std::mem::take(&mut self.held_for_auth);
+            let mut out = Vec::new();
+            for line in held {
+                let Ok(held_msg) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let Some(held_id) = held_msg.get("id") else {
+                    continue;
+                };
+                self.pending.remove(&id_key(held_id));
+                out.push(Routed::ToClient(error_response(
+                    held_id,
+                    -32000,
+                    "Cursor authentication failed. Run `agent login`, then try again.",
+                )));
+            }
+            if !injected {
+                out.push(Routed::ToClient(msg.to_string()));
+            }
+            return out;
+        }
+        self.cursor_authenticated = true;
+        let mut out: Vec<_> = std::mem::take(&mut self.held_for_auth)
+            .into_iter()
+            .map(Routed::ToAgent)
+            .collect();
+        if !injected {
+            out.push(Routed::ToClient(msg.to_string()));
+        }
+        out
     }
 
     fn inbound_session_id(&self, msg: &Value) -> Option<String> {

@@ -179,10 +179,59 @@ fn load_replay_is_stamped_or_dropped() {
 #[test]
 fn mcp_servers_are_dropped_unless_forwarded() {
     let req = r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[{"type":"http","name":"x","url":"https://x","headers":[]}]}}"#;
-    let out = CursorAdapter::new(None, false).outbound(req);
-    assert_eq!(parse(&out[0])["params"]["mcpServers"], json!([]));
-    let out = CursorAdapter::new(None, true).outbound(req);
-    assert_eq!(parse(&out[0])["params"]["mcpServers"][0]["name"], "x");
+    let mut dropped = CursorAdapter::new(None, false);
+    let auth = dropped.outbound(req);
+    assert_eq!(parse(&auth[0])["params"]["methodId"], "cursor_login");
+    let released = dropped.inbound(
+        r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","result":{}}"#,
+    );
+    assert_eq!(parse(&released[0])["params"]["mcpServers"], json!([]));
+
+    let mut forwarded = CursorAdapter::new(None, true);
+    forwarded.outbound(req);
+    let released = forwarded.inbound(
+        r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","result":{}}"#,
+    );
+    assert_eq!(parse(&released[0])["params"]["mcpServers"][0]["name"], "x");
+}
+
+#[test]
+fn session_new_waits_for_cursor_login() {
+    let mut adapter = CursorAdapter::new(None, false);
+    let first = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":4,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    assert_eq!(parse(&first[0])["method"], "authenticate");
+    assert_eq!(parse(&first[0])["params"]["methodId"], "cursor_login");
+    let second = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":5,"method":"session/new","params":{"cwd":"/work","mcpServers":[]}}"#,
+    );
+    assert!(second.is_empty());
+
+    let failed = adapter.inbound(
+        r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","error":{"code":-32000,"message":"Authentication required"}}"#,
+    );
+    assert_eq!(failed.len(), 2);
+    assert!(parse(&failed[0])["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("agent login"));
+
+    let again = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":6,"method":"authenticate","params":{"methodId":"xai.api_key"}}"#,
+    );
+    assert_eq!(parse(&again[0])["params"]["methodId"], "cursor_login");
+    let created = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":7,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    assert!(created.is_empty());
+    let released = adapter.inbound(r#"{"jsonrpc":"2.0","id":6,"result":{}}"#);
+    assert_eq!(parse(&released[0])["method"], "session/new");
+    assert_eq!(parse(&released[1])["id"], 6);
+    let later = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":8,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    assert_eq!(parse(&later[0])["method"], "session/new");
 }
 
 #[test]
