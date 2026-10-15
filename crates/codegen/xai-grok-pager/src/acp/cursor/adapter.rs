@@ -28,6 +28,8 @@ pub(crate) enum Routed {
         agent_id: Option<String>,
         /// Set on the first `&` task when the session cwd has a git remote.
         repo: Option<super::cloud::CloudRepo>,
+        /// `agent` or `plan` when this handoff sends a task. Ask and other pager modes are omitted.
+        mode: Option<String>,
         /// `session/prompt` id to answer when the cloud handoff is done.
         prompt_rpc_id: Option<Value>,
         prompt_id: Option<String>,
@@ -88,6 +90,8 @@ struct CursorSession {
     skills: HashSet<String>,
     cloud_agent_id: Option<String>,
     cwd: Option<String>,
+    /// Last Cursor conversation mode the cloud API accepts (`agent` or `plan`).
+    mode: Option<String>,
 }
 
 impl CursorAdapter {
@@ -182,6 +186,7 @@ impl CursorAdapter {
                 if let Some(mode) = msg.pointer_mut("/params/modeId") {
                     protocol::rewrite_mode_value(mode, false);
                 }
+                self.note_outbound_mode(&msg);
             }
             "session/set_config_option" => {
                 if msg.pointer("/params/configId").and_then(Value::as_str) == Some("mode")
@@ -189,6 +194,7 @@ impl CursorAdapter {
                 {
                     protocol::rewrite_mode_value(value, false);
                 }
+                self.note_outbound_mode(&msg);
             }
             "authenticate" => {
                 if let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) {
@@ -262,9 +268,10 @@ impl CursorAdapter {
                     }
                     return vec![Routed::Cloud {
                         session_id: session_id.clone(),
-                        request,
                         repo: self.cloud_repo(cloud_agent_id.as_deref(), &session_id),
+                        mode: self.cloud_mode(&session_id, &request),
                         agent_id: cloud_agent_id,
+                        request,
                         prompt_rpc_id: id,
                         prompt_id,
                     }];
@@ -380,6 +387,13 @@ impl CursorAdapter {
                         .map(str::to_owned)
                         .or(session_id);
                     if let Some(session_id) = &session_id {
+                        if let Some(mode) = result
+                            .get("modes")
+                            .and_then(|modes| modes.get("currentModeId"))
+                            .and_then(Value::as_str)
+                        {
+                            self.remember_cloud_mode(session_id, mode);
+                        }
                         let session = self.sessions.entry(session_id.clone()).or_default();
                         if session.cwd.is_none() {
                             session.cwd = cwd;
@@ -472,12 +486,55 @@ impl CursorAdapter {
         let Some(update) = params.get_mut("update").and_then(Value::as_object_mut) else {
             return;
         };
+        if update.get("sessionUpdate").and_then(Value::as_str) == Some("current_mode_update")
+            && let Some(mode) = update.get("currentModeId").and_then(Value::as_str)
+            && let Some(session_id) = session_id.as_deref()
+        {
+            self.remember_cloud_mode(session_id, mode);
+        }
         if update.get("sessionUpdate").and_then(Value::as_str) == Some("available_commands_update")
         {
             protocol::normalize_commands(update.get_mut("availableCommands"));
             if let Some(session_id) = session_id {
                 self.remember_skills(&session_id, update.get("availableCommands"));
             }
+        }
+    }
+
+    fn note_outbound_mode(&mut self, msg: &Value) {
+        let Some(session_id) = msg.pointer("/params/sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let mode = if msg.get("method").and_then(Value::as_str) == Some("session/set_mode") {
+            msg.pointer("/params/modeId").and_then(Value::as_str)
+        } else if msg.pointer("/params/configId").and_then(Value::as_str) == Some("mode") {
+            msg.pointer("/params/value").and_then(Value::as_str)
+        } else {
+            None
+        };
+        if let Some(mode) = mode {
+            self.remember_cloud_mode(session_id, mode);
+        }
+    }
+
+    fn remember_cloud_mode(&mut self, session_id: &str, mode_id: &str) {
+        let mode = protocol::mode_to_cursor(mode_id);
+        if mode != "agent" && mode != "plan" {
+            return;
+        }
+        self.sessions
+            .entry(session_id.to_owned())
+            .or_default()
+            .mode = Some(mode.to_owned());
+    }
+
+    fn cloud_mode(&self, session_id: &str, request: &CloudRequest) -> Option<String> {
+        match request {
+            CloudRequest::Send(_) => self
+                .sessions
+                .get(session_id)
+                .and_then(|session| session.mode.clone()),
+            CloudRequest::Refresh | CloudRequest::Cancel => None,
         }
     }
 

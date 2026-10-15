@@ -282,7 +282,7 @@ pub(crate) struct CloudRepo {
     pub starting_ref: Option<String>,
 }
 
-pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>) -> String {
+pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>, mode: Option<&str>) -> String {
     let mut body = json!({ "prompt": { "text": text } });
     if let Some(repo) = repo {
         let mut entry = json!({ "url": repo.url });
@@ -291,7 +291,16 @@ pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>) -> String {
         }
         body["repos"] = json!([entry]);
     }
+    attach_cloud_mode(&mut body, mode);
     body.to_string()
+}
+
+fn attach_cloud_mode(body: &mut Value, mode: Option<&str>) {
+    if let Some(mode) = mode
+        && (mode == "agent" || mode == "plan")
+    {
+        body["mode"] = json!(mode);
+    }
 }
 
 pub(crate) fn normalize_git_remote(remote: &str) -> Option<String> {
@@ -382,8 +391,10 @@ fn git_output(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
     }
 }
 
-pub(crate) fn follow_up_body(text: &str) -> String {
-    json!({ "prompt": { "text": text } }).to_string()
+pub(crate) fn follow_up_body(text: &str, mode: Option<&str>) -> String {
+    let mut body = json!({ "prompt": { "text": text } });
+    attach_cloud_mode(&mut body, mode);
+    body.to_string()
 }
 
 pub(crate) fn parse_cloud_response(body: &str) -> Result<CloudAgent, String> {
@@ -559,13 +570,17 @@ pub(crate) fn dispatch(
     agent_id: Option<&str>,
     text: &str,
     repo: Option<&CloudRepo>,
+    mode: Option<&str>,
 ) -> Result<CloudAgent, String> {
     let (url, body) = match agent_id {
         Some(id) => (
             format!("{api_base}/v1/agents/{id}/runs"),
-            follow_up_body(text),
+            follow_up_body(text, mode),
         ),
-        None => (format!("{api_base}/v1/agents"), create_body(text, repo)),
+        None => (
+            format!("{api_base}/v1/agents"),
+            create_body(text, repo, mode),
+        ),
     };
     let raw = match request("POST", &url, auth, Some(&body)) {
         Ok(raw) => raw,
@@ -956,7 +971,7 @@ mod tests {
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module", None).unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module", None, None).unwrap();
         assert_eq!(created.id, "bc-1");
         assert_eq!(
             created.url.as_deref(),
@@ -964,7 +979,7 @@ mod tests {
         );
         assert_eq!(created.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(created.result.as_deref(), Some("Refactored auth."));
-        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None).unwrap();
+        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None).unwrap();
         assert_eq!(follow.id, "bc-1");
         assert_eq!(follow.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(follow.result.as_deref(), Some("Added the tests."));
@@ -1069,7 +1084,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme", None).unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme", None, None).unwrap();
         assert_eq!(created.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(created.result, None);
         assert!(!run_is_terminal(created.run_status.as_deref()));
@@ -1321,7 +1336,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None).unwrap();
+        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None).unwrap();
         assert_eq!(agent.id, "bc-1");
         assert_eq!(agent.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(
@@ -1414,10 +1429,34 @@ data: {}
             None,
             "refactor the auth module",
             None,
+            None,
         )
         .unwrap();
         assert_eq!(created.id, "bc-1");
         assert_eq!(created.result.as_deref(), Some("from login"));
+    }
+
+    #[test]
+    fn plan_mode_is_sent_and_ask_is_left_off() {
+        let created: Value = serde_json::from_str(&create_body(
+            "draft it",
+            Some(&CloudRepo {
+                url: "https://github.com/acme/app".to_owned(),
+                starting_ref: None,
+            }),
+            Some("plan"),
+        ))
+        .unwrap();
+        assert_eq!(created["mode"], "plan");
+        assert_eq!(created["prompt"]["text"], "draft it");
+        assert_eq!(created["repos"][0]["url"], "https://github.com/acme/app");
+        let follow: Value = serde_json::from_str(&follow_up_body("ship it", Some("agent"))).unwrap();
+        assert_eq!(follow["mode"], "agent");
+        assert_eq!(follow["prompt"]["text"], "ship it");
+        let ask: Value = serde_json::from_str(&create_body("look", None, Some("ask"))).unwrap();
+        assert!(ask.get("mode").is_none());
+        let plain: Value = serde_json::from_str(&follow_up_body("look", None)).unwrap();
+        assert!(plain.get("mode").is_none());
     }
 
     #[test]
@@ -1486,6 +1525,7 @@ data: {}
             None,
             "refactor the auth module",
             Some(&repo),
+            None,
         )
         .unwrap();
         assert_eq!(created.result.as_deref(), Some("on the repo"));

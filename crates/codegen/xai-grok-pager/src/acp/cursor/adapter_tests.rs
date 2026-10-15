@@ -418,6 +418,7 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
         prompt_rpc_id,
         prompt_id,
         repo,
+        mode,
     } = &sent[0]
     else {
         panic!("expected a cloud handoff: {sent:?}");
@@ -428,6 +429,7 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
     assert_eq!(prompt_rpc_id.as_ref().and_then(Value::as_u64), Some(4));
     assert_eq!(prompt_id, &None);
     assert!(repo.is_none());
+    assert_eq!(mode, &None);
 
     adapter.note_cloud_agent("s1", "bc-123");
     let local = adapter.outbound(
@@ -854,4 +856,70 @@ fn cloud_task_keeps_later_text_and_hoists_a_skill() {
         panic!("expected the later block to be the task: {sent:?}");
     };
     assert_eq!(request, &CloudRequest::Send("fix the auth".to_owned()));
+}
+
+#[test]
+fn cloud_handoff_sends_plan_mode_and_keeps_it_through_ask() {
+    let mut adapter = CursorAdapter::new(None, false);
+    adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    adapter.inbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "sessionId": "s1",
+                "modes": { "currentModeId": "agent", "availableModes": [] }
+            }
+        })
+        .to_string(),
+    );
+    adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{"sessionId":"s1","modeId":"plan"}}"#,
+    );
+    let sent = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& draft the auth change"}]}}"#,
+    );
+    let Routed::Cloud { mode, request, .. } = &sent[0] else {
+        panic!("expected a plan-mode cloud task: {sent:?}");
+    };
+    assert_eq!(mode.as_deref(), Some("plan"));
+    assert_eq!(
+        request,
+        &CloudRequest::Send("draft the auth change".to_owned())
+    );
+
+    adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":4,"method":"session/set_config_option","params":{"sessionId":"s1","configId":"mode","value":"default"}}"#,
+    );
+    let sent = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& implement it"}]}}"#,
+    );
+    let Routed::Cloud { mode, .. } = &sent[0] else {
+        panic!("expected an agent-mode follow-up: {sent:?}");
+    };
+    assert_eq!(mode.as_deref(), Some("agent"));
+
+    adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":6,"method":"session/set_mode","params":{"sessionId":"s1","modeId":"ask"}}"#,
+    );
+    let sent = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":8,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& still the last cloud mode"}]}}"#,
+    );
+    let Routed::Cloud { mode, .. } = &sent[0] else {
+        panic!("expected ask to leave the cloud mode alone: {sent:?}");
+    };
+    assert_eq!(mode.as_deref(), Some("agent"));
+
+    adapter.inbound(
+        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}}}"#,
+    );
+    let sent = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& keep planning"}]}}"#,
+    );
+    let Routed::Cloud { mode, .. } = &sent[0] else {
+        panic!("expected the mode update to reach the next task: {sent:?}");
+    };
+    assert_eq!(mode.as_deref(), Some("plan"));
 }
