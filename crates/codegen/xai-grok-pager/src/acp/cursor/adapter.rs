@@ -220,16 +220,17 @@ impl CursorAdapter {
                 if let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) {
                     cloud_handoff = protocol::prompt_is_cloud_handoff(params);
                     if cloud_handoff {
-                        cloud_task = params
-                            .get("prompt")
-                            .and_then(Value::as_array)
-                            .and_then(|blocks| {
-                                blocks.iter().find_map(|block| {
-                                    block.get("text").and_then(Value::as_str).map(str::to_owned)
-                                })
-                            })
-                            .as_deref()
-                            .and_then(super::cloud::handoff_text);
+                        cloud_task = protocol::cloud_task_text(params);
+                        if let Some(task) = cloud_task.as_mut() {
+                            let control = task.is_empty()
+                                || task.eq_ignore_ascii_case("status")
+                                || task.eq_ignore_ascii_case("cancel");
+                            if !control
+                                && let Some(hoisted) = protocol::hoist_skill_text(task, &skills)
+                            {
+                                *task = hoisted;
+                            }
+                        }
                     } else {
                         protocol::hoist_skill_prompt(params, &skills);
                     }

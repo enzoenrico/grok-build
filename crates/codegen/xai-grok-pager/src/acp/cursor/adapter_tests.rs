@@ -798,3 +798,60 @@ fn cloud_create_uses_the_session_git_remote() {
     assert!(repo.is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cloud_task_keeps_later_text_and_hoists_a_skill() {
+    let mut adapter = CursorAdapter::new(None, false);
+    adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    adapter.inbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "sessionId": "s1",
+                "skills": [{ "name": "poteto-mode", "description": "Poteto" }]
+            }
+        })
+        .to_string(),
+    );
+    let prompt = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "s1",
+            "prompt": [
+                {"type": "text", "text": "& look at the diff"},
+                {"type": "text", "text": "then /poteto-mode please"}
+            ]
+        }
+    });
+    let sent = adapter.outbound(&prompt.to_string());
+    let Routed::Cloud { request, .. } = &sent[0] else {
+        panic!("expected a cloud task: {sent:?}");
+    };
+    assert_eq!(
+        request,
+        &CloudRequest::Send("/poteto-mode look at the diff\nthen please".to_owned())
+    );
+
+    let split = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "s1",
+            "prompt": [
+                {"type": "text", "text": "&"},
+                {"type": "text", "text": "fix the auth"}
+            ]
+        }
+    });
+    let sent = adapter.outbound(&split.to_string());
+    let Routed::Cloud { request, .. } = &sent[0] else {
+        panic!("expected the later block to be the task: {sent:?}");
+    };
+    assert_eq!(request, &CloudRequest::Send("fix the auth".to_owned()));
+}

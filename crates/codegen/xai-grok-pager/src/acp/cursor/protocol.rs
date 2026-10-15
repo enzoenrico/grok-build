@@ -441,6 +441,23 @@ pub(crate) fn prompt_is_cloud_handoff(params: &Map<String, Value>) -> bool {
     first_prompt_text(params).is_some_and(|text| text.trim_start().starts_with('&'))
 }
 
+pub(crate) fn cloud_task_text(params: &Map<String, Value>) -> Option<String> {
+    let prompt = params.get("prompt")?.as_array()?;
+    let mut parts = Vec::new();
+    for block in prompt {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        if let Some(text) = block.get("text").and_then(Value::as_str) {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    super::cloud::handoff_text(&parts.join("\n"))
+}
+
 pub(crate) fn stamp_cloud_handoff(params: &mut Map<String, Value>, agent_id: Option<&str>) {
     let handoff = prompt_is_cloud_handoff(params);
     let meta = meta_mut(params);
