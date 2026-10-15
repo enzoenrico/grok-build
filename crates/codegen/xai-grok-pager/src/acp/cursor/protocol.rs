@@ -759,21 +759,7 @@ fn plan_as_question(params: &Value) -> Value {
             prompt.push_str(text);
         }
     }
-    if let Some(todos) = params.get("todos").and_then(Value::as_array) {
-        let lines: Vec<&str> = todos
-            .iter()
-            .filter_map(|todo| todo.get("content").and_then(Value::as_str))
-            .filter(|text| !text.is_empty())
-            .collect();
-        if !lines.is_empty() {
-            prompt.push_str("\n\n");
-            for line in lines {
-                prompt.push_str("- ");
-                prompt.push_str(line);
-                prompt.push('\n');
-            }
-        }
-    }
+    append_plan_tasks(&mut prompt, params);
     json!({
         "toolCallId": params.get("toolCallId").cloned().unwrap_or_else(|| json!("plan")),
         "questions": [{
@@ -786,6 +772,42 @@ fn plan_as_question(params: &Value) -> Value {
             ]
         }]
     })
+}
+
+fn append_plan_tasks(prompt: &mut String, params: &Value) {
+    let mut lines = Vec::new();
+    push_todo_lines(&mut lines, params.get("todos"));
+    if let Some(phases) = params.get("phases").and_then(Value::as_array) {
+        for phase in phases {
+            let name = phase.get("name").and_then(Value::as_str).unwrap_or("Phase");
+            let mut phase_lines = Vec::new();
+            push_todo_lines(&mut phase_lines, phase.get("todos"));
+            if phase_lines.is_empty() {
+                continue;
+            }
+            lines.push(name.to_owned());
+            lines.extend(phase_lines);
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    prompt.push_str("\n\n");
+    prompt.push_str(&lines.join("\n"));
+    prompt.push('\n');
+}
+
+fn push_todo_lines(lines: &mut Vec<String>, todos: Option<&Value>) {
+    let Some(todos) = todos.and_then(Value::as_array) else {
+        return;
+    };
+    for todo in todos {
+        if let Some(text) = todo.get("content").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            lines.push(format!("- {text}"));
+        }
+    }
 }
 
 pub(crate) fn normalize_plan_session_update(msg: &mut Value) {
@@ -1208,7 +1230,8 @@ mod tests {
                 "name": "Auth",
                 "overview": "Replace the token check.",
                 "plan": "",
-                "todos": [{"id": "t1", "content": "Read the login file", "status": "pending"}]
+                "todos": [{"id": "t1", "content": "Read the login file", "status": "pending"}],
+                "phases": [{"name": "Ship", "todos": [{"id": "t2", "content": "Open the pull request", "status": "pending"}]}]
             }
         });
         let translated = translate_cursor_inbound(&overview, Some("s1")).unwrap();
@@ -1217,6 +1240,8 @@ mod tests {
             .unwrap();
         assert!(question.contains("Replace the token check."));
         assert!(question.contains("Read the login file"));
+        assert!(question.contains("Ship"));
+        assert!(question.contains("Open the pull request"));
         let PendingBridge::Plan(wait) = translated.pending.unwrap() else {
             panic!("plan wait");
         };
