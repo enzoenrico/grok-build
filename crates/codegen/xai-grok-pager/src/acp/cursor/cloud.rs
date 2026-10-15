@@ -1,11 +1,17 @@
 //! Cursor Cloud Agents HTTP API. ACP `session/prompt` does not create a cloud agent.
 //! A message that starts with `&` and a task is sent here. `&` and `& status` only read the latest run.
 //! `& cancel` stops that run. A run that is still going is followed on its event stream.
+//!
+//! Auth matches `agent login`. `CURSOR_AUTH_TOKEN` is sent as Bearer, then `CURSOR_API_KEY` as Basic,
+//! then the access token `agent login` stores.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +66,195 @@ pub(crate) fn event_text(event: &CloudEvent, saw_assistant: bool) -> Option<Stri
             Some(msg)
         }
         CloudEvent::Error { message } => Some(format!("Cloud agent run failed. {message}\n")),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CloudAuth {
+    Basic(String),
+    Bearer(String),
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct StoredLogin {
+    #[serde(default, rename = "accessToken")]
+    access_token: Option<String>,
+    #[serde(default, rename = "apiKey")]
+    api_key: Option<String>,
+}
+
+const LOGIN_REQUIRED: &str =
+    "Run `agent login`, or set CURSOR_API_KEY, to send this to a Cursor cloud agent.";
+
+pub(crate) fn resolve_cloud_auth() -> Result<CloudAuth, String> {
+    let auth_token = std::env::var("CURSOR_AUTH_TOKEN").ok();
+    let api_key = std::env::var("CURSOR_API_KEY").ok();
+    let stored = read_stored_login()?;
+    cloud_auth_from_sources(
+        auth_token.as_deref(),
+        api_key.as_deref(),
+        stored.as_ref(),
+    )
+}
+
+pub(crate) fn cloud_auth_from_sources(
+    auth_token: Option<&str>,
+    api_key: Option<&str>,
+    stored: Option<&StoredLogin>,
+) -> Result<CloudAuth, String> {
+    if let Some(token) = nonempty(auth_token) {
+        return Ok(CloudAuth::Bearer(token.to_owned()));
+    }
+    if let Some(key) = nonempty(api_key) {
+        return Ok(CloudAuth::Basic(key.to_owned()));
+    }
+    if let Some(stored) = stored {
+        if let Some(token) = nonempty(stored.access_token.as_deref()) {
+            return Ok(CloudAuth::Bearer(token.to_owned()));
+        }
+        if let Some(key) = nonempty(stored.api_key.as_deref()) {
+            return Ok(CloudAuth::Basic(key.to_owned()));
+        }
+    }
+    Err(LOGIN_REQUIRED.to_owned())
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|text| !text.is_empty())
+}
+
+fn read_stored_login() -> Result<Option<StoredLogin>, String> {
+    #[cfg(target_os = "macos")]
+    if keychain_is_default_store()
+        && let Some(login) = read_macos_keychain()
+        && (nonempty(login.access_token.as_deref()).is_some()
+            || nonempty(login.api_key.as_deref()).is_some())
+    {
+        return Ok(Some(login));
+    }
+    read_auth_file()
+}
+
+fn read_auth_file() -> Result<Option<StoredLogin>, String> {
+    let path = cursor_auth_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(format!(
+                "Cursor login file at {} could not be read. Run `agent login` again.",
+                path.display()
+            ));
+        }
+    };
+    serde_json::from_str(&text).map(Some).map_err(|_| {
+        format!(
+            "Cursor login file at {} could not be read. Run `agent login` again.",
+            path.display()
+        )
+    })
+}
+
+fn cursor_auth_path() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let xdg = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let appdata = std::env::var("APPDATA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    cursor_auth_path_for(
+        std::env::consts::OS,
+        &home,
+        xdg.as_deref(),
+        appdata.as_deref(),
+    )
+}
+
+fn cursor_auth_path_for(
+    os: &str,
+    home: &Path,
+    xdg_config_home: Option<&Path>,
+    appdata: Option<&Path>,
+) -> PathBuf {
+    match os {
+        "windows" => {
+            let base = appdata
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| home.join("AppData").join("Roaming"));
+            base.join("Cursor").join("auth.json")
+        }
+        "macos" => home.join(".cursor").join("auth.json"),
+        _ => {
+            let base = xdg_config_home
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| home.join(".config"));
+            base.join("cursor").join("auth.json")
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_is_default_store() -> bool {
+    !matches!(
+        std::env::var("AGENT_CLI_CREDENTIAL_STORE")
+            .ok()
+            .as_deref(),
+        Some("file" | "memory")
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_keychain() -> Option<StoredLogin> {
+    Some(StoredLogin {
+        access_token: keychain_secret("cursor-access-token"),
+        api_key: keychain_secret("cursor-api-key"),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_secret(service: &str) -> Option<String> {
+    let output = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            service,
+            "-a",
+            "cursor-user",
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let secret = String::from_utf8(output.stdout).ok()?;
+    let secret = secret.trim();
+    if secret.is_empty() {
+        None
+    } else {
+        Some(secret.to_owned())
+    }
+}
+
+fn authorization_header(auth: &CloudAuth) -> String {
+    match auth {
+        CloudAuth::Basic(key) => format!("Basic {}", basic_token(key)),
+        CloudAuth::Bearer(token) => format!("Bearer {token}"),
+    }
+}
+
+fn curl_auth_args(auth: &CloudAuth) -> Vec<String> {
+    match auth {
+        CloudAuth::Basic(key) => vec!["-u".to_owned(), format!("{key}:")],
+        CloudAuth::Bearer(token) => {
+            vec!["-H".to_owned(), format!("Authorization: Bearer {token}")]
+        }
     }
 }
 
@@ -136,11 +331,11 @@ fn pr_url(value: &Value) -> Option<String> {
     None
 }
 
-fn refresh(api_base: &str, api_key: &str, agent: &mut CloudAgent) -> Result<(), String> {
+fn refresh(api_base: &str, auth: &CloudAuth, agent: &mut CloudAgent) -> Result<(), String> {
     let record = request(
         "GET",
         &format!("{api_base}/v1/agents/{}", agent.id),
-        api_key,
+        auth,
         None,
     )?;
     let value: Value = serde_json::from_str(&record).map_err(|err| err.to_string())?;
@@ -161,7 +356,7 @@ fn refresh(api_base: &str, api_key: &str, agent: &mut CloudAgent) -> Result<(), 
     let run = request(
         "GET",
         &format!("{api_base}/v1/agents/{}/runs/{run_id}", agent.id),
-        api_key,
+        auth,
         None,
     )?;
     let run: Value = serde_json::from_str(&run).map_err(|err| err.to_string())?;
@@ -184,7 +379,7 @@ fn refresh(api_base: &str, api_key: &str, agent: &mut CloudAgent) -> Result<(), 
 
 pub(crate) fn refresh_existing(
     api_base: &str,
-    api_key: &str,
+    auth: &CloudAuth,
     agent_id: &str,
 ) -> Result<CloudAgent, String> {
     let mut agent = CloudAgent {
@@ -195,16 +390,16 @@ pub(crate) fn refresh_existing(
         result: None,
         pr_url: None,
     };
-    refresh(api_base, api_key, &mut agent)?;
+    refresh(api_base, auth, &mut agent)?;
     Ok(agent)
 }
 
 pub(crate) fn cancel_existing(
     api_base: &str,
-    api_key: &str,
+    auth: &CloudAuth,
     agent_id: &str,
 ) -> Result<CloudAgent, String> {
-    let mut agent = refresh_existing(api_base, api_key, agent_id)?;
+    let mut agent = refresh_existing(api_base, auth, agent_id)?;
     if run_is_terminal(agent.run_status.as_deref()) {
         return Ok(agent);
     }
@@ -214,16 +409,16 @@ pub(crate) fn cancel_existing(
     let _ = request(
         "POST",
         &format!("{api_base}/v1/agents/{}/runs/{run_id}/cancel", agent.id),
-        api_key,
+        auth,
         None,
     )?;
-    let _ = refresh(api_base, api_key, &mut agent);
+    let _ = refresh(api_base, auth, &mut agent);
     Ok(agent)
 }
 
 pub(crate) fn dispatch(
     api_base: &str,
-    api_key: &str,
+    auth: &CloudAuth,
     agent_id: Option<&str>,
     text: &str,
 ) -> Result<CloudAgent, String> {
@@ -234,13 +429,13 @@ pub(crate) fn dispatch(
         ),
         None => (format!("{api_base}/v1/agents"), create_body(text)),
     };
-    let raw = match request("POST", &url, api_key, Some(&body)) {
+    let raw = match request("POST", &url, auth, Some(&body)) {
         Ok(raw) => raw,
         Err(err) if is_agent_busy(&err) => {
             let Some(id) = agent_id else {
                 return Err(err);
             };
-            let mut agent = refresh_existing(api_base, api_key, id)?;
+            let mut agent = refresh_existing(api_base, auth, id)?;
             if agent.result.is_none() {
                 agent.result = Some(
                     "Still running, so this task was not sent. Send & status to read it, or & cancel to stop it."
@@ -252,22 +447,22 @@ pub(crate) fn dispatch(
         Err(err) => return Err(err),
     };
     let mut agent = parse_cloud_response(&raw)?;
-    let _ = refresh(api_base, api_key, &mut agent);
+    let _ = refresh(api_base, auth, &mut agent);
     Ok(agent)
 }
 
 pub(crate) fn follow_run(
     api_base: &str,
-    api_key: &str,
+    auth: &CloudAuth,
     agent_id: &str,
     run_id: &str,
     on_event: impl FnMut(CloudEvent),
 ) -> Result<(), String> {
     let url = format!("{api_base}/v1/agents/{agent_id}/runs/{run_id}/stream");
     if url.starts_with("https://") {
-        return follow_via_curl(&url, api_key, on_event);
+        return follow_via_curl(&url, auth, on_event);
     }
-    let body = request("GET", &url, api_key, None)?;
+    let body = request("GET", &url, auth, None)?;
     emit_sse(&body, on_event);
     Ok(())
 }
@@ -364,22 +559,23 @@ fn decode_event(event: &str, data: &str) -> Option<CloudEvent> {
 
 fn follow_via_curl(
     url: &str,
-    api_key: &str,
+    auth: &CloudAuth,
     mut on_event: impl FnMut(CloudEvent),
 ) -> Result<(), String> {
-    let mut child = std::process::Command::new("curl")
-        .args([
-            "-N",
-            "-sS",
-            "-f",
-            "-X",
-            "GET",
-            "-u",
-            &format!("{api_key}:"),
-            "-H",
-            "Accept: text/event-stream",
-            url,
-        ])
+    let mut args = vec![
+        "-N".to_owned(),
+        "-sS".to_owned(),
+        "-f".to_owned(),
+        "-X".to_owned(),
+        "GET".to_owned(),
+    ];
+    args.extend(curl_auth_args(auth));
+    args.extend([
+        "-H".to_owned(),
+        "Accept: text/event-stream".to_owned(),
+        url.to_owned(),
+    ]);
+    let mut child = std::process::Command::new("curl").args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -421,34 +617,32 @@ fn is_agent_busy(err: &str) -> bool {
 fn request(
     method: &str,
     url: &str,
-    api_key: &str,
+    auth: &CloudAuth,
     body: Option<&str>,
 ) -> Result<String, String> {
     if url.starts_with("https://") {
-        return request_via_curl(method, url, api_key, body);
+        return request_via_curl(method, url, auth, body);
     }
-    request_via_tcp(method, url, api_key, body)
+    request_via_tcp(method, url, auth, body)
 }
 
 fn request_via_curl(
     method: &str,
     url: &str,
-    api_key: &str,
+    auth: &CloudAuth,
     body: Option<&str>,
 ) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("curl");
-    cmd.args([
-        "-sS",
-        "-X",
-        method,
-        "-u",
-        &format!("{api_key}:"),
-        "-H",
-        "Accept: application/json",
-        "-w",
-        "\n%{http_code}",
-        url,
+    let mut args = vec!["-sS".to_owned(), "-X".to_owned(), method.to_owned()];
+    args.extend(curl_auth_args(auth));
+    args.extend([
+        "-H".to_owned(),
+        "Accept: application/json".to_owned(),
+        "-w".to_owned(),
+        "\n%{http_code}".to_owned(),
+        url.to_owned(),
     ]);
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(args);
     if let Some(body) = body {
         cmd.args(["-H", "Content-Type: application/json", "-d", body]);
     }
@@ -469,7 +663,7 @@ fn request_via_curl(
 fn request_via_tcp(
     method: &str,
     url: &str,
-    api_key: &str,
+    auth: &CloudAuth,
     body: Option<&str>,
 ) -> Result<String, String> {
     let rest = url
@@ -483,10 +677,10 @@ fn request_via_tcp(
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|err| err.to_string())?;
-    let token = basic_token(api_key);
+    let header = authorization_header(auth);
     let body = body.unwrap_or("");
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nAuthorization: Basic {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nAuthorization: {header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
@@ -509,7 +703,6 @@ fn request_via_tcp(
 }
 
 fn basic_token(api_key: &str) -> String {
-    use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(format!("{api_key}:"))
 }
 
@@ -545,7 +738,7 @@ mod tests {
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, "test-key", None, "refactor the auth module").unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module").unwrap();
         assert_eq!(created.id, "bc-1");
         assert_eq!(
             created.url.as_deref(),
@@ -553,7 +746,7 @@ mod tests {
         );
         assert_eq!(created.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(created.result.as_deref(), Some("Refactored auth."));
-        let follow = dispatch(&base, "test-key", Some("bc-1"), "add tests").unwrap();
+        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests").unwrap();
         assert_eq!(follow.id, "bc-1");
         assert_eq!(follow.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(follow.result.as_deref(), Some("Added the tests."));
@@ -588,7 +781,7 @@ mod tests {
             }
         });
         let base = format!("http://{addr}");
-        let agent = refresh_existing(&base, "test-key", "bc-1").unwrap();
+        let agent = refresh_existing(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1").unwrap();
         assert_eq!(agent.id, "bc-1");
         assert_eq!(
             agent.url.as_deref(),
@@ -658,12 +851,12 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, "test-key", None, "update the readme").unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme").unwrap();
         assert_eq!(created.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(created.result, None);
         assert!(!run_is_terminal(created.run_status.as_deref()));
         let mut events = Vec::new();
-        follow_run(&base, "test-key", "bc-1", "run-1", |event| events.push(event)).unwrap();
+        follow_run(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1", "run-1", |event| events.push(event)).unwrap();
         assert_eq!(
             events,
             vec![
@@ -735,7 +928,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let agent = cancel_existing(&base, "test-key", "bc-1").unwrap();
+        let agent = cancel_existing(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1").unwrap();
         assert_eq!(agent.id, "bc-1");
         assert_eq!(agent.run_id.as_deref(), Some("run-1"));
         assert_eq!(agent.run_status.as_deref(), Some("CANCELLED"));
@@ -763,7 +956,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let agent = cancel_existing(&base, "test-key", "bc-1").unwrap();
+        let agent = cancel_existing(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1").unwrap();
         assert_eq!(agent.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(agent.result.as_deref(), Some("Already done."));
     }
@@ -807,7 +1000,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let agent = dispatch(&base, "test-key", Some("bc-1"), "add tests").unwrap();
+        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests").unwrap();
         assert_eq!(agent.id, "bc-1");
         assert_eq!(agent.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(
@@ -816,5 +1009,92 @@ data: {}
                 "Still running, so this task was not sent. Send & status to read it, or & cancel to stop it."
             )
         );
+    }
+
+    #[test]
+    fn login_sources_prefer_the_cli_order() {
+        let stored = serde_json::from_str::<StoredLogin>(
+            r#"{"accessToken":"login-token","refreshToken":"refresh","apiKey":"stored-key"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cloud_auth_from_sources(Some("env-token"), Some("env-key"), Some(&stored)).unwrap(),
+            CloudAuth::Bearer("env-token".to_owned())
+        );
+        assert_eq!(
+            cloud_auth_from_sources(None, Some("env-key"), Some(&stored)).unwrap(),
+            CloudAuth::Basic("env-key".to_owned())
+        );
+        assert_eq!(
+            cloud_auth_from_sources(None, None, Some(&stored)).unwrap(),
+            CloudAuth::Bearer("login-token".to_owned())
+        );
+        let key_only = serde_json::from_str::<StoredLogin>(r#"{"apiKey":"stored-key"}"#).unwrap();
+        assert_eq!(
+            cloud_auth_from_sources(None, Some("  "), Some(&key_only)).unwrap(),
+            CloudAuth::Basic("stored-key".to_owned())
+        );
+        let err = cloud_auth_from_sources(None, None, None).unwrap_err();
+        assert!(err.contains("agent login"), "{err}");
+    }
+
+    #[test]
+    fn auth_file_path_matches_the_cli() {
+        let home = std::path::Path::new("/home/u");
+        assert_eq!(
+            cursor_auth_path_for("linux", home, None, None),
+            std::path::PathBuf::from("/home/u/.config/cursor/auth.json")
+        );
+        assert_eq!(
+            cursor_auth_path_for("linux", home, Some(std::path::Path::new("/xdg")), None),
+            std::path::PathBuf::from("/xdg/cursor/auth.json")
+        );
+        assert_eq!(
+            cursor_auth_path_for("macos", home, None, None),
+            std::path::PathBuf::from("/home/u/.cursor/auth.json")
+        );
+        assert_eq!(
+            cursor_auth_path_for("windows", home, None, Some(std::path::Path::new("/App"))),
+            std::path::PathBuf::from("/App/Cursor/auth.json")
+        );
+        assert_eq!(
+            cursor_auth_path_for("windows", home, None, None),
+            std::path::PathBuf::from("/home/u/AppData/Roaming/Cursor/auth.json")
+        );
+    }
+
+    #[test]
+    fn login_token_is_sent_as_bearer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 8192];
+            let n = sock.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = if req.contains("Authorization: Bearer login-token")
+                && !req.contains("Authorization: Basic")
+            {
+                r#"{"agent":{"id":"bc-1","url":"https://cursor.com/agents/bc-1"},"run":{"id":"run-1","status":"FINISHED","result":"from login"}}"#
+            } else {
+                r#"{"error":"missing bearer"}"#
+            };
+            let status = if body.contains("bc-1") { "200 OK" } else { "401 Unauthorized" };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+        let base = format!("http://{addr}");
+        let created = dispatch(
+            &base,
+            &CloudAuth::Bearer("login-token".to_owned()),
+            None,
+            "refactor the auth module",
+        )
+        .unwrap();
+        assert_eq!(created.id, "bc-1");
+        assert_eq!(created.result.as_deref(), Some("from login"));
     }
 }

@@ -15,29 +15,27 @@ fn cloud_handoff_notice(
     request: &CloudRequest,
     agent_id: Option<&str>,
 ) -> (String, Option<cloud::CloudAgent>) {
-    let key = std::env::var("CURSOR_API_KEY").unwrap_or_default();
     let base = std::env::var("CURSOR_CLOUD_API")
         .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
-    let outcome = if key.is_empty() {
-        Err("Set CURSOR_API_KEY to send this to a Cursor cloud agent.".to_owned())
-    } else {
-        match request {
-            CloudRequest::Send(task) => cloud::dispatch(&base, &key, agent_id, task),
+    let outcome = match cloud::resolve_cloud_auth() {
+        Err(err) => Err(err),
+        Ok(auth) => match request {
+            CloudRequest::Send(task) => cloud::dispatch(&base, &auth, agent_id, task),
             CloudRequest::Refresh => match agent_id {
-                Some(id) => cloud::refresh_existing(&base, &key, id),
+                Some(id) => cloud::refresh_existing(&base, &auth, id),
                 None => Err(
                     "No cloud agent on this session yet. Send & and a task to start one."
                         .to_owned(),
                 ),
             },
             CloudRequest::Cancel => match agent_id {
-                Some(id) => cloud::cancel_existing(&base, &key, id),
+                Some(id) => cloud::cancel_existing(&base, &auth, id),
                 None => Err(
                     "No cloud agent on this session yet. Send & and a task to start one."
                         .to_owned(),
                 ),
             },
-        }
+        },
     };
     let (text, recorded) = match outcome {
         Ok(agent) => {
@@ -80,19 +78,21 @@ fn watch_cloud_run(
 ) {
     // The stream stays open until the cloud agent finishes. Reading it here would stall the local agent.
     std::thread::spawn(move || {
-        let key = std::env::var("CURSOR_API_KEY").unwrap_or_default();
         let base = std::env::var("CURSOR_CLOUD_API")
             .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
         let mut saw_assistant = false;
-        let result = cloud::follow_run(&base, &key, &agent_id, &run_id, |event| {
-            let text = cloud::event_text(&event, saw_assistant);
-            if matches!(event, cloud::CloudEvent::Assistant(_)) {
-                saw_assistant = true;
-            }
-            if let Some(text) = text {
-                let _ = tx.send(cloud_text_notice(&session_id, &text));
-            }
-        });
+        let result = (|| {
+            let auth = cloud::resolve_cloud_auth()?;
+            cloud::follow_run(&base, &auth, &agent_id, &run_id, |event| {
+                let text = cloud::event_text(&event, saw_assistant);
+                if matches!(event, cloud::CloudEvent::Assistant(_)) {
+                    saw_assistant = true;
+                }
+                if let Some(text) = text {
+                    let _ = tx.send(cloud_text_notice(&session_id, &text));
+                }
+            })
+        })();
         if let Err(err) = result {
             let _ = tx.send(cloud_text_notice(
                 &session_id,
