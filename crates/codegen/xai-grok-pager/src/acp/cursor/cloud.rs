@@ -1,5 +1,5 @@
 //! Cursor Cloud Agents HTTP API. ACP `session/prompt` does not create a cloud agent.
-//! A message that starts with `&` is sent here instead.
+//! A message that starts with `&` and a task is sent here. A bare `&` only reads the latest run.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -114,6 +114,22 @@ fn refresh(api_base: &str, api_key: &str, agent: &mut CloudAgent) -> Result<(), 
         .map(str::to_owned)
         .or(agent.result.take());
     Ok(())
+}
+
+pub(crate) fn refresh_existing(
+    api_base: &str,
+    api_key: &str,
+    agent_id: &str,
+) -> Result<CloudAgent, String> {
+    let mut agent = CloudAgent {
+        id: agent_id.to_owned(),
+        url: None,
+        run_id: None,
+        run_status: None,
+        result: None,
+    };
+    refresh(api_base, api_key, &mut agent)?;
+    Ok(agent)
 }
 
 pub(crate) fn dispatch(
@@ -274,5 +290,45 @@ mod tests {
         assert_eq!(follow.id, "bc-1");
         assert_eq!(follow.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(follow.result.as_deref(), Some("Added the tests."));
+    }
+
+    #[test]
+    fn refresh_reads_the_latest_run_without_posting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let replies = [
+                r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"IDLE","latestRunId":"run-9"}"#,
+                r#"{"id":"run-9","agentId":"bc-1","status":"FINISHED","result":"Still the same answer."}"#,
+            ];
+            for body in replies {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let ok = req.starts_with("GET ");
+                let payload = if ok {
+                    body.to_owned()
+                } else {
+                    r#"{"error":"posted"}"#.to_owned()
+                };
+                let status = if ok { "200 OK" } else { "400 Bad Request" };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let base = format!("http://{addr}");
+        let agent = refresh_existing(&base, "test-key", "bc-1").unwrap();
+        assert_eq!(agent.id, "bc-1");
+        assert_eq!(
+            agent.url.as_deref(),
+            Some("https://cursor.com/agents/bc-1")
+        );
+        assert_eq!(agent.run_id.as_deref(), Some("run-9"));
+        assert_eq!(agent.run_status.as_deref(), Some("FINISHED"));
+        assert_eq!(agent.result.as_deref(), Some("Still the same answer."));
     }
 }

@@ -21,7 +21,8 @@ pub(crate) enum Routed {
     ToAgent(String),
     /// Hand back to the pager's ACP client.
     ToClient(String),
-    /// Create or follow up a Cursor cloud agent. ACP does not do this.
+    /// Create, follow up, or refresh a Cursor cloud agent. ACP does not do this.
+    /// An empty `task` refreshes `agent_id` and does not start a run.
     Cloud {
         session_id: String,
         task: String,
@@ -196,14 +197,23 @@ impl CursorAdapter {
                     let Some(session_id) = session_id.clone() else {
                         return vec![Routed::ToClient(msg.to_string())];
                     };
-                    let Some(task) = cloud_task else {
-                        return vec![Routed::ToClient(
-                            protocol::cloud_status_update(
-                                &session_id,
-                                "needs a task after &",
-                            )
-                            .to_string(),
-                        )];
+                    let Some(task) = cloud_task
+                        .filter(|task| !task.eq_ignore_ascii_case("status"))
+                    else {
+                        let Some(agent_id) = cloud_agent_id.clone() else {
+                            return vec![Routed::ToClient(
+                                protocol::agent_notice(
+                                    &session_id,
+                                    "No cloud agent on this session yet. Send & and a task to start one.\n",
+                                )
+                                .to_string(),
+                            )];
+                        };
+                        return vec![Routed::Cloud {
+                            session_id,
+                            task: String::new(),
+                            agent_id: Some(agent_id),
+                        }];
                     };
                     return vec![Routed::Cloud {
                         session_id,

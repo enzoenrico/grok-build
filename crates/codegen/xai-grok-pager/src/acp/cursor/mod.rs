@@ -20,6 +20,13 @@ fn cloud_handoff_notice(
         .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
     let outcome = if key.is_empty() {
         Err("Set CURSOR_API_KEY to send this to a Cursor cloud agent.".to_owned())
+    } else if task.trim().is_empty() {
+        match agent_id {
+            Some(id) => cloud::refresh_existing(&base, &key, id),
+            None => Err(
+                "No cloud agent on this session yet. Send & and a task to start one.".to_owned(),
+            ),
+        }
     } else {
         cloud::dispatch(&base, &key, agent_id, task)
     };

@@ -304,6 +304,37 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
 }
 
 #[test]
+fn bare_ampersand_refreshes_the_recorded_agent() {
+    let mut adapter = CursorAdapter::new(None, false);
+    let missing = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"&"}]}}"#,
+    );
+    let Routed::ToClient(line) = &missing[0] else {
+        panic!("expected a client notice: {missing:?}");
+    };
+    let notice: Value = serde_json::from_str(line).unwrap();
+    assert_eq!(
+        notice["params"]["update"]["content"]["text"],
+        "No cloud agent on this session yet. Send & and a task to start one.\n"
+    );
+
+    adapter.note_cloud_agent("s1", "bc-123");
+    for text in ["&", "& ", "& status", "& Status"] {
+        let refresh = adapter.outbound(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{{"sessionId":"s1","prompt":[{{"type":"text","text":"{text}"}}]}}}}"#
+        ));
+        let Routed::Cloud {
+            task, agent_id, ..
+        } = &refresh[0]
+        else {
+            panic!("expected a refresh for {text}: {refresh:?}");
+        };
+        assert_eq!(task, "");
+        assert_eq!(agent_id.as_deref(), Some("bc-123"));
+    }
+}
+
+#[test]
 fn two_sessions_keep_their_own_skills_and_cloud_agents() {
     let mut adapter = CursorAdapter::new(None, false);
     for (id, skill, cloud) in [("s1", "poteto-mode", "bc-one"), ("s2", "review", "bc-two")] {

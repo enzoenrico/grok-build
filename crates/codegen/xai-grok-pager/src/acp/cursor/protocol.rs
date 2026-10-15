@@ -403,7 +403,7 @@ pub(crate) fn cloud_agent_id(result: &Map<String, Value>) -> Option<String> {
     None
 }
 
-pub(crate) fn cloud_status_update(session_id: &str, agent_id: &str) -> Value {
+pub(crate) fn agent_notice(session_id: &str, text: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
         "method": "session/update",
@@ -411,13 +411,17 @@ pub(crate) fn cloud_status_update(session_id: &str, agent_id: &str) -> Value {
             "sessionId": session_id,
             "update": {
                 "sessionUpdate": "agent_message_chunk",
-                "content": {
-                    "type": "text",
-                    "text": format!("Cloud agent {agent_id} is running. Send another message to follow up.\n"),
-                }
+                "content": { "type": "text", "text": text }
             }
         }
     })
+}
+
+pub(crate) fn cloud_status_update(session_id: &str, agent_id: &str) -> Value {
+    agent_notice(
+        session_id,
+        &format!("Cloud agent {agent_id} is running. Send another message to follow up.\n"),
+    )
 }
 
 pub(crate) fn translate_cursor_inbound(
