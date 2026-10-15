@@ -444,6 +444,16 @@ fn a_cursor_command_without_skill_meta_still_hoists() {
         parse(&clipboard[0])["params"]["prompt"][0]["text"],
         "please /copy-request-id now"
     );
+    let params = parse(&listed[0])["params"].clone();
+    let note: agent_client_protocol::SessionNotification =
+        serde_json::from_value(params).expect("pager can read the command list");
+    let agent_client_protocol::SessionUpdate::AvailableCommandsUpdate(update) = note.update else {
+        panic!("expected available commands");
+    };
+    let skill = crate::slash::acp_command::AcpSlashCommand::from(&update.available_commands[0]);
+    let plain = crate::slash::acp_command::AcpSlashCommand::from(&update.available_commands[1]);
+    assert!(crate::slash::command::SlashCommand::is_skill(&skill));
+    assert!(!crate::slash::command::SlashCommand::is_skill(&plain));
 }
 
 #[test]
