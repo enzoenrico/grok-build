@@ -247,7 +247,8 @@ fn session_new_waits_for_cursor_login() {
     let after = stalled.outbound(
         r#"{"jsonrpc":"2.0","id":10,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
     );
-    assert_eq!(parse(&after[0])["method"], "session/new");
+    assert_eq!(parse(&after[0])["method"], "authenticate");
+    assert_eq!(parse(&after[0])["params"]["methodId"], "cursor_login");
 }
 
 #[test]

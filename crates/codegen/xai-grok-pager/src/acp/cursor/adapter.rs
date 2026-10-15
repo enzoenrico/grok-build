@@ -74,8 +74,6 @@ pub(crate) struct CursorAdapter {
     bridge_wait: HashMap<String, protocol::PendingBridge>,
     /// `cursor_login` has succeeded for this agent process.
     cursor_authenticated: bool,
-    /// Injected login did not answer. Later sessions go through and show Cursor's own error.
-    cursor_auth_gave_up: bool,
     /// In-flight `authenticate` id, either injected or rewritten from the pager.
     auth_request_id: Option<String>,
     /// `session/new` and `session/load` lines waiting for that authenticate call.
@@ -276,9 +274,7 @@ impl CursorAdapter {
             }
             _ => {}
         }
-        if matches!(method.as_str(), "session/new" | "session/load")
-            && !self.cursor_authenticated
-            && !self.cursor_auth_gave_up
+        if matches!(method.as_str(), "session/new" | "session/load") && !self.cursor_authenticated
         {
             self.held_for_auth.push(msg.to_string());
             return self.start_cursor_auth();
@@ -526,7 +522,6 @@ impl CursorAdapter {
             return Vec::new();
         }
         self.auth_request_id = None;
-        self.cursor_auth_gave_up = true;
         let held = std::mem::take(&mut self.held_for_auth);
         let mut out = Vec::new();
         for line in held {
