@@ -14,7 +14,7 @@ fn cloud_handoff_notice(
     session_id: &str,
     task: &str,
     agent_id: Option<&str>,
-) -> (String, Option<String>) {
+) -> (String, Option<cloud::CloudAgent>) {
     let key = std::env::var("CURSOR_API_KEY").unwrap_or_default();
     let base = std::env::var("CURSOR_CLOUD_API")
         .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
@@ -35,10 +35,12 @@ fn cloud_handoff_notice(
             let url = agent.url.clone().unwrap_or_default();
             let status = agent.run_status.clone().unwrap_or_default();
             let reply = agent.result.clone().unwrap_or_default();
-            (
-                format!("Cloud agent {} {url}\nRun status {status}.\n{reply}", agent.id),
-                Some(agent.id),
-            )
+            let mut text = format!("Cloud agent {} {url}\nRun status {status}.\n{reply}", agent.id);
+            if let Some(pr) = &agent.pr_url {
+                text.push('\n');
+                text.push_str(pr);
+            }
+            (text, Some(agent))
         }
         Err(err) => (format!("Cloud agent handoff failed. {err}\n"), None),
     };
@@ -57,6 +59,51 @@ fn cloud_handoff_notice(
         .to_string(),
         recorded,
     )
+}
+
+fn watch_cloud_run(
+    session_id: String,
+    agent_id: String,
+    run_id: String,
+    tx: mpsc::UnboundedSender<String>,
+) {
+    // The stream stays open until the cloud agent finishes. Reading it here would stall the local agent.
+    std::thread::spawn(move || {
+        let key = std::env::var("CURSOR_API_KEY").unwrap_or_default();
+        let base = std::env::var("CURSOR_CLOUD_API")
+            .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
+        let mut saw_assistant = false;
+        let result = cloud::follow_run(&base, &key, &agent_id, &run_id, |event| {
+            let text = cloud::event_text(&event, saw_assistant);
+            if matches!(event, cloud::CloudEvent::Assistant(_)) {
+                saw_assistant = true;
+            }
+            if let Some(text) = text {
+                let _ = tx.send(cloud_text_notice(&session_id, &text));
+            }
+        });
+        if let Err(err) = result {
+            let _ = tx.send(cloud_text_notice(
+                &session_id,
+                &format!("Cloud agent run failed. {err}\n"),
+            ));
+        }
+    });
+}
+
+fn cloud_text_notice(session_id: &str, text: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text }
+            }
+        }
+    })
+    .to_string()
 }
 
 use std::path::PathBuf;
@@ -292,11 +339,21 @@ impl CursorIo {
                         } => {
                             let (notice, recorded) =
                                 cloud_handoff_notice(&session_id, &task, agent_id.as_deref());
-                            if let Some(id) = recorded {
+                            if let Some(agent) = &recorded {
                                 adapter
                                     .lock()
                                     .unwrap_or_else(|p| p.into_inner())
-                                    .note_cloud_agent(&session_id, &id);
+                                    .note_cloud_agent(&session_id, &agent.id);
+                                if !cloud::run_is_terminal(agent.run_status.as_deref())
+                                    && let Some(run_id) = agent.run_id.clone()
+                                {
+                                    watch_cloud_run(
+                                        session_id.clone(),
+                                        agent.id.clone(),
+                                        run_id,
+                                        to_client_tx.clone(),
+                                    );
+                                }
                             }
                             let _ = to_client_tx.send(notice);
                         }

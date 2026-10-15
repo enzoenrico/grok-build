@@ -1,7 +1,8 @@
 //! Cursor Cloud Agents HTTP API. ACP `session/prompt` does not create a cloud agent.
 //! A message that starts with `&` and a task is sent here. A bare `&` only reads the latest run.
+//! A run that is still going is followed on its event stream.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -14,6 +15,52 @@ pub(crate) struct CloudAgent {
     pub run_id: Option<String>,
     pub run_status: Option<String>,
     pub result: Option<String>,
+    pub pr_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CloudEvent {
+    Assistant(String),
+    ToolDone { name: String },
+    Result {
+        status: String,
+        text: String,
+        pr_url: Option<String>,
+    },
+    Error { message: String },
+}
+
+pub(crate) fn run_is_terminal(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("FINISHED" | "ERROR" | "CANCELLED" | "EXPIRED")
+    )
+}
+
+pub(crate) fn event_text(event: &CloudEvent, saw_assistant: bool) -> Option<String> {
+    match event {
+        CloudEvent::Assistant(text) => Some(text.clone()),
+        CloudEvent::ToolDone { name } => Some(format!("Tool {name}\n")),
+        CloudEvent::Result {
+            status,
+            text,
+            pr_url,
+        } => {
+            let mut msg = format!("Run {status}.\n");
+            if !saw_assistant && !text.is_empty() {
+                msg.push_str(text);
+                if !text.ends_with('\n') {
+                    msg.push('\n');
+                }
+            }
+            if let Some(url) = pr_url {
+                msg.push_str(url);
+                msg.push('\n');
+            }
+            Some(msg)
+        }
+        CloudEvent::Error { message } => Some(format!("Cloud agent run failed. {message}\n")),
+    }
 }
 
 pub(crate) fn handoff_text(prompt: &str) -> Option<String> {
@@ -70,7 +117,23 @@ pub(crate) fn parse_cloud_response(body: &str) -> Result<CloudAgent, String> {
         run_id,
         run_status,
         result,
+        pr_url: pr_url(&value),
     })
+}
+
+fn pr_url(value: &Value) -> Option<String> {
+    for pointer in ["/run/git/branches", "/git/branches"] {
+        let Some(branches) = value.pointer(pointer).and_then(Value::as_array) else {
+            continue;
+        };
+        if let Some(url) = branches
+            .iter()
+            .find_map(|branch| branch.get("prUrl").and_then(Value::as_str))
+        {
+            return Some(url.to_owned());
+        }
+    }
+    None
 }
 
 fn refresh(api_base: &str, api_key: &str, agent: &mut CloudAgent) -> Result<(), String> {
@@ -113,6 +176,9 @@ fn refresh(api_base: &str, api_key: &str, agent: &mut CloudAgent) -> Result<(), 
         .and_then(Value::as_str)
         .map(str::to_owned)
         .or(agent.result.take());
+    if agent.pr_url.is_none() {
+        agent.pr_url = pr_url(&run);
+    }
     Ok(())
 }
 
@@ -127,6 +193,7 @@ pub(crate) fn refresh_existing(
         run_id: None,
         run_status: None,
         result: None,
+        pr_url: None,
     };
     refresh(api_base, api_key, &mut agent)?;
     Ok(agent)
@@ -149,6 +216,164 @@ pub(crate) fn dispatch(
     let mut agent = parse_cloud_response(&raw)?;
     let _ = refresh(api_base, api_key, &mut agent);
     Ok(agent)
+}
+
+pub(crate) fn follow_run(
+    api_base: &str,
+    api_key: &str,
+    agent_id: &str,
+    run_id: &str,
+    on_event: impl FnMut(CloudEvent),
+) -> Result<(), String> {
+    let url = format!("{api_base}/v1/agents/{agent_id}/runs/{run_id}/stream");
+    if url.starts_with("https://") {
+        return follow_via_curl(&url, api_key, on_event);
+    }
+    let body = request("GET", &url, api_key, None)?;
+    emit_sse(&body, on_event);
+    Ok(())
+}
+
+fn emit_sse(body: &str, mut on_event: impl FnMut(CloudEvent)) {
+    let mut parser = SseParser::default();
+    for line in body.split_inclusive('\n') {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if let Some(event) = parser.push_line(line) {
+            on_event(event);
+        }
+    }
+    if let Some(event) = parser.finish() {
+        on_event(event);
+    }
+}
+
+#[derive(Default)]
+struct SseParser {
+    event: String,
+    data: String,
+}
+
+impl SseParser {
+    fn push_line(&mut self, line: &str) -> Option<CloudEvent> {
+        if line.is_empty() {
+            return self.finish();
+        }
+        if let Some(rest) = line.strip_prefix("event:") {
+            self.event = rest.trim().to_owned();
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            if !self.data.is_empty() {
+                self.data.push('\n');
+            }
+            self.data.push_str(rest.trim_start());
+        }
+        None
+    }
+
+    fn finish(&mut self) -> Option<CloudEvent> {
+        let event = std::mem::take(&mut self.event);
+        let data = std::mem::take(&mut self.data);
+        if event.is_empty() && data.is_empty() {
+            None
+        } else {
+            decode_event(&event, &data)
+        }
+    }
+}
+
+fn decode_event(event: &str, data: &str) -> Option<CloudEvent> {
+    let value: Value = serde_json::from_str(data).unwrap_or(Value::Null);
+    match event {
+        "assistant" => value
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| CloudEvent::Assistant(text.to_owned())),
+        "tool_call" => {
+            if value.get("status").and_then(Value::as_str) == Some("completed") {
+                Some(CloudEvent::ToolDone {
+                    name: value
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned(),
+                })
+            } else {
+                None
+            }
+        }
+        "result" => Some(CloudEvent::Result {
+            status: value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("FINISHED")
+                .to_owned(),
+            text: value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            pr_url: pr_url(&value),
+        }),
+        "error" => Some(CloudEvent::Error {
+            message: value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+                .to_owned(),
+        }),
+        _ => None,
+    }
+}
+
+fn follow_via_curl(
+    url: &str,
+    api_key: &str,
+    mut on_event: impl FnMut(CloudEvent),
+) -> Result<(), String> {
+    let mut child = std::process::Command::new("curl")
+        .args([
+            "-N",
+            "-sS",
+            "-f",
+            "-X",
+            "GET",
+            "-u",
+            &format!("{api_key}:"),
+            "-H",
+            "Accept: text/event-stream",
+            url,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| err.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "curl has no stdout".to_owned())?;
+    let mut parser = SseParser::default();
+    for line in BufReader::new(stdout).lines() {
+        let line = line.map_err(|err| err.to_string())?;
+        if let Some(event) = parser.push_line(&line) {
+            on_event(event);
+        }
+    }
+    if let Some(event) = parser.finish() {
+        on_event(event);
+    }
+    let status = child.wait().map_err(|err| err.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        let mut err = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut err);
+        }
+        Err(if err.trim().is_empty() {
+            format!("curl exited {status}")
+        } else {
+            err.trim().to_owned()
+        })
+    }
 }
 
 fn request(
@@ -330,5 +555,105 @@ mod tests {
         assert_eq!(agent.run_id.as_deref(), Some("run-9"));
         assert_eq!(agent.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(agent.result.as_deref(), Some("Still the same answer."));
+    }
+
+    #[test]
+    fn a_running_cloud_agent_streams_its_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = "\
+event: status
+data: {\"runId\":\"run-1\",\"status\":\"RUNNING\"}
+
+event: assistant
+data: {\"text\":\"I'll update the README now.\"}
+
+event: tool_call
+data: {\"callId\":\"call-1\",\"name\":\"read_file\",\"status\":\"running\"}
+
+event: tool_call
+data: {\"callId\":\"call-1\",\"name\":\"read_file\",\"status\":\"completed\"}
+
+event: result
+data: {\"status\":\"FINISHED\",\"text\":\"Added README.md.\",\"git\":{\"branches\":[{\"prUrl\":\"https://github.com/acme/app/pull/123\"}]}}
+
+event: done
+data: {}
+";
+        thread::spawn(move || {
+            let replies = [
+                (
+                    "POST",
+                    r#"{"agent":{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"ACTIVE"},"run":{"id":"run-1","status":"CREATING"}}"#,
+                ),
+                (
+                    "GET",
+                    r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"ACTIVE","latestRunId":"run-1"}"#,
+                ),
+                (
+                    "GET",
+                    r#"{"id":"run-1","agentId":"bc-1","status":"RUNNING"}"#,
+                ),
+                ("GET", stream),
+            ];
+            for (method, body) in replies {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let ok = req.starts_with(method);
+                let payload = if ok {
+                    body.to_owned()
+                } else {
+                    r#"{"error":"wrong method"}"#.to_owned()
+                };
+                let status = if ok { "200 OK" } else { "400 Bad Request" };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let base = format!("http://{addr}");
+        let created = dispatch(&base, "test-key", None, "update the readme").unwrap();
+        assert_eq!(created.run_status.as_deref(), Some("RUNNING"));
+        assert_eq!(created.result, None);
+        assert!(!run_is_terminal(created.run_status.as_deref()));
+        let mut events = Vec::new();
+        follow_run(&base, "test-key", "bc-1", "run-1", |event| events.push(event)).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                CloudEvent::Assistant("I'll update the README now.".to_owned()),
+                CloudEvent::ToolDone {
+                    name: "read_file".to_owned()
+                },
+                CloudEvent::Result {
+                    status: "FINISHED".to_owned(),
+                    text: "Added README.md.".to_owned(),
+                    pr_url: Some("https://github.com/acme/app/pull/123".to_owned()),
+                },
+            ]
+        );
+        let mut saw_assistant = false;
+        let texts: Vec<String> = events
+            .iter()
+            .filter_map(|event| {
+                let text = event_text(event, saw_assistant);
+                if matches!(event, CloudEvent::Assistant(_)) {
+                    saw_assistant = true;
+                }
+                text
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "I'll update the README now.".to_owned(),
+                "Tool read_file\n".to_owned(),
+                "Run FINISHED.\nhttps://github.com/acme/app/pull/123\n".to_owned(),
+            ]
+        );
     }
 }
