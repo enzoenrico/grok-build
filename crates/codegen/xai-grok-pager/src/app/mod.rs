@@ -801,13 +801,14 @@ pub async fn run(
     );
     let prefetch_elapsed = startup_start.elapsed();
     let requested_confinement = xai_grok_sandbox::requested_confinement_profile();
+    let backend = crate::acp::cursor::resolve_backend(args.backend, &raw_config);
     let LeaderMode {
         use_leader,
         policy_disable_reason,
         disabled_by_confinement,
     } = resolve_leader_mode(
         args.leader,
-        args.no_leader,
+        args.no_leader || backend.is_cursor(),
         &raw_config,
         remote_settings.as_ref(),
         true,
@@ -865,7 +866,16 @@ pub async fn run(
     let mut materialize_ctx = session_startup::MaterializeCtx::from_pager_args(&args);
     materialize_ctx.restore_progress_on_stdout =
         std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let materialized = session_startup::materialize_startup(materialize_ctx, intent).await?;
+    let materialized = if backend.is_cursor() {
+        let cwd = std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("Failed to get cwd: {e}"))?
+            .to_string_lossy()
+            .into_owned();
+        let command = crate::acp::cursor::CursorAgentCommand::from_config(&raw_config, false);
+        crate::acp::cursor::materialize_startup(&command, intent, &cwd).await?
+    } else {
+        session_startup::materialize_startup(materialize_ctx, intent).await?
+    };
     if args.chat()
         && let session_startup::MaterializedStartup::Resume { session_id, .. } = &materialized
     {
@@ -965,6 +975,7 @@ pub async fn run(
         default_yolo_mode: launch_yolo.yolo,
         default_auto_mode: launch_auto && !launch_yolo.yolo,
         status_line: false,
+        backend,
     };
     let mut config_watcher = crate::appearance::ConfigWatcher::start().await?;
     let alt_screen_config_mode = config_watcher.current().alt_screen;

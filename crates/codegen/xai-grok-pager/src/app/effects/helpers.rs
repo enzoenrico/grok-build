@@ -1181,6 +1181,9 @@ pub(crate) async fn persist_setting(
             let SettingValue::String(s) = value else {
                 return Err(kind_mismatch("default_model", "String", &value));
             };
+            if crate::acp::cursor::is_active() {
+                return crate::acp::cursor::persist_default_model(&s).map_err(|e| format!("{e:#}"));
+            }
             xai_grok_shell::util::config::set_default_model(s)
                 .await
                 .map_err(|e| e.to_string())

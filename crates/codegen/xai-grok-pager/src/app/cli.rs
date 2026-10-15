@@ -757,6 +757,10 @@ pub struct PagerArgs {
     /// Run standalone even when leader mode is configured.
     #[arg(long, conflicts_with = "leader", hide = true)]
     pub no_leader: bool,
+    /// Agent backend: `grok` (default) or `cursor` (runs `cursor-agent acp`).
+    /// Also settable via `GROK_BACKEND` or `[cli] backend` in config.toml.
+    #[arg(long = "backend", value_enum, value_name = "BACKEND")]
+    pub backend: Option<crate::acp::cursor::BackendKind>,
     /// Initial prompt for the interactive session, e.g. `grok "fix the bug"` or `grok --worktree=feat "create this feature"`.
     #[arg(
         value_name = "PROMPT",

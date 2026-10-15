@@ -92,6 +92,8 @@ pub struct HeadlessOptions {
     pub memory_flush: bool,
     /// CLI `--experimental-memory` / `--no-memory` override for the headless agent.
     pub memory_enabled_override: Option<bool>,
+    /// `--backend`; resolved against `GROK_BACKEND` and config at spawn.
+    pub backend: Option<crate::acp::cursor::BackendKind>,
 }
 struct HeadlessEmitter {
     format: OutputFormat,
@@ -429,8 +431,17 @@ async fn spawn_agent(
     cancel: &CancellationToken,
     memory_config: Option<xai_grok_shell::config::MemoryConfig>,
     options: &HeadlessOptions,
+    raw_config: &toml::Value,
 ) -> Result<SpawnedAgent> {
-    let _ = options;
+    use crate::acp::cursor;
+    if cursor::resolve_backend(options.backend, raw_config).is_cursor() {
+        let auth_manager = crate::acp::spawn::boot_auth_manager(
+            &xai_grok_shell::util::grok_home::grok_home(),
+            &agent_config,
+        );
+        let command = cursor::CursorAgentCommand::from_config(raw_config, options.yolo);
+        return cursor::spawn_cursor_agent(command, cancel, auth_manager).await;
+    }
     spawn_grok_shell(agent_config, cancel, memory_config).await
 }
 /// Authenticate via the agent's `defaultAuthMethodId`, failing closed when none is available.
@@ -889,7 +900,8 @@ pub async fn run_single_turn(
         );
         PendingStartup::finish_held(&mut pending_startup, crate::acp::StartupOutcome::Error);
     };
-    let spawned = match spawn_agent(agent_config, &cancel, memory_config, &options).await {
+    let spawned = match spawn_agent(agent_config, &cancel, memory_config, &options, &raw_config).await
+    {
         Ok(s) => s,
         Err(e) => {
             report_startup_failure(&timer);
@@ -970,16 +982,21 @@ pub async fn run_single_turn(
         PendingStartup::finish_held(&mut pending_startup, crate::acp::StartupOutcome::Error);
     })?;
     let cwd_str = cwd.to_string_lossy().to_string();
-    let materialized = session_startup::materialize_startup_for_cwd(
-        headless_materialize_ctx(
-            options.resume_title_pinned,
-            options.restore_code,
-            worktree.is_some(),
-        ),
-        intent,
-        &cwd_str,
-    )
-    .await
+    let materialized = if crate::acp::cursor::resolve_backend(options.backend, &raw_config).is_cursor() {
+        let command = crate::acp::cursor::CursorAgentCommand::from_config(&raw_config, false);
+        crate::acp::cursor::materialize_startup(&command, intent, &cwd_str).await
+    } else {
+        session_startup::materialize_startup_for_cwd(
+            headless_materialize_ctx(
+                options.resume_title_pinned,
+                options.restore_code,
+                worktree.is_some(),
+            ),
+            intent,
+            &cwd_str,
+        )
+        .await
+    }
     .inspect_err(|_| {
         PendingStartup::finish_held(&mut pending_startup, crate::acp::StartupOutcome::Error);
     })?;
