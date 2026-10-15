@@ -80,15 +80,16 @@ pub(crate) fn advertise_cursor_client(msg: &mut Value) {
     let caps = caps
         .as_object_mut()
         .expect("clientCapabilities is an object");
+    caps.insert("subagents".to_owned(), Value::Bool(true));
     let meta = caps
         .entry("_meta")
         .or_insert_with(|| Value::Object(Map::new()));
     if !meta.is_object() {
         *meta = Value::Object(Map::new());
     }
-    meta.as_object_mut()
-        .expect("_meta is an object")
-        .insert("cursorExtensions".to_owned(), Value::Bool(true));
+    let meta = meta.as_object_mut().expect("_meta is an object");
+    meta.insert("cursorExtensions".to_owned(), Value::Bool(true));
+    meta.insert("subagents".to_owned(), Value::Bool(true));
 }
 
 pub(crate) fn absorb_cursor_skills(result: &mut Map<String, Value>) {
@@ -174,6 +175,19 @@ pub(crate) fn normalize_commands(commands: Option<&mut Value>) {
     }
 }
 
+pub(crate) fn command_names(commands: Option<&Value>) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Some(commands) = commands.and_then(Value::as_array) else {
+        return names;
+    };
+    for cmd in commands {
+        if let Some(name) = cmd.get("name").and_then(Value::as_str) {
+            names.insert(name.to_owned());
+        }
+    }
+    names
+}
+
 pub(crate) fn skill_names(commands: Option<&Value>) -> HashSet<String> {
     let mut names = HashSet::new();
     let Some(commands) = commands.and_then(Value::as_array) else {
@@ -220,6 +234,61 @@ fn skill_meta(name: &str, path: Option<&str>) -> Value {
         .map(str::to_owned)
         .unwrap_or_else(|| format!("cursor://skills/{name}"));
     json!({ "path": path, "scope": "user" })
+}
+
+pub(crate) fn rewrite_cursor_subagent_update(update: &mut Map<String, Value>) {
+    let kind = update.get("sessionUpdate").and_then(Value::as_str);
+    match kind {
+        Some("subagent_spawned") => {
+            let id = update
+                .get("subagentSessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("subagent")
+                .to_owned();
+            let name = update
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("subagent");
+            let task = update.get("task").and_then(Value::as_str).unwrap_or("");
+            let title = if task.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name}: {task}")
+            };
+            *update = json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": id,
+                "title": title,
+                "kind": "other",
+                "status": "in_progress",
+            })
+            .as_object()
+            .expect("tool call object")
+            .clone();
+        }
+        Some("subagent_state_update") => {
+            let id = update
+                .get("subagentSessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("subagent")
+                .to_owned();
+            let state = update.get("state").and_then(Value::as_str).unwrap_or("");
+            let status = match state {
+                "completed" | "done" | "finished" | "success" => "completed",
+                "failed" | "error" | "disconnected" => "failed",
+                _ => "in_progress",
+            };
+            *update = json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": id,
+                "status": status,
+            })
+            .as_object()
+            .expect("tool call update object")
+            .clone();
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn hoist_skill_prompt(params: &mut Map<String, Value>, skills: &HashSet<String>) {
@@ -753,6 +822,57 @@ mod tests {
         hoist_skill_prompt(params.as_object_mut().unwrap(), &skills);
         assert_eq!(params["prompt"][0]["text"], "look at the diff");
         assert_eq!(params["prompt"][2]["text"], "/poteto-mode then please");
+    }
+
+    #[test]
+    fn a_bare_cursor_command_is_still_a_hoist_name() {
+        let commands = json!([
+            {"name": "poteto-mode", "description": "Poteto"}
+        ]);
+        let names = command_names(Some(&commands));
+        assert!(names.contains("poteto-mode"));
+        assert_eq!(
+            hoist_skill_text("please /poteto-mode review", &names).as_deref(),
+            Some("/poteto-mode please review")
+        );
+    }
+
+    #[test]
+    fn subagent_spawn_becomes_a_tool_call_the_pager_can_parse() {
+        let mut update = json!({
+            "sessionUpdate": "subagent_spawned",
+            "subagentSessionId": "child-1",
+            "name": "explore",
+            "task": "Find auth"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        rewrite_cursor_subagent_update(&mut update);
+        assert_eq!(update["sessionUpdate"], "tool_call");
+        assert_eq!(update["toolCallId"], "child-1");
+        assert_eq!(update["title"], "explore: Find auth");
+        assert_eq!(update["status"], "in_progress");
+
+        let mut done = json!({
+            "sessionUpdate": "subagent_state_update",
+            "subagentSessionId": "child-1",
+            "state": "completed"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        rewrite_cursor_subagent_update(&mut done);
+        assert_eq!(done["sessionUpdate"], "tool_call_update");
+        assert_eq!(done["status"], "completed");
+    }
+
+    #[test]
+    fn initialize_advertises_subagents() {
+        let mut msg = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}});
+        advertise_cursor_client(&mut msg);
+        assert_eq!(msg["params"]["clientCapabilities"]["subagents"], true);
+        assert_eq!(msg["params"]["clientCapabilities"]["_meta"]["subagents"], true);
     }
 
     #[test]

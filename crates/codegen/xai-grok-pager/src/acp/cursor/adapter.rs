@@ -356,6 +356,7 @@ impl CursorAdapter {
         let Some(update) = params.get_mut("update").and_then(Value::as_object_mut) else {
             return;
         };
+        protocol::rewrite_cursor_subagent_update(update);
         if update.get("sessionUpdate").and_then(Value::as_str) == Some("available_commands_update")
         {
             protocol::normalize_commands(update.get_mut("availableCommands"));
@@ -383,7 +384,7 @@ impl CursorAdapter {
             .entry(session_id.to_owned())
             .or_default()
             .skills
-            .extend(protocol::skill_names(commands));
+            .extend(protocol::command_names(commands));
     }
 
     fn record_models(&mut self, result: &Map<String, Value>) {

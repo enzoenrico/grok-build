@@ -340,6 +340,38 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
 }
 
 #[test]
+fn cursor_subagent_updates_become_tool_calls() {
+    let mut adapter = CursorAdapter::new(None, false);
+    let spawned = adapter.inbound(
+        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"subagent_spawned","subagentSessionId":"child-1","name":"explore","task":"Find auth"}}}"#,
+    );
+    let update = &parse(&spawned[0])["params"]["update"];
+    assert_eq!(update["sessionUpdate"], "tool_call");
+    assert_eq!(update["toolCallId"], "child-1");
+    assert_eq!(update["status"], "in_progress");
+
+    let init = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#,
+    );
+    assert_eq!(parse(&init[0])["params"]["clientCapabilities"]["subagents"], true);
+}
+
+#[test]
+fn a_cursor_command_without_skill_meta_still_hoists() {
+    let mut adapter = CursorAdapter::new(None, false);
+    adapter.inbound(
+        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"poteto-mode","description":"Poteto"}]}}}"#,
+    );
+    let sent = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"please /poteto-mode review"}]}}"#,
+    );
+    assert_eq!(
+        parse(&sent[0])["params"]["prompt"][0]["text"],
+        "/poteto-mode please review"
+    );
+}
+
+#[test]
 fn cursor_question_is_answered_through_the_pager_ext_method() {
     let mut adapter = CursorAdapter::new(None, false);
     adapter.outbound(r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#);
