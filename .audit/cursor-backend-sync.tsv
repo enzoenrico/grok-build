@@ -33,3 +33,4 @@ ts	phase	decision	why	evidence	result
 2026-10-15T18:11:52Z	runtime	the bridge initialize line is what agent 2026.10.14 accepts for subagents and cursor_login	hand-built JSON was not the adapter output	installed_agent_accepts_the_bridge_initialize	passed in 1.10s
 2026-10-15T18:17:46Z	skills	a skill after another leading slash is moved to the front	cursor-agent resolveLeadingSlashCommand ignores a prompt that does not start with the skill	protocol mid_message_skill_moves_to_the_front_for_cursor	4 pager tests passed
 2026-10-15T18:31:19Z	runtime	use agent on PATH when cursor-agent is not installed	the default name is cursor-agent and many installs only ship agent	mod.rs pick_default_cursor_bin	2 pager tests passed
+2026-10-15T18:48:04Z	cloud	cloud handoff uses the agent login access token as Bearer when CURSOR_API_KEY is unset	the CLI stores that token and sends Authorization Bearer	cloud.rs login_token_is_sent_as_bearer	44 cursor pager tests passed
