@@ -392,7 +392,29 @@ impl CursorIo {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .outbound(&line);
+                    let started_login = routed.iter().any(|routed| {
+                        matches!(
+                            routed,
+                            Routed::ToAgent(line)
+                                if line.contains("grok-cursor-bridge-auth")
+                                    && line.contains("cursor_login")
+                        )
+                    });
                     deliver(routed);
+                    if started_login {
+                        let adapter = adapter.clone();
+                        let deliver = deliver.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                            let notices = adapter
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .auth_timed_out();
+                            if !notices.is_empty() {
+                                deliver(notices.into_iter().map(Routed::ToClient).collect());
+                            }
+                        });
+                    }
                 }
             })
         };

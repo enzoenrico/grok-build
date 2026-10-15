@@ -71,6 +71,8 @@ pub(crate) struct CursorAdapter {
     bridge_wait: HashMap<String, protocol::PendingBridge>,
     /// `cursor_login` has succeeded for this agent process.
     cursor_authenticated: bool,
+    /// Injected login did not answer. Later sessions go through and show Cursor's own error.
+    cursor_auth_gave_up: bool,
     /// In-flight `authenticate` id, either injected or rewritten from the pager.
     auth_request_id: Option<String>,
     /// `session/new` and `session/load` lines waiting for that authenticate call.
@@ -260,7 +262,9 @@ impl CursorAdapter {
             }
             _ => {}
         }
-        if matches!(method.as_str(), "session/new" | "session/load") && !self.cursor_authenticated
+        if matches!(method.as_str(), "session/new" | "session/load")
+            && !self.cursor_authenticated
+            && !self.cursor_auth_gave_up
         {
             self.held_for_auth.push(msg.to_string());
             return self.start_cursor_auth();
@@ -320,6 +324,11 @@ impl CursorAdapter {
             .as_str()
             .is_some_and(|s| s.starts_with(INTERNAL_ID_PREFIX))
         {
+            if id.as_str() == Some(&format!("{INTERNAL_ID_PREFIX}auth"))
+                && msg.get("error").is_none()
+            {
+                self.cursor_authenticated = true;
+            }
             if let Some(error) = msg.get("error") {
                 tracing::warn!(%error, "cursor backend: internal request failed");
             }
@@ -473,7 +482,7 @@ impl CursorAdapter {
                 out.push(Routed::ToClient(error_response(
                     held_id,
                     -32000,
-                    "Cursor authentication failed. Run `agent login`, then try again.",
+                    &cursor_auth_failure(msg),
                 )));
             }
             if !injected {
@@ -488,6 +497,37 @@ impl CursorAdapter {
             .collect();
         if !injected {
             out.push(Routed::ToClient(msg.to_string()));
+        }
+        out
+    }
+
+    /// `cursor_login` opens a browser and does not answer until that finishes.
+    /// The caller gives up so `session/new` is not held forever.
+    pub(crate) fn auth_timed_out(&mut self) -> Vec<String> {
+        let injected = self
+            .auth_request_id
+            .as_deref()
+            .is_some_and(|id| id.contains("grok-cursor-bridge-auth"));
+        if self.cursor_authenticated || !injected {
+            return Vec::new();
+        }
+        self.auth_request_id = None;
+        self.cursor_auth_gave_up = true;
+        let held = std::mem::take(&mut self.held_for_auth);
+        let mut out = Vec::new();
+        for line in held {
+            let Ok(held_msg) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(held_id) = held_msg.get("id") else {
+                continue;
+            };
+            self.pending.remove(&id_key(held_id));
+            out.push(error_response(
+                held_id,
+                -32000,
+                "Cursor login did not finish. Run `agent login`, then start the session again.",
+            ));
         }
         out
     }
@@ -612,6 +652,14 @@ fn cloud_request(task: Option<String>) -> CloudRequest {
     } else {
         CloudRequest::Send(task)
     }
+}
+
+fn cursor_auth_failure(msg: &Value) -> String {
+    let detail = msg
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("Cursor authentication failed.");
+    format!("{detail} Run `agent login` if this did not open a browser.")
 }
 
 fn rewrite_modes(result: &mut Map<String, Value>) {

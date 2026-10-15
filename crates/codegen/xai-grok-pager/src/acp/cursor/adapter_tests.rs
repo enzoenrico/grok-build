@@ -232,6 +232,22 @@ fn session_new_waits_for_cursor_login() {
         r#"{"jsonrpc":"2.0","id":8,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
     );
     assert_eq!(parse(&later[0])["method"], "session/new");
+
+    let mut stalled = CursorAdapter::new(None, false);
+    stalled.outbound(
+        r#"{"jsonrpc":"2.0","id":9,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    let notices = stalled.auth_timed_out();
+    assert_eq!(notices.len(), 1);
+    let notice: Value = serde_json::from_str(&notices[0]).unwrap();
+    assert!(notice["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("agent login"));
+    let after = stalled.outbound(
+        r#"{"jsonrpc":"2.0","id":10,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    assert_eq!(parse(&after[0])["method"], "session/new");
 }
 
 #[test]
