@@ -234,7 +234,23 @@ pub(crate) fn dispatch(
         ),
         None => (format!("{api_base}/v1/agents"), create_body(text)),
     };
-    let raw = request("POST", &url, api_key, Some(&body))?;
+    let raw = match request("POST", &url, api_key, Some(&body)) {
+        Ok(raw) => raw,
+        Err(err) if is_agent_busy(&err) => {
+            let Some(id) = agent_id else {
+                return Err(err);
+            };
+            let mut agent = refresh_existing(api_base, api_key, id)?;
+            if agent.result.is_none() {
+                agent.result = Some(
+                    "Still running, so this task was not sent. Send & status to read it, or & cancel to stop it."
+                        .to_owned(),
+                );
+            }
+            return Ok(agent);
+        }
+        Err(err) => return Err(err),
+    };
     let mut agent = parse_cloud_response(&raw)?;
     let _ = refresh(api_base, api_key, &mut agent);
     Ok(agent)
@@ -396,6 +412,10 @@ fn follow_via_curl(
             err.trim().to_owned()
         })
     }
+}
+
+fn is_agent_busy(err: &str) -> bool {
+    err.contains(" 409") || err.contains("HTTP 409")
 }
 
 fn request(
@@ -746,5 +766,55 @@ data: {}
         let agent = cancel_existing(&base, "test-key", "bc-1").unwrap();
         assert_eq!(agent.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(agent.result.as_deref(), Some("Already done."));
+    }
+
+    #[test]
+    fn follow_up_while_the_agent_is_busy_reads_the_running_run() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let replies = [
+                ("409 Conflict", r#"{"code":"agent_busy"}"#),
+                (
+                    "200 OK",
+                    r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"ACTIVE","latestRunId":"run-1"}"#,
+                ),
+                (
+                    "200 OK",
+                    r#"{"id":"run-1","agentId":"bc-1","status":"RUNNING"}"#,
+                ),
+            ];
+            for (i, (status, body)) in replies.into_iter().enumerate() {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let ok = if i == 0 {
+                    req.starts_with("POST ")
+                } else {
+                    req.starts_with("GET ")
+                };
+                let (status, payload) = if ok {
+                    (status, body.to_owned())
+                } else {
+                    ("400 Bad Request", r#"{"error":"wrong method"}"#.to_owned())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let base = format!("http://{addr}");
+        let agent = dispatch(&base, "test-key", Some("bc-1"), "add tests").unwrap();
+        assert_eq!(agent.id, "bc-1");
+        assert_eq!(agent.run_status.as_deref(), Some("RUNNING"));
+        assert_eq!(
+            agent.result.as_deref(),
+            Some(
+                "Still running, so this task was not sent. Send & status to read it, or & cancel to stop it."
+            )
+        );
     }
 }
