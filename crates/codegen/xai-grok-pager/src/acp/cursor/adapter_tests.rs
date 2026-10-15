@@ -401,7 +401,7 @@ fn cursor_skills_hoist_from_the_middle_of_a_prompt() {
     );
     assert_eq!(
         parse(&out[0])["params"]["prompt"][0]["text"],
-        "/poteto-mode please review this"
+        "/poteto-mode review this\nplease"
     );
 }
 
@@ -545,7 +545,7 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
     let sent = parse(&first[0]);
     assert_eq!(
         sent["params"]["prompt"][0]["text"],
-        "/poteto-mode please the tests\nand /review later"
+        "/poteto-mode the tests\nplease\nand /review later"
     );
     assert_eq!(sent["params"]["prompt"][1]["text"], "");
     assert!(sent["params"].get("_meta").is_none());
@@ -554,7 +554,7 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
         r#"{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"s2","prompt":[{"type":"text","text":"please /review the diff"}]}}"#,
     );
     let sent = parse(&second[0]);
-    assert_eq!(sent["params"]["prompt"][0]["text"], "/review please the diff");
+    assert_eq!(sent["params"]["prompt"][0]["text"], "/review the diff\nplease");
     assert!(sent["params"].get("_meta").is_none());
     let again = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{"sessionId":"s2","prompt":[{"type":"text","text":"& keep going"}]}}"#,
@@ -603,7 +603,7 @@ fn a_cursor_command_without_skill_meta_still_hoists() {
     );
     assert_eq!(
         parse(&sent[0])["params"]["prompt"][0]["text"],
-        "/poteto-mode please review"
+        "/poteto-mode review\nplease"
     );
     let clipboard = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"please /copy-request-id now"}]}}"#,
@@ -840,7 +840,7 @@ fn cloud_task_keeps_later_text_and_hoists_a_skill() {
     };
     assert_eq!(
         request,
-        &CloudRequest::Send("/poteto-mode look at the diff\nthen please".to_owned())
+        &CloudRequest::Send("/poteto-mode please\nlook at the diff\nthen".to_owned())
     );
 
     let split = json!({

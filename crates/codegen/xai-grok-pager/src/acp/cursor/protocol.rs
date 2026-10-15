@@ -420,18 +420,33 @@ pub(crate) fn hoist_skill_text(text: &str, skills: &HashSet<String>) -> Option<S
             .unwrap_or(trimmed.len());
         let word = &trimmed[start..end];
         if skills.contains(word) {
+            // Cursor's slash command stops at the first newline, so the skill's own arguments stay on that line.
             let before = trimmed[..i].trim();
-            let after = trimmed[end..].trim();
-            let rest = match (before.is_empty(), after.is_empty()) {
-                (true, true) => String::new(),
-                (false, true) => before.to_owned(),
-                (true, false) => after.to_owned(),
-                (false, false) => format!("{before} {after}"),
-            };
-            return Some(if rest.is_empty() {
-                format!("/{word}")
+            let rest_of = &trimmed[end..];
+            let (line_args, after_lines) = if let Some(nl) = rest_of.find('\n') {
+                (rest_of[..nl].trim(), rest_of[nl + 1..].trim())
             } else {
-                format!("/{word} {rest}")
+                (rest_of.trim(), "")
+            };
+            let mut command = format!("/{word}");
+            if !line_args.is_empty() {
+                command.push(' ');
+                command.push_str(line_args);
+            }
+            let mut rest = String::new();
+            if !before.is_empty() {
+                rest.push_str(before);
+            }
+            if !after_lines.is_empty() {
+                if !rest.is_empty() {
+                    rest.push('\n');
+                }
+                rest.push_str(after_lines);
+            }
+            return Some(if rest.is_empty() {
+                command
+            } else {
+                format!("{command}\n{rest}")
             });
         }
         i = end.max(start);
@@ -1024,13 +1039,13 @@ mod tests {
         skills.insert("poteto-mode".to_owned());
         assert_eq!(
             hoist_skill_text("please /poteto-mode review this", &skills).as_deref(),
-            Some("/poteto-mode please review this")
+            Some("/poteto-mode review this\nplease")
         );
         assert_eq!(hoist_skill_text("/poteto-mode review", &skills), None);
         assert_eq!(hoist_skill_text("see /tmp/file", &skills), None);
         assert_eq!(
             hoist_skill_text("/compact please /poteto-mode review", &skills).as_deref(),
-            Some("/poteto-mode /compact please review")
+            Some("/poteto-mode review\n/compact please")
         );
     }
 
@@ -1048,7 +1063,7 @@ mod tests {
         hoist_skill_prompt(params.as_object_mut().unwrap(), &skills);
         assert_eq!(
             params["prompt"][0]["text"],
-            "/poteto-mode look at the diff\nthen please"
+            "/poteto-mode please\nlook at the diff\nthen"
         );
         assert_eq!(params["prompt"][1]["data"], "abc");
         assert_eq!(params["prompt"][2]["text"], "");
@@ -1072,7 +1087,7 @@ mod tests {
         assert!(names.contains("poteto-mode"));
         assert_eq!(
             hoist_skill_text("please /poteto-mode review", &names).as_deref(),
-            Some("/poteto-mode please review")
+            Some("/poteto-mode review\nplease")
         );
     }
 
