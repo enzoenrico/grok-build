@@ -410,15 +410,26 @@ fn cursor_subagent_updates_become_child_session_notices() {
 #[test]
 fn a_cursor_command_without_skill_meta_still_hoists() {
     let mut adapter = CursorAdapter::new(None, false);
-    adapter.inbound(
-        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"poteto-mode","description":"Poteto"}]}}}"#,
+    let listed = adapter.inbound(
+        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"poteto-mode","description":"Poteto"},{"name":"copy-request-id","description":"Copy the last request ID"}]}}}"#,
     );
+    let update = &parse(&listed[0])["params"]["update"]["availableCommands"];
+    assert_eq!(update[0]["_meta"]["path"], "cursor://skills/poteto-mode");
+    assert_eq!(update[0]["_meta"]["scope"], "user");
+    assert!(update[1].get("_meta").is_none());
     let sent = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"please /poteto-mode review"}]}}"#,
     );
     assert_eq!(
         parse(&sent[0])["params"]["prompt"][0]["text"],
         "/poteto-mode please review"
+    );
+    let clipboard = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"please /copy-request-id now"}]}}"#,
+    );
+    assert_eq!(
+        parse(&clipboard[0])["params"]["prompt"][0]["text"],
+        "please /copy-request-id now"
     );
 }
 

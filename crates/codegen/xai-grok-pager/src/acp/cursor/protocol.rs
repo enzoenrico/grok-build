@@ -142,6 +142,7 @@ pub(crate) fn normalize_commands(commands: Option<&mut Value>) {
             continue;
         };
         if !command_is_skill(obj) {
+            stamp_bare_cursor_skill(obj);
             continue;
         }
         let name = obj
@@ -173,6 +174,20 @@ pub(crate) fn normalize_commands(commands: Option<&mut Value>) {
             meta.insert("scope".to_owned(), Value::String("user".to_owned()));
         }
     }
+}
+
+fn stamp_bare_cursor_skill(cmd: &mut Map<String, Value>) {
+    if cmd.get("_meta").is_some() {
+        return;
+    }
+    let Some(name) = cmd.get("name").and_then(Value::as_str) else {
+        return;
+    };
+    if name == "copy-request-id" {
+        return;
+    }
+    let name = name.to_owned();
+    cmd.insert("_meta".to_owned(), skill_meta(&name, None));
 }
 
 pub(crate) fn command_names(commands: Option<&Value>) -> HashSet<String> {

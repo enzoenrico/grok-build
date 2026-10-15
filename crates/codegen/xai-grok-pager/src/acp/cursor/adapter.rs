@@ -436,7 +436,7 @@ impl CursorAdapter {
             .entry(session_id.to_owned())
             .or_default()
             .skills
-            .extend(protocol::command_names(commands));
+            .extend(protocol::skill_names(commands));
     }
 
     fn record_models(&mut self, result: &Map<String, Value>) {
