@@ -236,7 +236,6 @@ pub(crate) fn hoist_skill_prompt(params: &mut Map<String, Value>, skills: &HashS
         if let Some(hoisted) = hoist_skill_text(text, skills) {
             block["text"] = Value::String(hoisted);
         }
-        break;
     }
 }
 
@@ -738,6 +737,22 @@ mod tests {
         );
         assert_eq!(hoist_skill_text("/poteto-mode review", &skills), None);
         assert_eq!(hoist_skill_text("see /tmp/file", &skills), None);
+    }
+
+    #[test]
+    fn a_skill_in_a_later_text_block_is_hoisted() {
+        let mut skills = HashSet::new();
+        skills.insert("poteto-mode".to_owned());
+        let mut params = json!({
+            "prompt": [
+                {"type": "text", "text": "look at the diff"},
+                {"type": "image", "data": "abc"},
+                {"type": "text", "text": "then /poteto-mode please"}
+            ]
+        });
+        hoist_skill_prompt(params.as_object_mut().unwrap(), &skills);
+        assert_eq!(params["prompt"][0]["text"], "look at the diff");
+        assert_eq!(params["prompt"][2]["text"], "/poteto-mode then please");
     }
 
     #[test]

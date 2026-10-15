@@ -54,10 +54,14 @@ pub(crate) struct CursorAdapter {
     preferred_model: Option<String>,
     /// Cursor loads its own MCP config; the pager's list (which already includes `~/.cursor/mcp.json`) is dropped unless opted in.
     forward_mcp_servers: bool,
-    skill_names: HashSet<String>,
-    cloud_agent_id: Option<String>,
-    last_session_id: Option<String>,
+    sessions: HashMap<String, CursorSession>,
     bridge_wait: HashMap<String, protocol::PendingBridge>,
+}
+
+#[derive(Debug, Default)]
+struct CursorSession {
+    skills: HashSet<String>,
+    cloud_agent_id: Option<String>,
 }
 
 impl CursorAdapter {
@@ -150,27 +154,36 @@ impl CursorAdapter {
                 }
             }
             "session/prompt" => {
-                let mut cloud_handoff = false;
-                if let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) {
-                    protocol::hoist_skill_prompt(params, &self.skill_names);
-                    cloud_handoff = protocol::prompt_is_cloud_handoff(params);
-                    let follow = if cloud_handoff {
-                        None
-                    } else {
-                        self.cloud_agent_id.as_deref()
-                    };
-                    protocol::stamp_cloud_handoff(params, follow);
-                }
                 let session_id = msg
                     .pointer("/params/sessionId")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                let skills = session_id
+                    .as_deref()
+                    .and_then(|id| self.sessions.get(id))
+                    .map(|session| session.skills.clone())
+                    .unwrap_or_default();
+                let cloud_agent_id = session_id
+                    .as_deref()
+                    .and_then(|id| self.sessions.get(id))
+                    .and_then(|session| session.cloud_agent_id.clone());
+                let mut cloud_handoff = false;
+                if let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) {
+                    protocol::hoist_skill_prompt(params, &skills);
+                    cloud_handoff = protocol::prompt_is_cloud_handoff(params);
+                    let follow = if cloud_handoff {
+                        None
+                    } else {
+                        cloud_agent_id.as_deref()
+                    };
+                    protocol::stamp_cloud_handoff(params, follow);
+                }
                 let prompt_id = msg
                     .pointer("/params/_meta/promptId")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 if let Some(session_id) = session_id {
-                    self.last_session_id = Some(session_id.clone());
+                    self.sessions.entry(session_id.clone()).or_default();
                     if let Some(prompt_id) = prompt_id {
                         self.active_prompts.insert(session_id.clone(), prompt_id);
                     }
@@ -204,9 +217,10 @@ impl CursorAdapter {
                 }
                 return vec![Routed::ToClient(msg.to_string())];
             }
-            if let Some(translated) =
-                protocol::translate_cursor_inbound(&msg, self.last_session_id.as_deref())
-            {
+            if let Some(translated) = protocol::translate_cursor_inbound(
+                &msg,
+                self.inbound_session_id(&msg).as_deref(),
+            ) {
                 if let (Some(id), Some(pending)) = (msg.get("id"), translated.pending) {
                     self.bridge_wait.insert(id_key(id), pending);
                 }
@@ -257,11 +271,13 @@ impl CursorAdapter {
                         .map(str::to_owned)
                         .or(session_id);
                     if let Some(session_id) = &session_id {
-                        self.last_session_id = Some(session_id.clone());
+                        self.sessions.entry(session_id.clone()).or_default();
                     }
                     rewrite_modes(result);
                     protocol::absorb_cursor_skills(result);
-                    self.remember_skills(result.get("availableCommands"));
+                    if let Some(session_id) = &session_id {
+                        self.remember_skills(session_id, result.get("availableCommands"));
+                    }
                     self.record_models(result);
                     if let (Some(session_id), Some(requested)) = (session_id, requested_model)
                         && let Some(set_model) =
@@ -282,7 +298,10 @@ impl CursorAdapter {
                             .or_insert(Value::String(prompt_id));
                     }
                     if cloud_handoff && let Some(agent_id) = protocol::cloud_agent_id(result) {
-                        self.cloud_agent_id = Some(agent_id.clone());
+                        self.sessions
+                            .entry(session_id.clone())
+                            .or_default()
+                            .cloud_agent_id = Some(agent_id.clone());
                         out.push(Routed::ToClient(
                             protocol::cloud_status_update(&session_id, &agent_id).to_string(),
                         ));
@@ -330,21 +349,41 @@ impl CursorAdapter {
         let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) else {
             return;
         };
-        if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
-            self.last_session_id = Some(session_id.to_owned());
-        }
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let Some(update) = params.get_mut("update").and_then(Value::as_object_mut) else {
             return;
         };
         if update.get("sessionUpdate").and_then(Value::as_str) == Some("available_commands_update")
         {
             protocol::normalize_commands(update.get_mut("availableCommands"));
-            self.remember_skills(update.get("availableCommands"));
+            if let Some(session_id) = session_id {
+                self.remember_skills(&session_id, update.get("availableCommands"));
+            }
         }
     }
 
-    fn remember_skills(&mut self, commands: Option<&Value>) {
-        self.skill_names.extend(protocol::skill_names(commands));
+    fn inbound_session_id(&self, msg: &Value) -> Option<String> {
+        if let Some(session_id) = msg
+            .pointer("/params/sessionId")
+            .and_then(Value::as_str)
+        {
+            return Some(session_id.to_owned());
+        }
+        if self.sessions.len() == 1 {
+            return self.sessions.keys().next().cloned();
+        }
+        None
+    }
+
+    fn remember_skills(&mut self, session_id: &str, commands: Option<&Value>) {
+        self.sessions
+            .entry(session_id.to_owned())
+            .or_default()
+            .skills
+            .extend(protocol::skill_names(commands));
     }
 
     fn record_models(&mut self, result: &Map<String, Value>) {

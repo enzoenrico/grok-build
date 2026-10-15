@@ -295,6 +295,51 @@ fn cloud_handoff_is_forwarded_and_a_follow_up_keeps_the_agent_id() {
 }
 
 #[test]
+fn two_sessions_keep_their_own_skills_and_cloud_agents() {
+    let mut adapter = CursorAdapter::new(None, false);
+    for (id, skill, cloud) in [("s1", "poteto-mode", "bc-one"), ("s2", "review", "bc-two")] {
+        adapter.outbound(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"session/new","params":{{"cwd":"/tmp","mcpServers":[]}}}}"#
+        ));
+        let created = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "sessionId": id,
+                "skills": [{ "name": skill, "description": skill }]
+            }
+        });
+        adapter.inbound(&created.to_string());
+        adapter.outbound(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{{"sessionId":"{id}","prompt":[{{"type":"text","text":"& ship it"}}]}}}}"#
+        ));
+        adapter.inbound(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn","cloudAgentId":"{cloud}"}}}}"#
+        ));
+    }
+
+    let first = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":8,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"please /poteto-mode the tests"},{"type":"text","text":"and /review later"}]}}"#,
+    );
+    let sent = parse(&first[0]);
+    assert_eq!(sent["params"]["prompt"][0]["text"], "/poteto-mode please the tests");
+    assert_eq!(sent["params"]["prompt"][1]["text"], "and /review later");
+    assert_eq!(sent["params"]["_meta"]["cloudAgentId"], "bc-one");
+
+    let second = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"s2","prompt":[{"type":"text","text":"please /review the diff"}]}}"#,
+    );
+    let sent = parse(&second[0]);
+    assert_eq!(sent["params"]["prompt"][0]["text"], "/review please the diff");
+    assert_eq!(sent["params"]["_meta"]["cloudAgentId"], "bc-two");
+
+    let asked = adapter.inbound(
+        r#"{"jsonrpc":"2.0","id":11,"method":"cursor/ask_question","params":{"sessionId":"s2","toolCallId":"q","questions":[{"id":"q1","prompt":"Ship?","options":[{"id":"yes","label":"Yes"}]}]}}"#,
+    );
+    assert_eq!(parse(&asked[0])["params"]["params"]["sessionId"], "s2");
+}
+
+#[test]
 fn cursor_question_is_answered_through_the_pager_ext_method() {
     let mut adapter = CursorAdapter::new(None, false);
     adapter.outbound(r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#);
