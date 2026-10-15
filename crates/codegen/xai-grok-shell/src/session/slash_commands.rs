@@ -1560,71 +1560,83 @@ pub(super) fn resolve_human_intent(
     _skill_rewrite: SkillSlashRewrite,
     workflows: &[crate::session::workflow::registry::WorkflowListing],
 ) -> Result<Vec<acp::ContentBlock>, SlashCommandOutcome> {
-    let Some((command_name, args)) =
-        crate::session::slash_authority::parse_slash_prefix(&prompt_blocks)
-    else {
-        return Ok(prompt_blocks);
-    };
-    let command_key = slash_key(command_name);
-    if let Some(prompt_cmd) = PROMPT_COMMANDS
-        .iter()
-        .find(|c| slash_key(c.name) == command_key)
-        && availability.allows(prompt_cmd.gate)
-    {
-        let mut blocks = match prompt_cmd.name {
-            "loop" => build_loop_prompt_blocks(args),
-            other => {
-                unreachable!("prompt-only command /{other} has no resolver wired in resolve()")
+    let owned_prefix = crate::session::slash_authority::parse_slash_prefix(&prompt_blocks)
+        .map(|(name, args)| (name.to_owned(), args.to_owned()));
+    if let Some((command_name, args)) = owned_prefix.as_ref() {
+        let command_name = command_name.as_str();
+        let args = args.as_str();
+        let command_key = slash_key(command_name);
+        if let Some(prompt_cmd) = PROMPT_COMMANDS
+            .iter()
+            .find(|c| slash_key(c.name) == command_key)
+            && availability.allows(prompt_cmd.gate)
+        {
+            let mut blocks = match prompt_cmd.name {
+                "loop" => build_loop_prompt_blocks(args),
+                other => {
+                    unreachable!("prompt-only command /{other} has no resolver wired in resolve()")
+                }
+            };
+            let display_text = if args.is_empty() {
+                format!("/{command_name}")
+            } else {
+                format!("/{command_name} {args}")
+            };
+            if let Some(acp::ContentBlock::Text(tb)) = blocks.first_mut() {
+                let map = tb.meta.get_or_insert_with(acp::Meta::new);
+                map.insert(
+                    "displayText".to_string(),
+                    serde_json::Value::String(display_text),
+                );
             }
-        };
-        let display_text = if args.is_empty() {
-            format!("/{command_name}")
-        } else {
-            format!("/{command_name} {args}")
-        };
-        if let Some(acp::ContentBlock::Text(tb)) = blocks.first_mut() {
-            let map = tb.meta.get_or_insert_with(acp::Meta::new);
-            map.insert(
-                "displayText".to_string(),
-                serde_json::Value::String(display_text),
-            );
+            return Err(SlashCommandOutcome::InvokeSkill {
+                blocks,
+                skills: vec![],
+            });
         }
-        return Err(SlashCommandOutcome::InvokeSkill {
-            blocks,
-            skills: vec![],
-        });
+        let catalog = EffectiveCommandCatalog::build(skills, availability, workflows);
+        if let Some(builtin) = catalog.builtins.iter().find(|builtin| {
+            slash_key(builtin.name) == command_key
+                || builtin
+                    .aliases
+                    .iter()
+                    .any(|alias| slash_key(alias) == command_key)
+        }) {
+            let action = (builtin.resolve)(args);
+            if matches!(action, BuiltinAction::WorkflowLaunch { .. }) && !availability.workflows {
+                return Ok(prompt_blocks);
+            }
+            return Err(SlashCommandOutcome::Builtin(action));
+        }
+        return finish_skill_or_workflow(prompt_blocks, &catalog, Some((command_name, args)));
     }
     let catalog = EffectiveCommandCatalog::build(skills, availability, workflows);
-    if let Some(builtin) = catalog.builtins.iter().find(|builtin| {
-        slash_key(builtin.name) == command_key
-            || builtin
-                .aliases
-                .iter()
-                .any(|alias| slash_key(alias) == command_key)
-    }) {
-        let action = (builtin.resolve)(args);
-        if matches!(action, BuiltinAction::WorkflowLaunch { .. }) && !availability.workflows {
-            return Ok(prompt_blocks);
+    finish_skill_or_workflow(prompt_blocks, &catalog, None)
+}
+
+fn finish_skill_or_workflow(
+    prompt_blocks: Vec<acp::ContentBlock>,
+    catalog: &EffectiveCommandCatalog<'_>,
+    prefix: Option<(&str, &str)>,
+) -> Result<Vec<acp::ContentBlock>, SlashCommandOutcome> {
+    let mut parsed_skills = Vec::new();
+    for block in &prompt_blocks {
+        let acp::ContentBlock::Text(text) = block else {
+            continue;
+        };
+        if let Some(refs) = parse_skill_references_with_catalog(&text.text, catalog) {
+            parsed_skills.extend(refs);
         }
-        return Err(SlashCommandOutcome::Builtin(action));
     }
-    let full_text = prompt_blocks
-        .iter()
-        .find_map(|b| {
-            if let acp::ContentBlock::Text(t) = b {
-                Some(t.text.as_str())
-            } else {
-                None
-            }
-        })
-        .unwrap_or("");
-    if let Some(parsed_skills) = parse_skill_references_with_catalog(full_text, &catalog) {
+    if !parsed_skills.is_empty() {
         return Err(SlashCommandOutcome::InvokeSkill {
             blocks: prompt_blocks,
             skills: parsed_skills,
         });
     }
-    if let Some(workflow) = catalog.workflow(&command_key) {
+    if let Some((command_name, args)) = prefix
+        && let Some(workflow) = catalog.workflow(&slash_key(command_name))
+    {
         return Err(SlashCommandOutcome::Builtin(
             BuiltinAction::WorkflowLaunch {
                 name: workflow.name.clone(),

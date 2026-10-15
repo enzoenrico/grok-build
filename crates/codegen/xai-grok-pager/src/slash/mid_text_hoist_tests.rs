@@ -123,6 +123,25 @@ fn detects_mid_text_goal_only_when_advertised() {
 }
 
 #[test]
+fn cursor_user_skill_is_armed_mid_message() {
+    let mut registry = builtins();
+    let meta = serde_json::json!({
+        "path": "cursor://skills/poteto-mode",
+        "scope": "user",
+    });
+    let cmd = acp::AvailableCommand::new("poteto-mode".to_string(), "Poteto".to_string())
+        .meta(meta.as_object().unwrap().clone());
+    registry.set_acp_commands(&[cmd]);
+    let text = "please /poteto-mode review this";
+    let command = registry.get_for_dispatch("poteto-mode").expect("skill");
+    assert!(token_is_armed_inline(
+        text,
+        &first_token(text),
+        command.as_ref()
+    ));
+}
+
+#[test]
 fn mid_text_goal_is_unarmed_leading_goal_is_armed() {
     let registry = with_goal();
     let cmd = registry.get_for_dispatch("goal").expect("goal");

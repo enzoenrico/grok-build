@@ -256,11 +256,6 @@ impl SessionActor {
     /// Interjections bypass turn-start slash resolution (`slash_commands::resolve`).
     /// Without this, a queued `/skill` row force-sent mid-turn, or a typed `/skill` interjection, reaches the model as a bare, unexpanded slash command.
     async fn interjection_skill_information(&self, text: &str) -> Option<String> {
-        // Mirror turn-start gating (`parse_slash_prefix`): only a leading slash invokes skills
-        // "don't run /commit yet" is steering text, not an invocation
-        if !text.trim_start().starts_with('/') {
-            return None;
-        }
         let slash_skills = self.slash_skills_for_resolve().await;
         // Availability without `command_availability()`'s goal-reconciliation side effects; this runs mid-turn inside the drain
         let tool_names = self.registered_tool_names().await;

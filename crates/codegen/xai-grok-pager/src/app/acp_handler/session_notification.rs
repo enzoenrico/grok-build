@@ -1990,6 +1990,8 @@ pub(crate) fn detect_plan_mode_change_replayed(
     let user_left = staged == Some(false);
     agent.plan_mode_active = now_active;
     agent.plan_mode_pending = None;
+    let wire_id = cmu.current_mode_id.0.as_ref();
+    agent.extension_mode_id = SessionMode::unmodeled_wire_id(wire_id).map(str::to_owned);
     agent.session_mode = mode;
     agent.session_mode_pending = None;
     let historical = is_replay || agent.session.loading_replay;

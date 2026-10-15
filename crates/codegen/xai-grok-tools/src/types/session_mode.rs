@@ -30,6 +30,12 @@ impl SessionMode {
     pub fn is_plan(&self) -> bool {
         matches!(self, Self::Plan)
     }
+
+    /// `Some(wire_id)` when the id is not one of `default`, `plan`, or `ask`.
+    pub fn unmodeled_wire_id(wire_id: &str) -> Option<&str> {
+        let parsed = Self::from_id(wire_id);
+        (parsed.as_id() != wire_id).then_some(wire_id)
+    }
 }
 
 #[cfg(test)]
@@ -42,6 +48,13 @@ mod tests {
             let mode = SessionMode::from_id(id);
             assert_eq!(mode.as_id(), id, "round-trip failed for {id}");
         }
+    }
+
+    #[test]
+    fn unmodeled_wire_id_keeps_unknown_ids() {
+        assert_eq!(SessionMode::unmodeled_wire_id("debug"), Some("debug"));
+        assert_eq!(SessionMode::unmodeled_wire_id("plan"), None);
+        assert_eq!(SessionMode::unmodeled_wire_id("default"), None);
     }
 
     #[test]

@@ -282,8 +282,6 @@ async fn drain_interjection_expands_skill_slash_reference() {
                 "SKILL.md body with substituted args must ride along, got: {text}"
             );
 
-            // A steering interjection that only mentions the skill mid-text (no leading slash) stays untouched
-            // The same gating applies at turn start, where "don't run /commit yet" is not an invocation
             actor.pending_interjections.push(PendingInterjection {
                 text: "don't run /find-session yet".to_string(),
                 attachments: vec![],
@@ -292,8 +290,16 @@ async fn drain_interjection_expands_skill_slash_reference() {
             let conversation = actor.chat_state_handle.get_conversation().await;
             let text = conversation.last().expect("user item").text_content();
             assert!(
-                !text.contains("<skill_information>"),
-                "non-leading slash mentions must not grow an envelope, got: {text}"
+                text.contains("<user_query>\ndon't run /find-session yet\n</user_query>"),
+                "the typed sentence stays the query, got: {text}"
+            );
+            assert!(
+                text.contains("<skill_information>"),
+                "a skill token anywhere in the message must expand, got: {text}"
+            );
+            assert!(
+                text.contains("Find sessions matching yet"),
+                "args after the mid-message token must substitute, got: {text}"
             );
         })
         .await;

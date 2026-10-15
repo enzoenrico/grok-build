@@ -855,21 +855,46 @@ fn dispatch_cycle_mode_inner(app: &mut AppView) -> Vec<Effect> {
     } else {
         None
     };
-    let (chosen, blocked) = next_choice(&choices, permission, &mode, yolo_locked);
+    let extension_mode_id = agent.extension_mode_id.clone();
+    let (chosen, blocked) = next_choice(
+        &choices,
+        permission,
+        &mode,
+        extension_mode_id.as_deref(),
+        yolo_locked,
+    );
     let Some((next, name)) = chosen else {
         return vec![];
     };
 
     let target_mode = match next {
         ModeChoice::Session(session_mode) => session_mode.clone(),
-        ModeChoice::Auto | ModeChoice::AlwaysApprove => SessionMode::Default,
+        ModeChoice::Unmodeled(_) | ModeChoice::Auto | ModeChoice::AlwaysApprove => {
+            SessionMode::Default
+        }
+    };
+    let wire_id = match next {
+        ModeChoice::Unmodeled(id) => id.clone(),
+        ModeChoice::Session(session_mode) => session_mode.as_id().to_owned(),
+        ModeChoice::Auto | ModeChoice::AlwaysApprove => SessionMode::Default.as_id().to_owned(),
+    };
+    let mode_changed = match next {
+        ModeChoice::Unmodeled(id) => agent.extension_mode_id.as_deref() != Some(id.as_str()),
+        ModeChoice::Session(_) => target_mode != mode || agent.extension_mode_id.is_some(),
+        ModeChoice::Auto | ModeChoice::AlwaysApprove => {
+            target_mode != mode || agent.extension_mode_id.is_some()
+        }
     };
     let mut effects = Vec::new();
-    if target_mode != mode {
-        agent.stage_session_mode(target_mode.clone());
+    if mode_changed {
+        agent.extension_mode_id = match next {
+            ModeChoice::Unmodeled(id) => Some(id.clone()),
+            _ => None,
+        };
+        agent.stage_session_mode(target_mode);
         effects.push(Effect::SetSessionMode {
             session_id: session_id.clone(),
-            mode_id: acp::SessionModeId::new(target_mode.as_id()),
+            mode_id: acp::SessionModeId::new(wire_id),
         });
     }
 
@@ -895,6 +920,7 @@ fn dispatch_cycle_mode_inner(app: &mut AppView) -> Vec<Effect> {
 #[derive(PartialEq)]
 enum ModeChoice {
     Session(SessionMode),
+    Unmodeled(String),
     Auto,
     AlwaysApprove,
 }
@@ -923,9 +949,14 @@ fn published_mode_choices(agent: &crate::app::agent_view::AgentView) -> Vec<(Mod
     agent
         .available_modes
         .iter()
-        .filter_map(|mode| {
-            let id: SessionMode = mode.id.0.parse().ok()?;
-            Some((ModeChoice::Session(id), mode.name.clone()))
+        .map(|mode| {
+            let wire_id = mode.id.0.as_ref();
+            let parsed = SessionMode::from_id(wire_id);
+            let choice = match SessionMode::unmodeled_wire_id(wire_id) {
+                Some(id) => ModeChoice::Unmodeled(id.to_owned()),
+                None => ModeChoice::Session(parsed),
+            };
+            (choice, mode.name.clone())
         })
         .collect()
 }
@@ -935,16 +966,19 @@ fn next_choice<'a>(
     choices: &'a [(ModeChoice, String)],
     permission: Option<ModeChoice>,
     mode: &SessionMode,
+    extension_mode_id: Option<&str>,
     yolo_locked: Option<&'static str>,
 ) -> (Option<&'a (ModeChoice, String)>, Option<&'static str>) {
-    // Shift+Tab exits the session mode and keeps the permission already on
-    let stays = permission.is_some() && *mode != SessionMode::Default;
-    let current = permission.unwrap_or(ModeChoice::Session(mode.clone()));
+    let keep_permission = permission.is_some() && *mode != SessionMode::Default;
+    let session_choice = extension_mode_id
+        .map(|id| ModeChoice::Unmodeled(id.to_owned()))
+        .unwrap_or_else(|| ModeChoice::Session(mode.clone()));
+    let current = permission.unwrap_or(session_choice);
     let mut next_index = choices
         .iter()
         .position(|(choice, _)| *choice == current)
         .map_or(0, |index| {
-            if stays {
+            if keep_permission {
                 index
             } else {
                 (index + 1) % choices.len()
@@ -980,10 +1014,10 @@ fn apply_choice_permission(
             app.current_ui.permission_mode = Some("auto".into());
             Some("auto")
         }
-        ModeChoice::Session(_) if in_yolo || in_auto || blocked => {
+        ModeChoice::Unmodeled(_) | ModeChoice::Session(_) if in_yolo || in_auto || blocked => {
             set_yolo_mode_inner(app, false);
             Some("ask")
         }
-        ModeChoice::Session(_) => None,
+        ModeChoice::Unmodeled(_) | ModeChoice::Session(_) => None,
     }
 }
