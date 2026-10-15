@@ -244,6 +244,9 @@ impl CursorAdapter {
 
         if let Some(method) = msg.get("method").and_then(Value::as_str).map(str::to_owned) {
             if method == "session/update" {
+                if let Some(ext) = protocol::cursor_subagent_ext(&msg) {
+                    return vec![Routed::ToClient(ext.to_string())];
+                }
                 self.note_session_update(&mut msg);
                 if !self.stamp_session_update(&mut msg) {
                     return Vec::new();
@@ -389,7 +392,6 @@ impl CursorAdapter {
         let Some(update) = params.get_mut("update").and_then(Value::as_object_mut) else {
             return;
         };
-        protocol::rewrite_cursor_subagent_update(update);
         if update.get("sessionUpdate").and_then(Value::as_str) == Some("available_commands_update")
         {
             protocol::normalize_commands(update.get_mut("availableCommands"));

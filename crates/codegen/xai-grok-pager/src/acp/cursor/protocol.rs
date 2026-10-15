@@ -236,58 +236,78 @@ fn skill_meta(name: &str, path: Option<&str>) -> Value {
     json!({ "path": path, "scope": "user" })
 }
 
-pub(crate) fn rewrite_cursor_subagent_update(update: &mut Map<String, Value>) {
-    let kind = update.get("sessionUpdate").and_then(Value::as_str);
-    match kind {
-        Some("subagent_spawned") => {
-            let id = update
-                .get("subagentSessionId")
-                .and_then(Value::as_str)
-                .unwrap_or("subagent")
-                .to_owned();
-            let name = update
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("subagent");
-            let task = update.get("task").and_then(Value::as_str).unwrap_or("");
-            let title = if task.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{name}: {task}")
-            };
-            *update = json!({
-                "sessionUpdate": "tool_call",
-                "toolCallId": id,
-                "title": title,
-                "kind": "other",
-                "status": "in_progress",
-            })
-            .as_object()
-            .expect("tool call object")
-            .clone();
-        }
-        Some("subagent_state_update") => {
-            let id = update
-                .get("subagentSessionId")
-                .and_then(Value::as_str)
-                .unwrap_or("subagent")
-                .to_owned();
+pub(crate) fn cursor_subagent_ext(msg: &Value) -> Option<Value> {
+    let params = msg.get("params")?;
+    let update = params.get("update")?;
+    let session_id = params.get("sessionId").and_then(Value::as_str)?;
+    let child = update.get("subagentSessionId").and_then(Value::as_str)?;
+    let body = match update.get("sessionUpdate").and_then(Value::as_str)? {
+        "subagent_spawned" => json!({
+            "sessionUpdate": "subagent_spawned",
+            "subagent_id": child,
+            "parent_session_id": session_id,
+            "child_session_id": child,
+            "subagent_type": update.get("name").and_then(Value::as_str).unwrap_or("subagent"),
+            "description": update.get("task").and_then(Value::as_str).unwrap_or(""),
+        }),
+        "subagent_state_update" => {
             let state = update.get("state").and_then(Value::as_str).unwrap_or("");
-            let status = match state {
-                "completed" | "done" | "finished" | "success" => "completed",
-                "failed" | "error" | "disconnected" => "failed",
-                _ => "in_progress",
-            };
-            *update = json!({
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": id,
-                "status": status,
-            })
-            .as_object()
-            .expect("tool call update object")
-            .clone();
+            if subagent_state_is_terminal(state) {
+                json!({
+                    "sessionUpdate": "subagent_finished",
+                    "subagent_id": child,
+                    "child_session_id": child,
+                    "status": subagent_finish_status(state),
+                    "tool_calls": 0,
+                    "turns": 0,
+                    "duration_ms": 0,
+                })
+            } else {
+                json!({
+                    "sessionUpdate": "subagent_progress",
+                    "subagent_id": child,
+                    "parent_session_id": session_id,
+                    "child_session_id": child,
+                    "duration_ms": 0,
+                    "turn_count": 0,
+                    "tool_call_count": 0,
+                    "tokens_used": 0,
+                    "context_window_tokens": 0,
+                    "context_usage_pct": 0,
+                    "tools_used": [],
+                    "error_count": 0,
+                })
+            }
         }
-        _ => {}
+        _ => return None,
+    };
+    Some(json!({
+        "jsonrpc": "2.0",
+        "method": "_x.ai/session_notification",
+        "params": { "sessionId": session_id, "update": body }
+    }))
+}
+
+fn subagent_state_is_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        "completed"
+            | "done"
+            | "finished"
+            | "success"
+            | "failed"
+            | "error"
+            | "disconnected"
+            | "cancelled"
+            | "canceled"
+    )
+}
+
+fn subagent_finish_status(state: &str) -> &'static str {
+    match state {
+        "failed" | "error" | "disconnected" => "failed",
+        "cancelled" | "canceled" => "cancelled",
+        _ => "completed",
     }
 }
 
@@ -838,33 +858,59 @@ mod tests {
     }
 
     #[test]
-    fn subagent_spawn_becomes_a_tool_call_the_pager_can_parse() {
-        let mut update = json!({
-            "sessionUpdate": "subagent_spawned",
-            "subagentSessionId": "child-1",
-            "name": "explore",
-            "task": "Find auth"
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        rewrite_cursor_subagent_update(&mut update);
-        assert_eq!(update["sessionUpdate"], "tool_call");
-        assert_eq!(update["toolCallId"], "child-1");
-        assert_eq!(update["title"], "explore: Find auth");
-        assert_eq!(update["status"], "in_progress");
+    fn subagent_spawn_becomes_the_pager_child_session_notice() {
+        use xai_grok_shell::extensions::notification::SessionUpdate;
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "parent",
+                "update": {
+                    "sessionUpdate": "subagent_spawned",
+                    "subagentSessionId": "child-1",
+                    "name": "explore",
+                    "task": "Find auth"
+                }
+            }
+        });
+        let ext = cursor_subagent_ext(&msg).unwrap();
+        assert_eq!(ext["method"], "_x.ai/session_notification");
+        let parsed: SessionUpdate = serde_json::from_value(ext["params"]["update"].clone()).unwrap();
+        let SessionUpdate::SubagentSpawned {
+            subagent_id,
+            parent_session_id,
+            child_session_id,
+            subagent_type,
+            description,
+            ..
+        } = parsed
+        else {
+            panic!("expected SubagentSpawned");
+        };
+        assert_eq!(subagent_id, "child-1");
+        assert_eq!(parent_session_id, "parent");
+        assert_eq!(child_session_id, "child-1");
+        assert_eq!(subagent_type, "explore");
+        assert_eq!(description, "Find auth");
 
-        let mut done = json!({
-            "sessionUpdate": "subagent_state_update",
-            "subagentSessionId": "child-1",
-            "state": "completed"
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        rewrite_cursor_subagent_update(&mut done);
-        assert_eq!(done["sessionUpdate"], "tool_call_update");
-        assert_eq!(done["status"], "completed");
+        let done = json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "parent",
+                "update": {
+                    "sessionUpdate": "subagent_state_update",
+                    "subagentSessionId": "child-1",
+                    "state": "completed"
+                }
+            }
+        });
+        let ext = cursor_subagent_ext(&done).unwrap();
+        let parsed: SessionUpdate = serde_json::from_value(ext["params"]["update"].clone()).unwrap();
+        let SessionUpdate::SubagentFinished { status, child_session_id, .. } = parsed else {
+            panic!("expected SubagentFinished");
+        };
+        assert_eq!(child_session_id, "child-1");
+        assert_eq!(status, "completed");
     }
 
     #[test]

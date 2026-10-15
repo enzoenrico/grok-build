@@ -359,15 +359,16 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
 }
 
 #[test]
-fn cursor_subagent_updates_become_tool_calls() {
+fn cursor_subagent_updates_become_child_session_notices() {
     let mut adapter = CursorAdapter::new(None, false);
     let spawned = adapter.inbound(
         r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"subagent_spawned","subagentSessionId":"child-1","name":"explore","task":"Find auth"}}}"#,
     );
-    let update = &parse(&spawned[0])["params"]["update"];
-    assert_eq!(update["sessionUpdate"], "tool_call");
-    assert_eq!(update["toolCallId"], "child-1");
-    assert_eq!(update["status"], "in_progress");
+    let notice = parse(&spawned[0]);
+    assert_eq!(notice["method"], "_x.ai/session_notification");
+    assert_eq!(notice["params"]["update"]["sessionUpdate"], "subagent_spawned");
+    assert_eq!(notice["params"]["update"]["child_session_id"], "child-1");
+    assert_eq!(notice["params"]["update"]["parent_session_id"], "s1");
 
     let init = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#,
