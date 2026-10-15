@@ -436,6 +436,116 @@
     }
 
     #[test]
+    fn cursor_subagent_notice_opens_a_child_session() {
+        let spawned = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "subagent_spawned",
+                    "subagentSessionId": "child-1",
+                    "name": "explore",
+                    "task": "Find auth"
+                }
+            }
+        });
+        let ext = crate::acp::cursor::protocol::cursor_subagent_ext(&spawned).unwrap();
+        let method = ext["method"].as_str().unwrap().trim_start_matches('_');
+        let raw = serde_json::value::to_raw_value(&ext["params"]).unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let msg = AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+            request: acp::ExtNotification::new(method, raw.into()),
+            response_tx: tx,
+        });
+        let mut app = make_app_with_agent("sess-1");
+        assert!(handle(msg, &mut app));
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let info = agent
+            .subagent_sessions
+            .get("child-1")
+            .expect("child session registered");
+        assert_eq!(info.description.as_ref(), "Find auth");
+        assert_eq!(info.subagent_type.as_ref(), "explore");
+        assert!(agent.subagent_views.contains_key("child-1"));
+
+        let finished = serde_json::json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "subagent_state_update",
+                    "subagentSessionId": "child-1",
+                    "state": "completed"
+                }
+            }
+        });
+        let ext = crate::acp::cursor::protocol::cursor_subagent_ext(&finished).unwrap();
+        let method = ext["method"].as_str().unwrap().trim_start_matches('_');
+        let raw = serde_json::value::to_raw_value(&ext["params"]).unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let msg = AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+            request: acp::ExtNotification::new(method, raw.into()),
+            response_tx: tx,
+        });
+        assert!(handle(msg, &mut app));
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let info = agent.subagent_sessions.get("child-1").unwrap();
+        assert!(info.is_finished());
+        assert_eq!(info.attempt.status.as_deref(), Some("completed"));
+
+        let dropped = serde_json::json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "subagent_spawned",
+                    "subagentSessionId": "child-2",
+                    "name": "explore",
+                    "task": "Read the logs"
+                }
+            }
+        });
+        let ext = crate::acp::cursor::protocol::cursor_subagent_ext(&dropped).unwrap();
+        let method = ext["method"].as_str().unwrap().trim_start_matches('_');
+        let raw = serde_json::value::to_raw_value(&ext["params"]).unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        assert!(handle(
+            AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+                request: acp::ExtNotification::new(method, raw.into()),
+                response_tx: tx,
+            }),
+            &mut app,
+        ));
+        let disconnected = serde_json::json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-1",
+                "update": {
+                    "sessionUpdate": "subagent_state_update",
+                    "subagentSessionId": "child-2",
+                    "state": "disconnected"
+                }
+            }
+        });
+        let ext = crate::acp::cursor::protocol::cursor_subagent_ext(&disconnected).unwrap();
+        let method = ext["method"].as_str().unwrap().trim_start_matches('_');
+        let raw = serde_json::value::to_raw_value(&ext["params"]).unwrap();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        assert!(handle(
+            AcpClientMessage::ExtNotification(xai_acp_lib::AcpArgs {
+                request: acp::ExtNotification::new(method, raw.into()),
+                response_tx: tx,
+            }),
+            &mut app,
+        ));
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let info = agent.subagent_sessions.get("child-2").unwrap();
+        assert!(info.is_finished());
+        assert_eq!(info.attempt.status.as_deref(), Some("failed"));
+    }
+
+    #[test]
     fn a_spawn_then_finish_updates_the_parent_row() {
         let mut app = make_app_with_agent("sess-parent");
         let child_sid = "child-sess-replay";

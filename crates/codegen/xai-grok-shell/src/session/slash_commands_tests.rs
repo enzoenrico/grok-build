@@ -1633,8 +1633,95 @@ fn parse_skill_refs_carry_the_skill_origin() {
 }
 
 #[test]
+fn resolve_invokes_a_skill_that_is_not_at_the_start() {
+    let skills = vec![make_skill("poteto-mode", true), make_skill("commit", true)];
+    let outcome = resolve(
+        vec![text_block("use /poteto-mode and then /commit the diff")],
+        &skills,
+        all_gated(),
+        SkillSlashRewrite::default(),
+        &[],
+    )
+    .unwrap_err();
+    let SlashCommandOutcome::InvokeSkill { blocks, skills } = outcome else {
+        panic!("expected InvokeSkill");
+    };
+    let acp::ContentBlock::Text(text) = &blocks[0] else {
+        panic!("expected a text block");
+    };
+    assert_eq!(text.text, "use /poteto-mode and then /commit the diff");
+    assert_eq!(skills.len(), 2);
+    assert_eq!(skills[0].name, "poteto-mode");
+    assert_eq!(skills[0].args, "and then");
+    assert_eq!(skills[1].name, "commit");
+    assert_eq!(skills[1].args, "the diff");
+}
+
+#[test]
+fn resolve_invokes_a_skill_in_a_later_text_block() {
+    let skills = vec![make_skill("poteto-mode", true)];
+    let outcome = resolve(
+        vec![
+            text_block("look at the diff"),
+            text_block("then /poteto-mode please"),
+        ],
+        &skills,
+        all_gated(),
+        SkillSlashRewrite::default(),
+        &[],
+    )
+    .unwrap_err();
+    let SlashCommandOutcome::InvokeSkill { skills, .. } = outcome else {
+        panic!("expected InvokeSkill");
+    };
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].name, "poteto-mode");
+    assert_eq!(skills[0].args, "please");
+}
+
+#[test]
+fn resolve_keeps_skill_args_inside_their_text_block() {
+    let skills = vec![make_skill("poteto-mode", true)];
+    let outcome = resolve(
+        vec![
+            text_block("please /poteto-mode review"),
+            text_block("unrelated notes"),
+        ],
+        &skills,
+        all_gated(),
+        SkillSlashRewrite::default(),
+        &[],
+    )
+    .unwrap_err();
+    let SlashCommandOutcome::InvokeSkill { skills, .. } = outcome else {
+        panic!("expected InvokeSkill");
+    };
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].args, "review");
+}
+
+#[test]
+fn resolve_leaves_a_mid_message_builtin_alone() {
+    let skills = vec![make_skill("commit", true)];
+    let blocks = vec![text_block("do not /compact this /commit")];
+    let outcome = resolve(
+        blocks.clone(),
+        &skills,
+        all_gated(),
+        SkillSlashRewrite::default(),
+        &[],
+    )
+    .unwrap_err();
+    let SlashCommandOutcome::InvokeSkill { skills, .. } = outcome else {
+        panic!("expected the skill, not the builtin");
+    };
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].name, "commit");
+    assert_eq!(skills[0].args, "");
+}
+
+#[test]
 fn parse_skill_refs_text_before_first_skill() {
-    // Text before the first skill reference is part of user query, not consumed as args
     let skills = vec![make_skill("commit", true)];
     let refs = parse_skill_references("please do /commit fix typo", &skills, all_gated()).unwrap();
     let [r0] = refs.as_slice() else {

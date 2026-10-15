@@ -4,9 +4,122 @@
 //! `--backend cursor`, `GROK_BACKEND=cursor`, or `[cli] backend = "cursor"` in `config.toml`.
 
 mod adapter;
+mod cloud;
+pub(crate) mod protocol;
 mod startup;
 
 pub use startup::materialize_startup;
+
+fn cloud_handoff_notice(
+    session_id: &str,
+    request: &CloudRequest,
+    agent_id: Option<&str>,
+    repo: Option<&cloud::CloudRepo>,
+) -> (String, Option<cloud::CloudAgent>) {
+    let base = std::env::var("CURSOR_CLOUD_API")
+        .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
+    let outcome = match cloud::resolve_cloud_auth() {
+        Err(err) => Err(err),
+        Ok(auth) => match request {
+            CloudRequest::Send(task) => cloud::dispatch(&base, &auth, agent_id, task, repo),
+            CloudRequest::Refresh => match agent_id {
+                Some(id) => cloud::refresh_existing(&base, &auth, id),
+                None => Err(
+                    "No cloud agent on this session yet. Send & and a task to start one."
+                        .to_owned(),
+                ),
+            },
+            CloudRequest::Cancel => match agent_id {
+                Some(id) => cloud::cancel_existing(&base, &auth, id),
+                None => Err(
+                    "No cloud agent on this session yet. Send & and a task to start one."
+                        .to_owned(),
+                ),
+            },
+        },
+    };
+    let (text, recorded) = match outcome {
+        Ok(agent) => {
+            let url = agent.url.clone().unwrap_or_default();
+            let status = agent.run_status.clone().unwrap_or_default();
+            let reply = agent.result.clone().unwrap_or_default();
+            let mut text = format!("Cloud agent {} {url}\nRun status {status}.\n{reply}", agent.id);
+            if let Some(pr) = &agent.pr_url {
+                text.push('\n');
+                text.push_str(pr);
+            }
+            (text, Some(agent))
+        }
+        Err(err) => (format!("Cloud agent handoff failed. {err}\n"), None),
+    };
+    (
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text }
+                }
+            }
+        })
+        .to_string(),
+        recorded,
+    )
+}
+
+fn watch_cloud_run(
+    session_id: String,
+    agent_id: String,
+    run_id: String,
+    prompt_rpc_id: Option<serde_json::Value>,
+    prompt_id: Option<String>,
+    tx: mpsc::UnboundedSender<String>,
+) {
+    // The stream stays open until the cloud agent finishes. Reading it here would stall the local agent.
+    std::thread::spawn(move || {
+        let base = std::env::var("CURSOR_CLOUD_API")
+            .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
+        let mut saw_assistant = false;
+        let result = (|| {
+            let auth = cloud::resolve_cloud_auth()?;
+            cloud::follow_run(&base, &auth, &agent_id, &run_id, |event| {
+                let text = cloud::event_text(&event, saw_assistant);
+                if matches!(event, cloud::CloudEvent::Assistant(_)) {
+                    saw_assistant = true;
+                }
+                if let Some(text) = text {
+                    let _ = tx.send(cloud_text_notice(&session_id, &text));
+                }
+            })
+        })();
+        if let Err(err) = result {
+            let _ = tx.send(cloud_text_notice(
+                &session_id,
+                &format!("Cloud agent run failed. {err}\n"),
+            ));
+        }
+        if let Some(id) = prompt_rpc_id {
+            let _ = tx.send(protocol::prompt_end(&id, prompt_id.as_deref()).to_string());
+        }
+    });
+}
+
+fn cloud_text_notice(session_id: &str, text: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text }
+            }
+        }
+    })
+    .to_string()
+}
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -20,11 +133,40 @@ use xai_grok_shell::leader::ReconnectPolicy;
 
 use super::leader_bridge::bridge_channels;
 use super::spawn::{SpawnedAgent, spawn_runtime_thread};
-use adapter::{CursorAdapter, Routed};
+use adapter::{CloudRequest, CursorAdapter, Routed};
 
 pub const CURSOR_AGENT_BIN_ENV: &str = "GROK_CURSOR_AGENT_BIN";
 const DEFAULT_CURSOR_AGENT_BIN: &str = "cursor-agent";
+const AGENT_BIN_FALLBACK: &str = "agent";
 const CHILD_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn resolve_cursor_program(configured: &std::path::Path) -> std::path::PathBuf {
+    if configured.components().nth(1).is_some() {
+        return configured.to_path_buf();
+    }
+    if configured != std::path::Path::new(DEFAULT_CURSOR_AGENT_BIN) {
+        return configured.to_path_buf();
+    }
+    let name = pick_default_cursor_bin(bin_on_path(DEFAULT_CURSOR_AGENT_BIN), bin_on_path(AGENT_BIN_FALLBACK));
+    std::path::PathBuf::from(name)
+}
+
+fn pick_default_cursor_bin(cursor_agent_on_path: bool, agent_on_path: bool) -> &'static str {
+    if cursor_agent_on_path || !agent_on_path {
+        DEFAULT_CURSOR_AGENT_BIN
+    } else {
+        AGENT_BIN_FALLBACK
+    }
+}
+
+fn bin_on_path(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            let candidate = dir.join(name);
+            candidate.is_file()
+        })
+    })
+}
 
 /// How to launch the Cursor agent (`<program> <args...> acp`) and how to talk to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +232,7 @@ impl CursorAgentCommand {
 
     /// Program, configured args, `--yolo` when asked and not already forced, then `acp`.
     pub fn tokio_command(&self, yolo: bool) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new(&self.program);
+        let mut cmd = tokio::process::Command::new(resolve_cursor_program(&self.program));
         cmd.args(&self.args);
         if yolo
             && !self
@@ -224,6 +366,7 @@ impl CursorIo {
         let deliver = {
             let to_client_tx = to_client_tx.clone();
             let stdin_tx = stdin_tx.clone();
+            let adapter = adapter.clone();
             move |routed: Vec<Routed>| {
                 for r in routed {
                     match r {
@@ -232,6 +375,47 @@ impl CursorIo {
                         }
                         Routed::ToClient(line) => {
                             let _ = to_client_tx.send(line);
+                        }
+                        Routed::Cloud {
+                            session_id,
+                            request,
+                            agent_id,
+                            repo,
+                            prompt_rpc_id,
+                            prompt_id,
+                        } => {
+                            let (notice, recorded) = cloud_handoff_notice(
+                                &session_id,
+                                &request,
+                                agent_id.as_deref(),
+                                repo.as_ref(),
+                            );
+                            if let Some(agent) = &recorded {
+                                adapter
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .note_cloud_agent(&session_id, &agent.id);
+                                if !cloud::run_is_terminal(agent.run_status.as_deref())
+                                    && let Some(run_id) = agent.run_id.clone()
+                                {
+                                    watch_cloud_run(
+                                        session_id.clone(),
+                                        agent.id.clone(),
+                                        run_id,
+                                        prompt_rpc_id.clone(),
+                                        prompt_id.clone(),
+                                        to_client_tx.clone(),
+                                    );
+                                    let _ = to_client_tx.send(notice);
+                                    continue;
+                                }
+                            }
+                            let _ = to_client_tx.send(notice);
+                            if let Some(id) = prompt_rpc_id {
+                                let _ = to_client_tx.send(
+                                    protocol::prompt_end(&id, prompt_id.as_deref()).to_string(),
+                                );
+                            }
                         }
                     }
                 }
@@ -259,7 +443,29 @@ impl CursorIo {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .outbound(&line);
+                    let started_login = routed.iter().any(|routed| {
+                        matches!(
+                            routed,
+                            Routed::ToAgent(line)
+                                if line.contains("grok-cursor-bridge-auth")
+                                    && line.contains("cursor_login")
+                        )
+                    });
                     deliver(routed);
+                    if started_login {
+                        let adapter = adapter.clone();
+                        let deliver = deliver.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                            let notices = adapter
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .auth_timed_out();
+                            if !notices.is_empty() {
+                                deliver(notices.into_iter().map(Routed::ToClient).collect());
+                            }
+                        });
+                    }
                 }
             })
         };
@@ -372,5 +578,13 @@ mod tests {
 
         let already = CursorAgentCommand::from_config(&config("[cursor]\nargs = [\"-f\"]\n"), None);
         assert_eq!(argv(&already, true), ["-f", "acp"]);
+    }
+
+    #[test]
+    fn default_bin_uses_agent_when_cursor_agent_is_missing() {
+        assert_eq!(pick_default_cursor_bin(true, true), "cursor-agent");
+        assert_eq!(pick_default_cursor_bin(true, false), "cursor-agent");
+        assert_eq!(pick_default_cursor_bin(false, false), "cursor-agent");
+        assert_eq!(pick_default_cursor_bin(false, true), "agent");
     }
 }
