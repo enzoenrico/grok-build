@@ -28,7 +28,7 @@ pub(crate) struct CloudAgent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CloudEvent {
     Assistant(String),
-    ToolDone { name: String },
+    Tool(CloudTool),
     Result {
         status: String,
         text: String,
@@ -37,6 +37,27 @@ pub(crate) enum CloudEvent {
     },
     Thinking(String),
     Error { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CloudTool {
+    pub call_id: String,
+    pub name: String,
+    pub phase: CloudToolPhase,
+    pub raw_input: Option<String>,
+    pub raw_output: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloudToolPhase {
+    Running,
+    Completed,
+    Failed,
+}
+
+pub(crate) enum CloudPiece {
+    Text(String),
+    Tool(CloudTool),
 }
 
 pub(crate) fn run_is_terminal(status: Option<&str>) -> bool {
@@ -49,7 +70,7 @@ pub(crate) fn run_is_terminal(status: Option<&str>) -> bool {
 pub(crate) fn event_text(event: &CloudEvent, saw_assistant: bool) -> Option<String> {
     match event {
         CloudEvent::Assistant(text) => Some(text.clone()),
-        CloudEvent::ToolDone { name } => Some(format!("Tool {name}\n")),
+        CloudEvent::Tool(_) => None,
         CloudEvent::Result {
             status,
             text,
@@ -814,7 +835,7 @@ pub(crate) fn follow_run_or_recover(
     auth: &CloudAuth,
     agent_id: &str,
     run_id: &str,
-    mut on_text: impl FnMut(String),
+    mut on_piece: impl FnMut(CloudPiece),
 ) -> Result<(), String> {
     let mut saw_assistant = false;
     let mut saw_result = false;
@@ -826,8 +847,11 @@ pub(crate) fn follow_run_or_recover(
         if matches!(event, CloudEvent::Assistant(_)) {
             saw_assistant = true;
         }
+        if let CloudEvent::Tool(tool) = &event {
+            on_piece(CloudPiece::Tool(tool.clone()));
+        }
         if let Some(text) = text {
-            on_text(text);
+            on_piece(CloudPiece::Text(text));
         }
     });
     if matches!(followed, Ok(()) if saw_result) {
@@ -837,7 +861,7 @@ pub(crate) fn follow_run_or_recover(
     match refresh_existing(api_base, auth, agent_id) {
         Ok(agent) => {
             if let Some(text) = recovered_run_text(&agent, !saw_assistant) {
-                on_text(text);
+                on_piece(CloudPiece::Text(text));
                 Ok(())
             } else if let Some(err) = err {
                 Err(err)
@@ -911,6 +935,15 @@ impl SseParser {
     }
 }
 
+fn json_field(value: &Value, key: &str) -> Option<String> {
+    let field = value.get(key)?;
+    if field.is_null() {
+        None
+    } else {
+        Some(field.to_string())
+    }
+}
+
 fn decode_event(event: &str, data: &str) -> Option<CloudEvent> {
     let value: Value = serde_json::from_str(data).unwrap_or(Value::Null);
     match event {
@@ -919,17 +952,29 @@ fn decode_event(event: &str, data: &str) -> Option<CloudEvent> {
             .and_then(Value::as_str)
             .map(|text| CloudEvent::Assistant(text.to_owned())),
         "tool_call" => {
-            if value.get("status").and_then(Value::as_str) == Some("completed") {
-                Some(CloudEvent::ToolDone {
-                    name: value
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool")
-                        .to_owned(),
-                })
-            } else {
-                None
-            }
+            let phase = match value.get("status").and_then(Value::as_str) {
+                Some("running") => CloudToolPhase::Running,
+                Some("completed") => CloudToolPhase::Completed,
+                Some("error" | "failed") => CloudToolPhase::Failed,
+                _ => return None,
+            };
+            let name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_owned();
+            let call_id = value
+                .get("callId")
+                .and_then(Value::as_str)
+                .unwrap_or(&name)
+                .to_owned();
+            Some(CloudEvent::Tool(CloudTool {
+                call_id,
+                name,
+                phase,
+                raw_input: json_field(&value, "args"),
+                raw_output: json_field(&value, "result"),
+            }))
         }
         "thinking" => value
             .get("text")
@@ -1265,9 +1310,20 @@ data: {}
             events,
             vec![
                 CloudEvent::Assistant("I'll update the README now.".to_owned()),
-                CloudEvent::ToolDone {
-                    name: "read_file".to_owned()
-                },
+                CloudEvent::Tool(CloudTool {
+                    call_id: "call-1".to_owned(),
+                    name: "read_file".to_owned(),
+                    phase: CloudToolPhase::Running,
+                    raw_input: None,
+                    raw_output: None,
+                }),
+                CloudEvent::Tool(CloudTool {
+                    call_id: "call-1".to_owned(),
+                    name: "read_file".to_owned(),
+                    phase: CloudToolPhase::Completed,
+                    raw_input: None,
+                    raw_output: None,
+                }),
                 CloudEvent::Result {
                     status: "FINISHED".to_owned(),
                     text: "Added README.md.".to_owned(),
@@ -1291,7 +1347,6 @@ data: {}
             texts,
             vec![
                 "I'll update the README now.".to_owned(),
-                "Tool read_file\n".to_owned(),
                 "Run FINISHED.\nhttps://github.com/acme/app/pull/123\n".to_owned(),
             ]
         );
@@ -1368,7 +1423,11 @@ data: {}
             &CloudAuth::Basic("test-key".to_owned()),
             "bc-1",
             "run-1",
-            |text| texts.push(text),
+            |piece| {
+                if let CloudPiece::Text(text) = piece {
+                    texts.push(text);
+                }
+            },
         )
         .unwrap();
         assert_eq!(
@@ -1408,7 +1467,11 @@ data: {}
             &CloudAuth::Basic("test-key".to_owned()),
             "bc-1",
             "run-1",
-            |text| texts.push(text),
+            |piece| {
+                if let CloudPiece::Text(text) = piece {
+                    texts.push(text);
+                }
+            },
         )
         .unwrap();
         assert_eq!(texts, vec!["Run RUNNING.\n".to_owned()]);

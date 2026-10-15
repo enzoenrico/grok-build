@@ -511,6 +511,59 @@ pub(crate) fn cloud_agent_id(result: &Map<String, Value>) -> Option<String> {
     None
 }
 
+pub(crate) fn cloud_tool_notice(
+    session_id: &str,
+    tool: &super::cloud::CloudTool,
+    first: bool,
+) -> Value {
+    let status = match tool.phase {
+        super::cloud::CloudToolPhase::Running => "in_progress",
+        super::cloud::CloudToolPhase::Completed => "completed",
+        super::cloud::CloudToolPhase::Failed => "failed",
+    };
+    let mut update = json!({
+        "sessionUpdate": if first { "tool_call" } else { "tool_call_update" },
+        "toolCallId": tool.call_id,
+        "title": tool.name,
+        "kind": cloud_tool_kind(&tool.name),
+        "status": status,
+    });
+    if let Some(raw) = tool
+        .raw_input
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    {
+        update["rawInput"] = raw;
+    }
+    if let Some(raw) = tool
+        .raw_output
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+    {
+        update["rawOutput"] = raw;
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": update,
+        }
+    })
+}
+
+fn cloud_tool_kind(name: &str) -> &'static str {
+    match name {
+        "read_file" | "read" => "read",
+        "edit_file" | "write" | "search_replace" | "str_replace" => "edit",
+        "delete_file" => "delete",
+        "grep" | "glob" | "semantic_search" | "web_search" => "search",
+        "run_terminal_cmd" | "shell" => "execute",
+        "web_fetch" | "fetch" => "fetch",
+        _ => "other",
+    }
+}
+
 pub(crate) fn agent_notice(session_id: &str, text: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -1351,6 +1404,70 @@ mod tests {
         assert_eq!(
             plan.entries[0].priority,
             agent_client_protocol::PlanEntryPriority::Medium
+        );
+    }
+
+    #[test]
+    fn a_cloud_tool_call_decodes_as_a_pager_tool() {
+        use super::super::cloud::{CloudTool, CloudToolPhase};
+        let running = CloudTool {
+            call_id: "call-1".to_owned(),
+            name: "read_file".to_owned(),
+            phase: CloudToolPhase::Running,
+            raw_input: Some(r#"{"path":"README.md"}"#.to_owned()),
+            raw_output: None,
+        };
+        let started = cloud_tool_notice("s1", &running, true);
+        let note: agent_client_protocol::SessionNotification =
+            serde_json::from_value(started["params"].clone()).expect("pager tool call");
+        let agent_client_protocol::SessionUpdate::ToolCall(call) = note.update else {
+            panic!("expected a tool call");
+        };
+        assert_eq!(call.title, "read_file");
+        assert_eq!(call.kind, agent_client_protocol::ToolKind::Read);
+        assert_eq!(
+            call.status,
+            agent_client_protocol::ToolCallStatus::InProgress
+        );
+        assert_eq!(
+            call.raw_input
+                .as_ref()
+                .and_then(|value| value.get("path"))
+                .and_then(serde_json::Value::as_str),
+            Some("README.md")
+        );
+
+        let done = CloudTool {
+            phase: CloudToolPhase::Completed,
+            raw_output: Some(r#"{"success":{"path":"README.md"}}"#.to_owned()),
+            ..running
+        };
+        let finished = cloud_tool_notice("s1", &done, false);
+        let note: agent_client_protocol::SessionNotification =
+            serde_json::from_value(finished["params"].clone()).expect("pager tool update");
+        let agent_client_protocol::SessionUpdate::ToolCallUpdate(update) = note.update else {
+            panic!("expected a tool update");
+        };
+        assert_eq!(
+            update.fields.status,
+            Some(agent_client_protocol::ToolCallStatus::Completed)
+        );
+        assert!(update.fields.raw_output.is_some());
+
+        let failed = CloudTool {
+            phase: CloudToolPhase::Failed,
+            raw_output: Some(r#"{"message":"missing"}"#.to_owned()),
+            ..done
+        };
+        let failed_note = cloud_tool_notice("s1", &failed, false);
+        let note: agent_client_protocol::SessionNotification =
+            serde_json::from_value(failed_note["params"].clone()).expect("pager failed tool");
+        let agent_client_protocol::SessionUpdate::ToolCallUpdate(update) = note.update else {
+            panic!("expected a failed tool");
+        };
+        assert_eq!(
+            update.fields.status,
+            Some(agent_client_protocol::ToolCallStatus::Failed)
         );
     }
 }

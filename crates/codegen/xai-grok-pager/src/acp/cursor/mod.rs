@@ -92,8 +92,16 @@ fn watch_cloud_run(
             .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
         let result = (|| {
             let auth = cloud::resolve_cloud_auth()?;
-            cloud::follow_run_or_recover(&base, &auth, &agent_id, &run_id, |text| {
-                let _ = tx.send(cloud_text_notice(&session_id, &text));
+            let mut seen_tools = HashSet::new();
+            cloud::follow_run_or_recover(&base, &auth, &agent_id, &run_id, |piece| {
+                let line = match piece {
+                    cloud::CloudPiece::Text(text) => cloud_text_notice(&session_id, &text),
+                    cloud::CloudPiece::Tool(tool) => {
+                        let first = seen_tools.insert(tool.call_id.clone());
+                        protocol::cloud_tool_notice(&session_id, &tool, first).to_string()
+                    }
+                };
+                let _ = tx.send(line);
             })
         })();
         if let Err(err) = result {
@@ -123,6 +131,7 @@ fn cloud_text_notice(session_id: &str, text: &str) -> String {
     .to_string()
 }
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
