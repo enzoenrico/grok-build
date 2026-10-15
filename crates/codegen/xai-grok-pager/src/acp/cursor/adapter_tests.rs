@@ -353,6 +353,8 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
         session_id,
         request,
         agent_id,
+        prompt_rpc_id,
+        prompt_id,
     } = &sent[0]
     else {
         panic!("expected a cloud handoff: {sent:?}");
@@ -360,6 +362,8 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
     assert_eq!(session_id, "s1");
     assert_eq!(request, &CloudRequest::Send("refactor the auth module".to_owned()));
     assert_eq!(agent_id, &None);
+    assert_eq!(prompt_rpc_id.as_ref().and_then(Value::as_u64), Some(4));
+    assert_eq!(prompt_id, &None);
 
     adapter.note_cloud_agent("s1", "bc-123");
     let local = adapter.outbound(
@@ -398,6 +402,12 @@ fn bare_ampersand_refreshes_the_recorded_agent() {
         notice["params"]["update"]["content"]["text"],
         "No cloud agent on this session yet. Send & and a task to start one.\n"
     );
+    let end: Value = match &missing[1] {
+        Routed::ToClient(line) => serde_json::from_str(line).unwrap(),
+        other => panic!("expected the prompt to end: {other:?}"),
+    };
+    assert_eq!(end["id"], 4);
+    assert_eq!(end["result"]["stopReason"], "end_turn");
 
     adapter.note_cloud_agent("s1", "bc-123");
     for text in ["&", "& ", "& status", "& Status"] {

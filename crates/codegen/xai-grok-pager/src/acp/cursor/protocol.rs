@@ -432,6 +432,19 @@ pub(crate) fn agent_notice(session_id: &str, text: &str) -> Value {
     })
 }
 
+pub(crate) fn prompt_end(id: &Value, prompt_id: Option<&str>) -> Value {
+    let mut result = Map::new();
+    result.insert("stopReason".to_owned(), json!("end_turn"));
+    if let Some(prompt_id) = prompt_id {
+        result.insert("_meta".to_owned(), json!({ "promptId": prompt_id }));
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
 pub(crate) fn cloud_status_update(session_id: &str, agent_id: &str) -> Value {
     agent_notice(
         session_id,

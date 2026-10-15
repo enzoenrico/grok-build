@@ -26,6 +26,9 @@ pub(crate) enum Routed {
         session_id: String,
         request: CloudRequest,
         agent_id: Option<String>,
+        /// `session/prompt` id to answer when the cloud handoff is done.
+        prompt_rpc_id: Option<Value>,
+        prompt_id: Option<String>,
     },
 }
 
@@ -219,25 +222,36 @@ impl CursorAdapter {
                     }
                 }
                 if cloud_handoff {
+                    let prompt_id = msg
+                        .pointer("/params/_meta/promptId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let end = id
+                        .as_ref()
+                        .map(|id| protocol::prompt_end(id, prompt_id.as_deref()).to_string());
                     let Some(session_id) = session_id.clone() else {
-                        return vec![Routed::ToClient(msg.to_string())];
+                        return end.into_iter().map(Routed::ToClient).collect();
                     };
                     let request = cloud_request(cloud_task);
                     if matches!(request, CloudRequest::Refresh | CloudRequest::Cancel)
                         && cloud_agent_id.is_none()
                     {
-                        return vec![Routed::ToClient(
+                        let mut out = vec![Routed::ToClient(
                             protocol::agent_notice(
                                 &session_id,
                                 "No cloud agent on this session yet. Send & and a task to start one.\n",
                             )
                             .to_string(),
                         )];
+                        out.extend(end.map(Routed::ToClient));
+                        return out;
                     }
                     return vec![Routed::Cloud {
                         session_id,
                         request,
                         agent_id: cloud_agent_id,
+                        prompt_rpc_id: id,
+                        prompt_id,
                     }];
                 }
                 let prompt_id = msg

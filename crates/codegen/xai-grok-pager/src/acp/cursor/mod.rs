@@ -74,6 +74,8 @@ fn watch_cloud_run(
     session_id: String,
     agent_id: String,
     run_id: String,
+    prompt_rpc_id: Option<serde_json::Value>,
+    prompt_id: Option<String>,
     tx: mpsc::UnboundedSender<String>,
 ) {
     // The stream stays open until the cloud agent finishes. Reading it here would stall the local agent.
@@ -96,6 +98,9 @@ fn watch_cloud_run(
                 &session_id,
                 &format!("Cloud agent run failed. {err}\n"),
             ));
+        }
+        if let Some(id) = prompt_rpc_id {
+            let _ = tx.send(protocol::prompt_end(&id, prompt_id.as_deref()).to_string());
         }
     });
 }
@@ -345,6 +350,8 @@ impl CursorIo {
                             session_id,
                             request,
                             agent_id,
+                            prompt_rpc_id,
+                            prompt_id,
                         } => {
                             let (notice, recorded) =
                                 cloud_handoff_notice(&session_id, &request, agent_id.as_deref());
@@ -360,11 +367,20 @@ impl CursorIo {
                                         session_id.clone(),
                                         agent.id.clone(),
                                         run_id,
+                                        prompt_rpc_id.clone(),
+                                        prompt_id.clone(),
                                         to_client_tx.clone(),
                                     );
+                                    let _ = to_client_tx.send(notice);
+                                    continue;
                                 }
                             }
                             let _ = to_client_tx.send(notice);
+                            if let Some(id) = prompt_rpc_id {
+                                let _ = to_client_tx.send(
+                                    protocol::prompt_end(&id, prompt_id.as_deref()).to_string(),
+                                );
+                            }
                         }
                     }
                 }
