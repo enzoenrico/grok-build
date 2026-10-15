@@ -14,13 +14,14 @@ fn cloud_handoff_notice(
     session_id: &str,
     request: &CloudRequest,
     agent_id: Option<&str>,
+    repo: Option<&cloud::CloudRepo>,
 ) -> (String, Option<cloud::CloudAgent>) {
     let base = std::env::var("CURSOR_CLOUD_API")
         .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
     let outcome = match cloud::resolve_cloud_auth() {
         Err(err) => Err(err),
         Ok(auth) => match request {
-            CloudRequest::Send(task) => cloud::dispatch(&base, &auth, agent_id, task),
+            CloudRequest::Send(task) => cloud::dispatch(&base, &auth, agent_id, task, repo),
             CloudRequest::Refresh => match agent_id {
                 Some(id) => cloud::refresh_existing(&base, &auth, id),
                 None => Err(
@@ -379,11 +380,16 @@ impl CursorIo {
                             session_id,
                             request,
                             agent_id,
+                            repo,
                             prompt_rpc_id,
                             prompt_id,
                         } => {
-                            let (notice, recorded) =
-                                cloud_handoff_notice(&session_id, &request, agent_id.as_deref());
+                            let (notice, recorded) = cloud_handoff_notice(
+                                &session_id,
+                                &request,
+                                agent_id.as_deref(),
+                                repo.as_ref(),
+                            );
                             if let Some(agent) = &recorded {
                                 adapter
                                     .lock()

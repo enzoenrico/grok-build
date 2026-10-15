@@ -267,8 +267,110 @@ pub(crate) fn handoff_text(prompt: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn create_body(text: &str) -> String {
-    json!({ "prompt": { "text": text } }).to_string()
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CloudRepo {
+    pub url: String,
+    pub starting_ref: Option<String>,
+}
+
+pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>) -> String {
+    let mut body = json!({ "prompt": { "text": text } });
+    if let Some(repo) = repo {
+        let mut entry = json!({ "url": repo.url });
+        if let Some(starting_ref) = &repo.starting_ref {
+            entry["startingRef"] = json!(starting_ref);
+        }
+        body["repos"] = json!([entry]);
+    }
+    body.to_string()
+}
+
+pub(crate) fn normalize_git_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    if remote.is_empty() {
+        return None;
+    }
+    let url = if let Some(rest) = remote.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        if host.is_empty() || path.is_empty() || host.contains('/') {
+            return None;
+        }
+        format!("https://{host}/{path}")
+    } else if let Some(rest) = remote.strip_prefix("ssh://") {
+        let rest = rest.strip_prefix("git@").unwrap_or(rest);
+        format!("https://{rest}")
+    } else if let Some(rest) = remote.strip_prefix("http://") {
+        format!("https://{rest}")
+    } else if remote.starts_with("https://") {
+        remote.to_owned()
+    } else {
+        return None;
+    };
+    let url = strip_userinfo(&url)?;
+    let url = trim_repo_url(url);
+    let without = url.strip_prefix("https://")?;
+    let (host, path) = without.split_once('/')?;
+    if host.is_empty() || path.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+fn strip_userinfo(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    if let Some((userinfo, hostpath)) = rest.split_once('@')
+        && !userinfo.contains('/')
+    {
+        return Some(format!("https://{hostpath}"));
+    }
+    Some(url.to_owned())
+}
+
+fn trim_repo_url(mut url: String) -> String {
+    while url.ends_with('/') {
+        url.pop();
+    }
+    if let Some(stripped) = url.strip_suffix(".git") {
+        url = stripped.to_owned();
+    }
+    while url.ends_with('/') {
+        url.pop();
+    }
+    url
+}
+
+pub(crate) fn repo_from_cwd(cwd: &std::path::Path) -> Option<CloudRepo> {
+    let remote = git_output(cwd, &["remote", "get-url", "origin"])?;
+    let url = normalize_git_remote(&remote)?;
+    let starting_ref = git_output(cwd, &["symbolic-ref", "--short", "HEAD"]).and_then(|name| {
+        let name = name.trim();
+        if name.is_empty() || name == "HEAD" {
+            None
+        } else {
+            Some(name.to_owned())
+        }
+    });
+    Some(CloudRepo { url, starting_ref })
+}
+
+fn git_output(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_owned())
+    }
 }
 
 pub(crate) fn follow_up_body(text: &str) -> String {
@@ -421,13 +523,14 @@ pub(crate) fn dispatch(
     auth: &CloudAuth,
     agent_id: Option<&str>,
     text: &str,
+    repo: Option<&CloudRepo>,
 ) -> Result<CloudAgent, String> {
     let (url, body) = match agent_id {
         Some(id) => (
             format!("{api_base}/v1/agents/{id}/runs"),
             follow_up_body(text),
         ),
-        None => (format!("{api_base}/v1/agents"), create_body(text)),
+        None => (format!("{api_base}/v1/agents"), create_body(text, repo)),
     };
     let raw = match request("POST", &url, auth, Some(&body)) {
         Ok(raw) => raw,
@@ -738,7 +841,7 @@ mod tests {
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module").unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module", None).unwrap();
         assert_eq!(created.id, "bc-1");
         assert_eq!(
             created.url.as_deref(),
@@ -746,7 +849,7 @@ mod tests {
         );
         assert_eq!(created.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(created.result.as_deref(), Some("Refactored auth."));
-        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests").unwrap();
+        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None).unwrap();
         assert_eq!(follow.id, "bc-1");
         assert_eq!(follow.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(follow.result.as_deref(), Some("Added the tests."));
@@ -851,7 +954,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme").unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme", None).unwrap();
         assert_eq!(created.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(created.result, None);
         assert!(!run_is_terminal(created.run_status.as_deref()));
@@ -1000,7 +1103,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests").unwrap();
+        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None).unwrap();
         assert_eq!(agent.id, "bc-1");
         assert_eq!(agent.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(
@@ -1092,9 +1195,82 @@ data: {}
             &CloudAuth::Bearer("login-token".to_owned()),
             None,
             "refactor the auth module",
+            None,
         )
         .unwrap();
         assert_eq!(created.id, "bc-1");
         assert_eq!(created.result.as_deref(), Some("from login"));
+    }
+
+    #[test]
+    fn git_remotes_become_cloud_repo_urls() {
+        assert_eq!(
+            normalize_git_remote("git@github.com:acme/payments.git").as_deref(),
+            Some("https://github.com/acme/payments")
+        );
+        assert_eq!(
+            normalize_git_remote("ssh://git@github.com/acme/payments.git").as_deref(),
+            Some("https://github.com/acme/payments")
+        );
+        assert_eq!(
+            normalize_git_remote("https://user:secret@github.com/acme/payments.git/").as_deref(),
+            Some("https://github.com/acme/payments")
+        );
+        assert_eq!(normalize_git_remote("/tmp/local.git"), None);
+    }
+
+    #[test]
+    fn a_session_git_repo_is_sent_on_create() {
+        let dir = std::env::temp_dir().join(format!("grok-cloud-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-b", "feature"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+        let remote = std::process::Command::new("git")
+            .args(["remote", "add", "origin", "git@github.com:acme/payments.git"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(remote.success());
+        let repo = repo_from_cwd(&dir).unwrap();
+        assert_eq!(repo.url, "https://github.com/acme/payments");
+        assert_eq!(repo.starting_ref.as_deref(), Some("feature"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 8192];
+            let n = sock.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let ok = req.contains("https://github.com/acme/payments")
+                && req.contains("\"startingRef\":\"feature\"");
+            let body = if ok {
+                r#"{"agent":{"id":"bc-1","url":"https://cursor.com/agents/bc-1"},"run":{"id":"run-1","status":"FINISHED","result":"on the repo"}}"#
+            } else {
+                r#"{"error":"missing repo"}"#
+            };
+            let status = if ok { "200 OK" } else { "400 Bad Request" };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+        let base = format!("http://{addr}");
+        let created = dispatch(
+            &base,
+            &CloudAuth::Basic("test-key".to_owned()),
+            None,
+            "refactor the auth module",
+            Some(&repo),
+        )
+        .unwrap();
+        assert_eq!(created.result.as_deref(), Some("on the repo"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
