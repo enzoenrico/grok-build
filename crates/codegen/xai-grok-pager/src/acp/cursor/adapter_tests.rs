@@ -147,6 +147,12 @@ fn set_model_and_set_mode_are_translated() {
         parse(&out[0])["params"]["update"]["currentModeId"],
         "default"
     );
+    let note: agent_client_protocol::SessionNotification =
+        serde_json::from_value(parse(&out[0])["params"].clone()).expect("pager mode update");
+    let agent_client_protocol::SessionUpdate::CurrentModeUpdate(mode) = note.update else {
+        panic!("expected a mode update");
+    };
+    assert_eq!(mode.current_mode_id.0.as_ref(), "default");
 }
 
 #[test]
@@ -228,6 +234,16 @@ fn ask_and_debug_modes_pass_through() {
         "default"
     );
     assert_eq!(resp["result"]["modes"]["availableModes"][3]["id"], "debug");
+    let created: agent_client_protocol::NewSessionResponse =
+        serde_json::from_value(resp["result"].clone()).expect("pager session result");
+    let modes = created.modes.expect("modes");
+    assert_eq!(modes.current_mode_id.0.as_ref(), "ask");
+    let ids: Vec<&str> = modes
+        .available_modes
+        .iter()
+        .map(|mode| mode.id.0.as_ref())
+        .collect();
+    assert_eq!(ids, ["default", "plan", "ask", "debug"]);
 
     let out = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{"sessionId":"s1","modeId":"debug"}}"#,
