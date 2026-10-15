@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use super::*;
 
 fn parse(routed: &Routed) -> Value {
@@ -585,4 +587,66 @@ fn unknown_models_pass_through_unchanged() {
         r#"{"jsonrpc":"2.0","id":2,"method":"session/set_model","params":{"sessionId":"s1","modelId":"mystery"}}"#,
     );
     assert_eq!(parse(&out[0])["params"]["modelId"], "mystery");
+}
+
+#[test]
+fn installed_agent_accepts_the_bridge_initialize() {
+    let mut adapter = CursorAdapter::new(None, false);
+    let out = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#,
+    );
+    let Routed::ToAgent(line) = &out[0] else {
+        panic!("expected initialize to be forwarded: {out:?}");
+    };
+    let sent: Value = serde_json::from_str(line).unwrap();
+    assert_eq!(
+        sent["params"]["clientCapabilities"]["_meta"]["subagents"],
+        true
+    );
+
+    let bin = std::env::var("GROK_CURSOR_AGENT_BIN").unwrap_or_else(|_| {
+        format!(
+            "{}/.local/bin/agent",
+            std::env::var("HOME").unwrap_or_default()
+        )
+    });
+    if !std::path::Path::new(&bin).exists() {
+        return;
+    }
+    let mut child = std::process::Command::new(&bin)
+        .arg("acp")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn agent acp");
+    let mut stdin = child.stdin.take().expect("agent stdin");
+    let stdout = child.stdout.take().expect("agent stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut response = String::new();
+        let _ = std::io::BufRead::read_line(&mut reader, &mut response);
+        let _ = tx.send(response);
+    });
+    stdin
+        .write_all(format!("{line}\n").as_bytes())
+        .expect("write initialize");
+    let _ = stdin.flush();
+    let response = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(line) => line,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("agent initialize timed out: {err}");
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let value: Value = serde_json::from_str(response.trim()).expect("agent json");
+    assert_eq!(
+        value["result"]["agentCapabilities"]["sessionCapabilities"]["subagents"],
+        json!({})
+    );
+    assert_eq!(value["result"]["authMethods"][0]["id"], "cursor_login");
 }

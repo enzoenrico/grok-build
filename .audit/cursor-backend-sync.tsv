@@ -30,3 +30,4 @@ ts	phase	decision	why	evidence	result
 2026-10-15T17:55:57Z	skills	skill args stay in the text block that contains the skill	joining blocks pulled the next block into the args	slash_commands resolve_keeps_skill_args_inside_their_text_block	3 shell tests passed
 2026-10-15T18:00:19Z	auth	a later session retries cursor_login after the first wait times out	giving up permanently left every later session/new unauthenticated	adapter session_new_waits_for_cursor_login	2 pager tests passed
 2026-10-15T18:05:04Z	cloud	the cloud handoff prompt result decodes as PromptResponse end_turn and echoes promptId	the pager closes the turn from that type	bare_ampersand_refreshes_the_recorded_agent	passed
+2026-10-15T18:11:52Z	runtime	the bridge initialize line is what agent 2026.10.14 accepts for subagents and cursor_login	hand-built JSON was not the adapter output	installed_agent_accepts_the_bridge_initialize	passed in 1.10s
