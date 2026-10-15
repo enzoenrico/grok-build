@@ -298,6 +298,44 @@ fn dispatch_load_session_ungated(
     });
     effects
 }
+/// Resume a Cursor chat the way a native session resumes: `session/load` on the Cursor backend,
+/// or a one-time transcript import on the Grok backend.
+pub(in crate::app::dispatch) fn cursor_resume_now(
+    app: &mut AppView,
+    session_id: String,
+    cwd: String,
+    title: String,
+) -> Vec<Effect> {
+    if app.backend.is_cursor() {
+        let session_cwd = (!cwd.is_empty()).then(|| std::path::PathBuf::from(cwd));
+        return dispatch_load_session(app, session_id, session_cwd, false);
+    }
+    vec![Effect::MaterializeCursorSession {
+        session_id,
+        cwd,
+        title,
+    }]
+}
+
+fn cursor_resume_effects(
+    app: &mut AppView,
+    session_id: String,
+    cwd: String,
+    title: String,
+) -> Vec<Effect> {
+    clear_startup_actions(app);
+    if !app.session_startup_allowed() {
+        app.deferred_startup.session = Some(
+            crate::app::session_startup::DeferredSessionStartup::ForeignResume {
+                tool: xai_grok_foreign_sessions::ForeignSessionTool::Cursor,
+                native_id: session_id,
+            },
+        );
+        return vec![];
+    }
+    cursor_resume_now(app, session_id, cwd, title)
+}
+
 /// Load the session selected in the session picker.
 pub(in crate::app::dispatch) fn dispatch_pick_session(
     app: &mut AppView,
@@ -326,10 +364,14 @@ pub(in crate::app::dispatch) fn dispatch_pick_session(
     let mut picker_dismissed = false;
     let entry_data = if let Some(agent) = get_active_agent_mut(app) {
         if let Some(ActiveModal::SessionPicker { entries, .. }) = agent.active_modal.as_mut() {
-            let data = entries
-                .as_ref()
-                .and_then(|s| s.get(index))
-                .map(|e| (e.id.clone(), e.source.clone(), e.cwd.clone()));
+            let data = entries.as_ref().and_then(|s| s.get(index)).map(|e| {
+                (
+                    e.id.clone(),
+                    e.source.clone(),
+                    e.cwd.clone(),
+                    e.summary.clone(),
+                )
+            });
             agent.active_modal = None;
             picker_dismissed = true;
             data
@@ -342,7 +384,7 @@ pub(in crate::app::dispatch) fn dispatch_pick_session(
     if picker_dismissed {
         invalidate_picker_fetch_on_dismiss(app);
     }
-    let (session_id, source, cwd) = match entry_data {
+    let (session_id, source, cwd, title) = match entry_data {
         Some(d) => d,
         None => {
             let sessions = match app.session_picker_entries.take() {
@@ -356,7 +398,12 @@ pub(in crate::app::dispatch) fn dispatch_pick_session(
                 Some(e) => e,
                 None => return vec![],
             };
-            let d = (entry.id.clone(), entry.source.clone(), entry.cwd.clone());
+            let d = (
+                entry.id.clone(),
+                entry.source.clone(),
+                entry.cwd.clone(),
+                entry.summary.clone(),
+            );
             app.session_picker_loading = false;
             app.session_picker_state.set_query("");
             app.session_picker_state.search_active = false;
@@ -369,6 +416,9 @@ pub(in crate::app::dispatch) fn dispatch_pick_session(
     if let Some(foreign_source) =
         crate::app::foreign_sessions::ForeignPickerSource::from_picker_source(&source)
     {
+        if foreign_source == crate::app::foreign_sessions::ForeignPickerSource::Cursor {
+            return cursor_resume_effects(app, session_id, cwd, title);
+        }
         let prompt = foreign_source.resume_prompt(&session_id);
         clear_startup_actions(app);
         if !app.session_startup_allowed() {

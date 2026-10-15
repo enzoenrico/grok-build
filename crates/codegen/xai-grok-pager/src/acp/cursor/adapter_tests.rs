@@ -34,7 +34,8 @@ fn session_new_response(id: u64) -> String {
 #[test]
 fn grok_extension_requests_are_answered_locally() {
     let mut adapter = CursorAdapter::new(None, false);
-    let out = adapter.outbound(r#"{"jsonrpc":"2.0","id":7,"method":"_x.ai/session/list","params":{}}"#);
+    let out =
+        adapter.outbound(r#"{"jsonrpc":"2.0","id":7,"method":"_x.ai/queue/snapshot","params":{}}"#);
     assert_eq!(out.len(), 1);
     let Routed::ToClient(line) = &out[0] else {
         panic!("extension request must not reach cursor: {out:?}");
@@ -42,6 +43,25 @@ fn grok_extension_requests_are_answered_locally() {
     let resp: Value = serde_json::from_str(line).unwrap();
     assert_eq!(resp["id"], 7);
     assert_eq!(resp["error"]["code"], METHOD_NOT_FOUND);
+}
+
+#[test]
+fn session_list_and_mcp_list_are_answered_from_disk() {
+    let mut adapter = CursorAdapter::new(None, false);
+    let sessions =
+        adapter.outbound(r#"{"jsonrpc":"2.0","id":7,"method":"_x.ai/session/list","params":{}}"#);
+    let Routed::ToClient(line) = &sessions[0] else {
+        panic!("session list must stay local: {sessions:?}");
+    };
+    let resp: Value = serde_json::from_str(line).unwrap();
+    assert_eq!(resp["result"]["sessions"], json!([]));
+
+    let mcps = adapter.outbound(r#"{"jsonrpc":"2.0","id":8,"method":"x.ai/mcp/list","params":{}}"#);
+    let Routed::ToClient(line) = &mcps[0] else {
+        panic!("mcp list must stay local: {mcps:?}");
+    };
+    let resp: Value = serde_json::from_str(line).unwrap();
+    assert!(resp["result"]["servers"].is_array());
 }
 
 #[test]
@@ -88,12 +108,21 @@ fn new_session_maps_modes_and_applies_requested_model() {
     };
     let set_model: Value = serde_json::from_str(set_model).unwrap();
     assert_eq!(set_model["method"], "session/set_model");
-    assert_eq!(set_model["params"]["modelId"], "grok-4.7[context=256k,fast=true]");
+    assert_eq!(
+        set_model["params"]["modelId"],
+        "grok-4.7[context=256k,fast=true]"
+    );
 
     let resp = parse(&out[1]);
-    assert_eq!(resp["result"]["models"]["currentModelId"], "grok-4.7[context=256k,fast=true]");
+    assert_eq!(
+        resp["result"]["models"]["currentModelId"],
+        "grok-4.7[context=256k,fast=true]"
+    );
     assert_eq!(resp["result"]["modes"]["currentModeId"], "default");
-    assert_eq!(resp["result"]["modes"]["availableModes"][0]["id"], "default");
+    assert_eq!(
+        resp["result"]["modes"]["availableModes"][0]["id"],
+        "default"
+    );
 
     let internal_ack = json!({"jsonrpc":"2.0","id": set_model["id"], "result": {}}).to_string();
     assert!(adapter.inbound(&internal_ack).is_empty());
@@ -119,7 +148,10 @@ fn set_model_and_set_mode_are_translated() {
     let out = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":2,"method":"session/set_model","params":{"sessionId":"s1","modelId":"GROK-4.7"}}"#,
     );
-    assert_eq!(parse(&out[0])["params"]["modelId"], "grok-4.7[context=256k,fast=true]");
+    assert_eq!(
+        parse(&out[0])["params"]["modelId"],
+        "grok-4.7[context=256k,fast=true]"
+    );
 
     let out = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{"sessionId":"s1","modeId":"default"}}"#,
@@ -129,7 +161,10 @@ fn set_model_and_set_mode_are_translated() {
     let out = adapter.inbound(
         r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"current_mode_update","currentModeId":"agent"}}}"#,
     );
-    assert_eq!(parse(&out[0])["params"]["update"]["currentModeId"], "default");
+    assert_eq!(
+        parse(&out[0])["params"]["update"]["currentModeId"],
+        "default"
+    );
 }
 
 #[test]

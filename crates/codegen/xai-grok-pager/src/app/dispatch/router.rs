@@ -183,6 +183,23 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 age_secs = hint.age.as_secs(),
                 "foreign_resume accepted"
             );
+            if source == crate::app::foreign_sessions::ForeignPickerSource::Cursor {
+                if !app.session_startup_allowed() {
+                    app.deferred_startup.session = Some(
+                        crate::app::session_startup::DeferredSessionStartup::ForeignResume {
+                            tool: hint.tool,
+                            native_id: hint.native_id,
+                        },
+                    );
+                    return vec![];
+                }
+                return super::session::load::cursor_resume_now(
+                    app,
+                    hint.native_id,
+                    app.cwd.to_string_lossy().into_owned(),
+                    String::new(),
+                );
+            }
             let prompt = source.resume_prompt(&hint.native_id);
             if !app.session_startup_allowed() {
                 app.deferred_startup.prompt = Some(prompt);

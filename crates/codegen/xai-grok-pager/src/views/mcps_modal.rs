@@ -10,6 +10,8 @@ pub enum McpWireSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpSectionId {
     Managed,
+    /// Remote HTTP and SSE servers from Cursor and project config.
+    Connectors,
     Plugin(String),
     Local,
 }
@@ -22,16 +24,23 @@ impl PartialOrd for McpSectionId {
 
 impl Ord for McpSectionId {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        match (self, other) {
-            (Self::Managed, Self::Managed) => Ordering::Equal,
-            (Self::Managed, _) => Ordering::Less,
-            (_, Self::Managed) => Ordering::Greater,
-            (Self::Plugin(a), Self::Plugin(b)) => a.cmp(b),
-            (Self::Plugin(_), Self::Local) => Ordering::Less,
-            (Self::Local, Self::Plugin(_)) => Ordering::Greater,
-            (Self::Local, Self::Local) => Ordering::Equal,
+        let rank = section_rank(self).cmp(&section_rank(other));
+        if rank != std::cmp::Ordering::Equal {
+            return rank;
         }
+        match (self, other) {
+            (Self::Plugin(a), Self::Plugin(b)) => a.cmp(b),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
+fn section_rank(section: &McpSectionId) -> u8 {
+    match section {
+        McpSectionId::Managed => 0,
+        McpSectionId::Connectors => 1,
+        McpSectionId::Plugin(_) => 2,
+        McpSectionId::Local => 3,
     }
 }
 
@@ -39,6 +48,7 @@ impl Ord for McpSectionId {
 pub fn section_key(section: &McpSectionId) -> String {
     match section {
         McpSectionId::Managed => "mcp-section:managed".into(),
+        McpSectionId::Connectors => "mcp-section:connectors".into(),
         McpSectionId::Plugin(name) => format!("mcp-section:plugin:{name}"),
         McpSectionId::Local => "mcp-section:local".into(),
     }
@@ -48,6 +58,7 @@ pub fn section_key(section: &McpSectionId) -> String {
 pub fn section_label(section: &McpSectionId, count: usize) -> String {
     match section {
         McpSectionId::Managed => format!("Managed by grok.com ({count})"),
+        McpSectionId::Connectors => format!("Connectors ({count})"),
         McpSectionId::Plugin(name) => format!("Plugin: {name} ({count})"),
         McpSectionId::Local => format!("Local ({count})"),
     }
@@ -90,21 +101,31 @@ pub fn section_description_lines(section: &McpSectionId, team_id: Option<&str>) 
                 format!("[{url}]"),
             ]
         }
+        McpSectionId::Connectors => {
+            vec!["Remote HTTP and SSE servers from Cursor and project config.".into()]
+        }
         McpSectionId::Plugin(_) | McpSectionId::Local => vec![],
     }
 }
 
 /// Classify a server into a UI section.
 ///
-/// Priority: a gateway / managed wire source maps to Managed; else a plugin label maps to Plugin; else Local.
+/// Priority: a gateway / managed wire source maps to Managed; a `connector:` label maps to
+/// Connectors; else a plugin label maps to Plugin; else Local.
 pub fn section_for(server: &McpServerInfo) -> McpSectionId {
     if server.is_managed_gateway || server.wire_source == McpWireSource::Managed {
         McpSectionId::Managed
+    } else if is_connector_source(&server.source) {
+        McpSectionId::Connectors
     } else if let Some(ref name) = server.plugin_name {
         McpSectionId::Plugin(name.clone())
     } else {
         McpSectionId::Local
     }
+}
+
+fn is_connector_source(source: &str) -> bool {
+    source.trim_start().starts_with("connector:")
 }
 
 /// Whether the user may delete this server from local config.
@@ -364,15 +385,10 @@ pub fn convert_list_response(resp: McpsListResponse) -> Vec<McpServerInfo> {
         })
         .collect::<Vec<_>>();
 
-    // Stable sort: managed before plugin/local, then alphabetical by name.
+    // Stable sort: managed, connectors, plugin, local, then alphabetical by name.
     servers.sort_by(|a, b| {
-        let source_rank = |s: &McpServerInfo| match section_for(s) {
-            McpSectionId::Managed => 0,
-            McpSectionId::Plugin(_) => 1,
-            McpSectionId::Local => 2,
-        };
-        source_rank(a)
-            .cmp(&source_rank(b))
+        section_for(a)
+            .cmp(&section_for(b))
             .then_with(|| {
                 a.display_name
                     .as_deref()
@@ -584,6 +600,18 @@ mod tests {
     fn section_for_grok_com_local_name_is_local() {
         let server = server_from_wire("grok_com_linear", Some("local"), None);
         assert_eq!(section_for(&server), McpSectionId::Local);
+    }
+
+    #[test]
+    fn section_for_connector_label_is_connectors_section() {
+        let server = server_from_wire("sentry", Some("local"), Some("connector: project"));
+        assert_eq!(section_for(&server), McpSectionId::Connectors);
+        assert_eq!(
+            section_label(&McpSectionId::Connectors, 1),
+            "Connectors (1)"
+        );
+        assert!(McpSectionId::Managed < McpSectionId::Connectors);
+        assert!(McpSectionId::Connectors < McpSectionId::Local);
     }
 
     #[test]

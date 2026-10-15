@@ -76,6 +76,11 @@ impl CursorAdapter {
         };
 
         if is_grok_extension(&method) {
+            if let Some(id) = id.as_ref()
+                && let Some(result) = cursor_local_extension_result(&method)
+            {
+                return vec![Routed::ToClient(success_response(id, result))];
+            }
             return match id {
                 Some(id) => vec![Routed::ToClient(error_response(
                     &id,
@@ -96,8 +101,9 @@ impl CursorAdapter {
                 if let Some(id) = &id {
                     let params = msg.get("params");
                     if method == "session/load"
-                        && let Some(session_id) =
-                            params.and_then(|p| p.get("sessionId")).and_then(Value::as_str)
+                        && let Some(session_id) = params
+                            .and_then(|p| p.get("sessionId"))
+                            .and_then(Value::as_str)
                     {
                         let no_replay = params
                             .and_then(|p| p.pointer("/_meta/noReplay"))
@@ -178,7 +184,10 @@ impl CursorAdapter {
         let Some(id) = msg.get("id").cloned() else {
             return vec![Routed::ToClient(line.to_owned())];
         };
-        if id.as_str().is_some_and(|s| s.starts_with(INTERNAL_ID_PREFIX)) {
+        if id
+            .as_str()
+            .is_some_and(|s| s.starts_with(INTERNAL_ID_PREFIX))
+        {
             if let Some(error) = msg.get("error") {
                 tracing::warn!(%error, "cursor backend: internal request failed");
             }
@@ -203,7 +212,8 @@ impl CursorAdapter {
                     rewrite_modes(result);
                     self.record_models(result);
                     if let (Some(session_id), Some(requested)) = (session_id, requested_model)
-                        && let Some(set_model) = self.apply_requested_model(result, &session_id, &requested)
+                        && let Some(set_model) =
+                            self.apply_requested_model(result, &session_id, &requested)
                     {
                         out.push(Routed::ToAgent(set_model));
                     }
@@ -213,7 +223,9 @@ impl CursorAdapter {
                 if let Some(prompt_id) = self.active_prompts.remove(&session_id)
                     && let Some(result) = msg.get_mut("result").and_then(Value::as_object_mut)
                 {
-                    meta_mut(result).entry("promptId").or_insert(Value::String(prompt_id));
+                    meta_mut(result)
+                        .entry("promptId")
+                        .or_insert(Value::String(prompt_id));
                 }
             }
             None => {}
@@ -227,7 +239,10 @@ impl CursorAdapter {
         let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) else {
             return true;
         };
-        let session_id = params.get("sessionId").and_then(Value::as_str).unwrap_or_default();
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let replay = self.loading.get(session_id).copied();
         if replay == Some(true) {
             return false;
@@ -314,7 +329,9 @@ impl CursorAdapter {
         let base = model_base(requested);
         self.models
             .iter()
-            .find(|m| model_base(&m.id).eq_ignore_ascii_case(base) || m.name.eq_ignore_ascii_case(base))
+            .find(|m| {
+                model_base(&m.id).eq_ignore_ascii_case(base) || m.name.eq_ignore_ascii_case(base)
+            })
             .map(|m| m.id.clone())
     }
 }
@@ -324,7 +341,39 @@ fn model_base(id: &str) -> &str {
 }
 
 fn is_grok_extension(method: &str) -> bool {
-    method.strip_prefix('_').unwrap_or(method).starts_with("x.ai/")
+    method
+        .strip_prefix('_')
+        .unwrap_or(method)
+        .starts_with("x.ai/")
+}
+
+/// Session list and MCP list are answered from disk so the picker and `/mcps` modal work
+/// while `cursor-agent` is the ACP backend. Other `x.ai/*` methods stay unsupported.
+fn cursor_local_extension_result(method: &str) -> Option<Value> {
+    match method.strip_prefix('_').unwrap_or(method) {
+        "x.ai/session/list" => Some(json!({ "sessions": [] })),
+        "x.ai/mcp/list" => Some(cursor_mcp_list_result()),
+        _ => None,
+    }
+}
+
+fn cursor_mcp_list_result() -> Value {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let servers: Vec<Value> = xai_grok_config::mcp_servers::list_cursor_mcp_for_display(&cwd)
+        .into_iter()
+        .map(|server| {
+            json!({
+                "name": server.name,
+                "source": "local",
+                "sourceLabel": server.source_label(),
+                "session": {
+                    "enabled": server.enabled,
+                    "status": if server.enabled { "ready" } else { "unavailable" },
+                },
+            })
+        })
+        .collect();
+    json!({ "servers": servers })
 }
 
 fn rewrite_modes(result: &mut Map<String, Value>) {
@@ -336,7 +385,10 @@ fn rewrite_modes(result: &mut Map<String, Value>) {
     {
         *current = Value::String(GROK_DEFAULT_MODE.to_owned());
     }
-    if let Some(available) = modes.get_mut("availableModes").and_then(Value::as_array_mut) {
+    if let Some(available) = modes
+        .get_mut("availableModes")
+        .and_then(Value::as_array_mut)
+    {
         for mode in available {
             if let Some(id) = mode.get_mut("id")
                 && id.as_str() == Some(CURSOR_AGENT_MODE)
@@ -354,11 +406,21 @@ fn meta_mut(obj: &mut Map<String, Value>) -> &mut Map<String, Value> {
     if !meta.is_object() {
         *meta = Value::Object(Map::new());
     }
-    meta.as_object_mut().expect("just ensured _meta is an object")
+    meta.as_object_mut()
+        .expect("just ensured _meta is an object")
 }
 
 fn id_key(id: &Value) -> String {
     id.to_string()
+}
+
+fn success_response(id: &Value, result: Value) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+    .to_string()
 }
 
 fn error_response(id: &Value, code: i64, message: &str) -> String {

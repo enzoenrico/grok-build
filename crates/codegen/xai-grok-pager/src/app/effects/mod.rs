@@ -569,6 +569,39 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::MaterializeCursorSession {
+            session_id,
+            cwd,
+            title,
+        } => {
+            tasks.spawn(async move {
+                let turns = tokio::task::spawn_blocking({
+                    let cwd = cwd.clone();
+                    let session_id = session_id.clone();
+                    move || {
+                        xai_grok_foreign_sessions::read_cursor_transcript(
+                            std::path::Path::new(&cwd),
+                            &session_id,
+                        )
+                    }
+                })
+                .await
+                .unwrap_or_default();
+                let error = match xai_grok_shell::session::cursor_import::materialize_cursor_session(
+                    &session_id, &cwd, &title, &turns,
+                )
+                .await
+                {
+                    Ok(()) => None,
+                    Err(error) => Some(error.to_string()),
+                };
+                TaskResult::CursorSessionMaterialized {
+                    session_id,
+                    cwd,
+                    error,
+                }
+            });
+        }
         Effect::ScanForeignSessions { cwd, compat, grok_home, coordinator, seq } => {
             if coordinator.latest_seq() != seq {
                 return (false, meta);

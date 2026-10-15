@@ -397,16 +397,16 @@ disabled = ["wip-skill"]              # skill names to keep listed but inactive
 
 ### Harness compatibility
 
-Control vendor compatibility for Cursor, Claude, and Codex. Every cell defaults to `true`. Session cells stay staged and inert until a foreign-session scanner consumes them, and each tool needs both its `sessions` cell and the matching `resume-claude`, `resume-codex`, or `resume-cursor` skill — a missing skill means zero foreign-session filesystem I/O.
+Control vendor compatibility for Cursor, Claude, and Codex. Every cell defaults to `true`. Cursor sessions show up in the Ctrl-R picker when `sessions` is on, with no `resume-cursor` skill. Claude and Codex session cells stay staged until their scanners run, and each of those tools needs both its `sessions` cell and the matching `resume-claude` or `resume-codex` skill — a missing skill means zero filesystem I/O for that tool.
 
 ```toml
 [compat.cursor]
 skills = true     # scan ~/.cursor/skills/ and <cwd>/.cursor/skills/
 rules = true      # scan ~/.cursor/rules/ and <dir>/.cursor/rules/
 agents = true     # scan ~/.cursor/ for named instruction files
-mcps = true       # scan ~/.cursor/mcp.json and <cwd>/.cursor/mcp.json
+mcps = true       # scan ~/.cursor/mcp.json, parent .cursor/mcp.json files, and Cursor plugin mcp.json
 hooks = true      # scan ~/.cursor/hooks.json and <cwd>/.cursor/hooks.json
-sessions = true   # staged; no scanner consumer yet
+sessions = true   # Ctrl-R lists Cursor agent transcripts and CLI chats for this workspace
 
 [compat.claude]
 skills = true     # scan ~/.claude/skills/ and <cwd>/.claude/skills/

@@ -165,9 +165,13 @@ fn run_list(json: bool) -> Result<()> {
     // `mcp_doctor::policy_subjects` judges this same TOML walk (plus the doctor-only `.mcp.json`
     // and plugin legs), so every server listed here has a verdict; the rule itself is the merge's.
     let blocked = xai_grok_shell::mcp_doctor::policy_blocked_servers(&cwd);
+    let cursor_extra: Vec<_> = xai_grok_config::mcp_servers::list_cursor_mcp_for_display(&cwd)
+        .into_iter()
+        .filter(|row| !servers.contains_key(&row.name))
+        .collect();
 
     if json {
-        let payload: serde_json::Value = servers
+        let mut payload: Vec<serde_json::Value> = servers
             .iter()
             .map(|(name, (config, scope))| {
                 let mut entry = serde_json::to_value(config).unwrap_or_default();
@@ -188,8 +192,20 @@ fn run_list(json: bool) -> Result<()> {
                 entry
             })
             .collect();
+        for row in &cursor_extra {
+            payload.push(serde_json::json!({
+                "name": row.name,
+                "scope": row.scope,
+                "transport": row.transport,
+                "detail": row.detail,
+                "enabled": row.enabled && !disabled.contains(&row.name),
+                "source": "cursor",
+                "location": row.location.display().to_string(),
+                "connector": row.is_connector(),
+            }));
+        }
         println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else if servers.is_empty() {
+    } else if servers.is_empty() && cursor_extra.is_empty() {
         println!("No MCP servers configured. Run `grok mcp add --help` to get started.");
     } else {
         for (name, (config, scope)) in &servers {
@@ -220,8 +236,34 @@ fn run_list(json: bool) -> Result<()> {
             };
             println!("  {name}: {transport}{suffix}");
         }
+        print_cursor_mcp_group("MCP servers", &cursor_extra, &disabled, false);
+        print_cursor_mcp_group("Connectors", &cursor_extra, &disabled, true);
     }
     Ok(())
+}
+
+fn print_cursor_mcp_group(
+    heading: &str,
+    rows: &[xai_grok_config::mcp_servers::CursorMcpListing],
+    disabled: &std::collections::HashSet<String>,
+    connectors: bool,
+) {
+    let rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.is_connector() == connectors)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    println!();
+    println!("{heading}");
+    for row in rows {
+        let mut notes = vec![format!("cursor {}", row.scope)];
+        if !row.enabled || disabled.contains(&row.name) {
+            notes.push("disabled".to_owned());
+        }
+        println!("  {}: {} ({})", row.name, row.detail, notes.join(", "));
+    }
 }
 
 #[derive(Debug)]

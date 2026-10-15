@@ -491,6 +491,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "loop",
     "m",
     "marketplace",
+    "mcp",
     "mcps",
     "mem",
     "memory",

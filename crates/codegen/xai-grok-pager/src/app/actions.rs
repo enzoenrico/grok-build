@@ -1459,6 +1459,12 @@ pub enum Effect {
         /// Conversation-entry bit (`source == "conversation"`), not sticky `--chat`.
         chat_kind: bool,
     },
+    /// Copy a Cursor transcript into a grok session, then load it.
+    MaterializeCursorSession {
+        session_id: String,
+        cwd: String,
+        title: String,
+    },
     /// Scan enabled foreign session stores without delaying the native list.
     ScanForeignSessions {
         cwd: std::path::PathBuf,
@@ -2495,6 +2501,12 @@ pub enum TaskResult {
         /// `Some` marks the sessions as server-side search results, so the local fuzzy re-filter doesn't hide content-only hits.
         /// Zero hits are then a normal outcome rather than an empty-directory error.
         query: Option<String>,
+    },
+    /// Cursor transcript import finished. `error` is set when there is nothing to load.
+    CursorSessionMaterialized {
+        session_id: String,
+        cwd: String,
+        error: Option<String>,
     },
     /// A background foreign-session scan completed.
     ForeignSessionsScanned {

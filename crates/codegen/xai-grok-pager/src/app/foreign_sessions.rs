@@ -265,6 +265,14 @@ impl ForeignPickerSource {
             Self::Cursor => enabled.cursor = true,
         }
     }
+    /// Claude and Codex resume through a bundled skill. Cursor sessions load through `session/load`
+    /// (Cursor backend) or a local transcript import (Grok backend), so the skill is not required.
+    const fn requires_skill(self) -> bool {
+        match self {
+            Self::Claude | Self::Codex => true,
+            Self::Cursor => false,
+        }
+    }
     pub(crate) fn resume_prompt(self, native_id: &str) -> String {
         format!("/{} {native_id}", self.skill_name())
     }
@@ -306,6 +314,10 @@ where
     let mut enabled = EnabledForeignSessionSources::default();
     for source in ForeignPickerSource::ALL {
         if !source.compat_enabled(compat) {
+            continue;
+        }
+        if !source.requires_skill() {
+            source.set_enabled(&mut enabled);
             continue;
         }
         let mut available = false;
@@ -550,6 +562,21 @@ mod tests {
                 .all(|path| path.to_string_lossy().contains("resume-codex"))
         );
         assert_eq!(store_calls.get(), 0);
+    }
+    #[tokio::test]
+    async fn cursor_sessions_scan_without_the_resume_skill() {
+        let enabled = gated_sources_async_with(
+            EnabledForeignSessionSources {
+                cursor: true,
+                ..Default::default()
+            },
+            Path::new("/grok"),
+            |_| std::future::ready(false),
+        )
+        .await;
+        assert!(enabled.cursor);
+        assert!(!enabled.claude);
+        assert!(!enabled.codex);
     }
     #[tokio::test]
     async fn async_gate_supports_bundled_and_user_skill_locations() {

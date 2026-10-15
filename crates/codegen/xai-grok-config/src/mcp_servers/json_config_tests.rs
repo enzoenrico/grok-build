@@ -158,3 +158,81 @@ fn nearest_mcp_json_wins_a_shared_name() {
         commands
     );
 }
+
+#[test]
+fn cursor_disabled_true_maps_to_enabled_false() {
+    let value = serde_json::json!({
+        "mcpServers": {
+            "off": { "command": "echo", "disabled": true },
+            "on": { "command": "echo", "disabled": false }
+        }
+    });
+    let config = mcp_config_from_json_value(&value);
+    assert!(!config.mcp_servers["off"].enabled);
+    assert!(config.mcp_servers["on"].enabled);
+}
+
+#[test]
+fn cursor_parent_mcp_json_is_visible_and_nearest_wins() {
+    let root = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".git")).unwrap();
+    std::fs::create_dir_all(root.path().join(".cursor")).unwrap();
+    std::fs::create_dir_all(root.path().join("pkg").join(".cursor")).unwrap();
+    std::fs::create_dir_all(root.path().join("pkg").join("nested")).unwrap();
+    std::fs::write(
+        root.path().join(".cursor").join("mcp.json"),
+        r#"{"mcpServers": {"shared": {"command": "parent"}, "parent-only": {"command": "parent"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("pkg").join(".cursor").join("mcp.json"),
+        r#"{"mcpServers": {
+            "shared": {"command": "child"},
+            "remote": {"url": "https://mcp.example.test/mcp", "disabled": true},
+            "events": {"url": "https://mcp.example.test/sse", "type": "sse"}
+        }}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(
+        config_dir
+            .path()
+            .join("plugins")
+            .join("local")
+            .join("linter"),
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir.path().join("mcp.json"),
+        r#"{"mcpServers": {"shared": {"command": "user"}, "user-only": {"command": "user"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir
+            .path()
+            .join("plugins")
+            .join("local")
+            .join("linter")
+            .join("mcp.json"),
+        r#"{"mcpServers": {"lint": {"command": "lint"}}}"#,
+    )
+    .unwrap();
+
+    let nested = root.path().join("pkg").join("nested");
+    let listed = list_cursor_mcp_in(&nested, Some(config_dir.path()));
+    let by_name: std::collections::HashMap<_, _> =
+        listed.iter().map(|row| (row.name.as_str(), row)).collect();
+
+    assert_eq!(by_name["shared"].detail, "child");
+    assert_eq!(by_name["shared"].scope, "project");
+    assert_eq!(by_name["parent-only"].detail, "parent");
+    assert_eq!(by_name["user-only"].scope, "user");
+    assert_eq!(by_name["user-only"].source_label(), "cursor: user");
+    assert!(!by_name["remote"].enabled);
+    assert!(by_name["remote"].is_connector());
+    assert_eq!(by_name["remote"].source_label(), "connector: project");
+    assert_eq!(by_name["events"].transport, "sse");
+    assert_eq!(by_name["lint"].scope, "plugin");
+    assert_eq!(by_name["lint"].plugin_name.as_deref(), Some("linter"));
+    assert_eq!(by_name.len(), 6);
+}

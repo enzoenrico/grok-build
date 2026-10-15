@@ -1237,10 +1237,73 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             }
         }
     }
+    label_cursor_mcp_servers(&mut servers, &cwd, &disabled_names);
     to_ext_response(Ok(McpListResponse {
         servers,
         session_mcp_resolved,
     }))
+}
+
+/// Label Cursor stdio servers `cursor: {scope}` and HTTP/SSE servers `connector: {scope}`.
+/// Servers Cursor marked `disabled` are absent from the started catalog, so they are appended here.
+fn label_cursor_mcp_servers(
+    servers: &mut Vec<McpServerEntry>,
+    cwd: &std::path::Path,
+    disabled_names: &HashSet<String>,
+) {
+    let cursor_rows = xai_grok_config::mcp_servers::list_cursor_mcp_for_display(cwd);
+    let known: HashSet<String> = servers.iter().map(|entry| entry.name.clone()).collect();
+    for entry in servers.iter_mut() {
+        if entry.source_label.is_some() {
+            continue;
+        }
+        if let Some(row) = cursor_rows.iter().find(|row| row.name == entry.name) {
+            entry.source_label = Some(row.source_label());
+        }
+    }
+    for row in cursor_rows {
+        if known.contains(&row.name) {
+            continue;
+        }
+        let enabled = row.enabled && !disabled_names.contains(&row.name);
+        let source_label = row.source_label();
+        let config = if row.is_connector() {
+            McpServerConfig::Http {
+                url: row.detail.clone(),
+                scope: None,
+                scope_id: None,
+                scope_name: None,
+            }
+        } else {
+            McpServerConfig::Stdio {
+                command: std::path::PathBuf::from(&row.detail),
+                args: Vec::new(),
+                env: Vec::new(),
+            }
+        };
+        servers.push(McpServerEntry {
+            name: row.name,
+            display_name: None,
+            icons: Vec::new(),
+            source: McpServerSource::Local,
+            source_label: Some(source_label),
+            setup: None,
+            setup_values: None,
+            config,
+            session: Some(McpServerSessionState {
+                enabled,
+                status: Some(if enabled {
+                    McpSessionStatus::Ready
+                } else {
+                    McpSessionStatus::Unavailable
+                }),
+                tools: vec![],
+                auth_required: false,
+                setup_required: false,
+                blocked_reason: None,
+            }),
+        });
+    }
 }
 
 // ── mcp/call handler ────────────────────────────────────────────────

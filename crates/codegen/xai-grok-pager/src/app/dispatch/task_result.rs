@@ -688,6 +688,22 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             scope,
             query,
         ),
+        TaskResult::CursorSessionMaterialized {
+            session_id,
+            cwd,
+            error,
+        } => match error {
+            Some(error) => {
+                app.show_toast(&error);
+                vec![]
+            }
+            None => super::session::load::dispatch_load_session(
+                app,
+                session_id,
+                Some(std::path::PathBuf::from(cwd)),
+                false,
+            ),
+        },
         TaskResult::ForeignSessionsScanned { entries, seq } => {
             handle_foreign_sessions_scanned(app, entries, seq)
         }

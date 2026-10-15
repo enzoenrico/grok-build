@@ -838,6 +838,11 @@ pub fn cli_known_mcp_server_names(cwd: &std::path::Path) -> std::collections::Ha
             names.insert(name.to_string());
         }
     }
+    names.extend(
+        xai_grok_config::mcp_servers::list_cursor_mcp_for_display(cwd)
+            .into_iter()
+            .map(|row| row.name),
+    );
     names
 }
 

@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod capability;
 mod claude;
 mod codex;
+mod cursor;
 use capability::{ApprovedRoot, open_sqlite_transaction};
 pub const MAX_SESSIONS_PER_TOOL: usize = 50;
 pub const MAX_SESSION_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -98,15 +99,15 @@ pub fn scan_foreign_sessions(
     cwd: &Path,
     enabled: EnabledForeignSessionSources,
 ) -> Vec<ForeignSessionSummary> {
-    let scan_cursor = |_: &Path, _: SystemTime| Vec::new();
-    scan_with(cwd, enabled, claude::scan, codex::scan, scan_cursor)
+    scan_with(cwd, enabled, claude::scan, codex::scan, cursor::scan)
 }
+pub use cursor::{CursorTranscriptTurn, read_transcript as read_cursor_transcript};
+
 pub fn most_recent_foreign_session(
     cwd: &Path,
     enabled: EnabledForeignSessionSources,
     within: Duration,
 ) -> Option<RecentForeignSession> {
-    let recent_cursor = |_: &Path, _: SystemTime, _: Duration| RecentProbe::Complete(None);
     match most_recent_with(
         cwd,
         enabled,
@@ -114,7 +115,7 @@ pub fn most_recent_foreign_session(
         SystemTime::now(),
         claude::most_recent,
         codex::most_recent,
-        recent_cursor,
+        cursor::most_recent,
     ) {
         RecentProbe::Complete(session) => session,
         RecentProbe::Incomplete => None,
