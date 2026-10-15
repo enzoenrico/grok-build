@@ -511,6 +511,20 @@ pub(crate) fn cloud_agent_id(result: &Map<String, Value>) -> Option<String> {
     None
 }
 
+pub(crate) fn cloud_thought_notice(session_id: &str, text: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": { "type": "text", "text": text }
+            }
+        }
+    })
+}
+
 pub(crate) fn cloud_tool_notice(
     session_id: &str,
     tool: &super::cloud::CloudTool,
@@ -1405,6 +1419,20 @@ mod tests {
             plan.entries[0].priority,
             agent_client_protocol::PlanEntryPriority::Medium
         );
+    }
+
+    #[test]
+    fn a_cloud_thought_decodes_as_a_pager_thought() {
+        let notice = cloud_thought_notice("s1", "Looking at the README.");
+        let note: agent_client_protocol::SessionNotification =
+            serde_json::from_value(notice["params"].clone()).expect("pager thought");
+        let agent_client_protocol::SessionUpdate::AgentThoughtChunk(chunk) = note.update else {
+            panic!("expected a thought");
+        };
+        let agent_client_protocol::ContentBlock::Text(text) = chunk.content else {
+            panic!("expected thought text");
+        };
+        assert_eq!(text.text, "Looking at the README.");
     }
 
     #[test]

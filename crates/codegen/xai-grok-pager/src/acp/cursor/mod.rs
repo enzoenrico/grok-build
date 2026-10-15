@@ -96,6 +96,9 @@ fn watch_cloud_run(
             cloud::follow_run_or_recover(&base, &auth, &agent_id, &run_id, |piece| {
                 let line = match piece {
                     cloud::CloudPiece::Text(text) => cloud_text_notice(&session_id, &text),
+                    cloud::CloudPiece::Thought(text) => {
+                        protocol::cloud_thought_notice(&session_id, &text).to_string()
+                    }
                     cloud::CloudPiece::Tool(tool) => {
                         let first = seen_tools.insert(tool.call_id.clone());
                         protocol::cloud_tool_notice(&session_id, &tool, first).to_string()

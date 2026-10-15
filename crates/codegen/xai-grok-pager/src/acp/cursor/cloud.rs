@@ -57,6 +57,7 @@ pub(crate) enum CloudToolPhase {
 
 pub(crate) enum CloudPiece {
     Text(String),
+    Thought(String),
     Tool(CloudTool),
 }
 
@@ -847,11 +848,14 @@ pub(crate) fn follow_run_or_recover(
         if matches!(event, CloudEvent::Assistant(_)) {
             saw_assistant = true;
         }
-        if let CloudEvent::Tool(tool) = &event {
-            on_piece(CloudPiece::Tool(tool.clone()));
-        }
-        if let Some(text) = text {
-            on_piece(CloudPiece::Text(text));
+        match &event {
+            CloudEvent::Thinking(text) => on_piece(CloudPiece::Thought(text.clone())),
+            CloudEvent::Tool(tool) => on_piece(CloudPiece::Tool(tool.clone())),
+            _ => {
+                if let Some(text) = text {
+                    on_piece(CloudPiece::Text(text));
+                }
+            }
         }
     });
     if matches!(followed, Ok(()) if saw_result) {
