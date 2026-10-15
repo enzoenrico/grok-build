@@ -655,17 +655,25 @@ fn question_result(wait: &QuestionWait, result: &Value) -> Value {
         return json!({ "outcome": { "outcome": cursor_outcome } });
     }
     let answers = result.get("answers").and_then(Value::as_object);
+    let annotations = result.get("annotations").and_then(Value::as_object);
     let mut cursor_answers = Vec::new();
     for (prompt, labels) in answers.into_iter().flat_map(|m| m.iter()) {
         let Some(question) = wait.questions.iter().find(|q| q.prompt == *prompt) else {
             continue;
         };
-        let selected: Vec<String> = labels
-            .as_array()
+        let notes = annotations
+            .and_then(|items| items.get(prompt))
+            .and_then(|item| item.get("notes"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty());
+        let selected: Vec<String> = answer_labels(labels)
             .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
             .map(|label| {
+                if label == "Other"
+                    && let Some(notes) = notes
+                {
+                    return notes.to_owned();
+                }
                 question
                     .options
                     .iter()
@@ -680,6 +688,16 @@ fn question_result(wait: &QuestionWait, result: &Value) -> Value {
         }));
     }
     json!({ "outcome": { "outcome": "answered", "answers": cursor_answers } })
+}
+
+fn answer_labels(value: &Value) -> Vec<&str> {
+    if let Some(labels) = value.as_array() {
+        labels.iter().filter_map(Value::as_str).collect()
+    } else if let Some(label) = value.as_str() {
+        vec![label]
+    } else {
+        Vec::new()
+    }
 }
 
 fn plan_result(wait: &QuestionWait, result: &Value) -> Value {
@@ -1202,6 +1220,24 @@ mod tests {
         assert_eq!(
             result["outcome"]["answers"][0]["selectedOptionIds"][0],
             "plan"
+        );
+        let typed = cursor_result_from_ext(
+            &PendingBridge::Question(question_wait(&json!({
+                "questions": [{
+                    "id": "q1",
+                    "prompt": "Which mode?",
+                    "options": [{"id": "plan", "label": "Plan"}]
+                }]
+            }))),
+            &json!({
+                "outcome": "accepted",
+                "answers": {"Which mode?": ["Other"]},
+                "annotations": {"Which mode?": {"notes": "use the login token"}}
+            }),
+        );
+        assert_eq!(
+            typed["outcome"]["answers"][0]["selectedOptionIds"][0],
+            "use the login token"
         );
     }
 
