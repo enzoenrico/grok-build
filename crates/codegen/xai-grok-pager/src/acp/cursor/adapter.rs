@@ -26,6 +26,8 @@ pub(crate) enum Routed {
         session_id: String,
         request: CloudRequest,
         agent_id: Option<String>,
+        /// Set on the first `&` task when the session cwd has a git remote.
+        repo: Option<super::cloud::CloudRepo>,
         /// `session/prompt` id to answer when the cloud handoff is done.
         prompt_rpc_id: Option<Value>,
         prompt_id: Option<String>,
@@ -45,6 +47,7 @@ enum Pending {
     Session {
         requested_model: Option<String>,
         session_id: Option<String>,
+        cwd: Option<String>,
     },
     Prompt {
         session_id: String,
@@ -84,6 +87,7 @@ pub(crate) struct CursorAdapter {
 struct CursorSession {
     skills: HashSet<String>,
     cloud_agent_id: Option<String>,
+    cwd: Option<String>,
 }
 
 impl CursorAdapter {
@@ -155,6 +159,10 @@ impl CursorAdapter {
                             }),
                             session_id: params
                                 .and_then(|p| p.get("sessionId"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            cwd: params
+                                .and_then(|p| p.get("cwd"))
                                 .and_then(Value::as_str)
                                 .map(str::to_owned),
                         },
@@ -245,8 +253,9 @@ impl CursorAdapter {
                         return out;
                     }
                     return vec![Routed::Cloud {
-                        session_id,
+                        session_id: session_id.clone(),
                         request,
+                        repo: self.cloud_repo(cloud_agent_id.as_deref(), &session_id),
                         agent_id: cloud_agent_id,
                         prompt_rpc_id: id,
                         prompt_id,
@@ -350,6 +359,7 @@ impl CursorAdapter {
             Some(Pending::Session {
                 requested_model,
                 session_id,
+                cwd,
             }) => {
                 if let Some(sid) = &session_id {
                     self.loading.remove(sid);
@@ -361,7 +371,10 @@ impl CursorAdapter {
                         .map(str::to_owned)
                         .or(session_id);
                     if let Some(session_id) = &session_id {
-                        self.sessions.entry(session_id.clone()).or_default();
+                        let session = self.sessions.entry(session_id.clone()).or_default();
+                        if session.cwd.is_none() {
+                            session.cwd = cwd;
+                        }
                     }
                     rewrite_modes(result);
                     protocol::absorb_cursor_skills(result);
@@ -559,6 +572,18 @@ impl CursorAdapter {
             .entry(session_id.to_owned())
             .or_default()
             .cloud_agent_id = Some(agent_id.to_owned());
+    }
+
+    fn cloud_repo(
+        &self,
+        agent_id: Option<&str>,
+        session_id: &str,
+    ) -> Option<super::cloud::CloudRepo> {
+        if agent_id.is_some() {
+            return None;
+        }
+        let cwd = self.sessions.get(session_id)?.cwd.as_deref()?;
+        super::cloud::repo_from_cwd(std::path::Path::new(cwd))
     }
 
     fn remember_skills(&mut self, session_id: &str, commands: Option<&Value>) {

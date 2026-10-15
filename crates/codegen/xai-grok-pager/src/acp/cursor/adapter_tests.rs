@@ -358,6 +358,7 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
         agent_id,
         prompt_rpc_id,
         prompt_id,
+        repo,
     } = &sent[0]
     else {
         panic!("expected a cloud handoff: {sent:?}");
@@ -367,6 +368,7 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
     assert_eq!(agent_id, &None);
     assert_eq!(prompt_rpc_id.as_ref().and_then(Value::as_u64), Some(4));
     assert_eq!(prompt_id, &None);
+    assert!(repo.is_none());
 
     adapter.note_cloud_agent("s1", "bc-123");
     let local = adapter.outbound(
@@ -476,8 +478,11 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
         r#"{"jsonrpc":"2.0","id":8,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"please /poteto-mode the tests"},{"type":"text","text":"and /review later"}]}}"#,
     );
     let sent = parse(&first[0]);
-    assert_eq!(sent["params"]["prompt"][0]["text"], "/poteto-mode please the tests");
-    assert_eq!(sent["params"]["prompt"][1]["text"], "and /review later");
+    assert_eq!(
+        sent["params"]["prompt"][0]["text"],
+        "/poteto-mode please the tests\nand /review later"
+    );
+    assert_eq!(sent["params"]["prompt"][1]["text"], "");
     assert!(sent["params"].get("_meta").is_none());
 
     let second = adapter.outbound(
@@ -649,4 +654,88 @@ fn installed_agent_accepts_the_bridge_initialize() {
         json!({})
     );
     assert_eq!(value["result"]["authMethods"][0]["id"], "cursor_login");
+}
+
+#[test]
+fn cloud_create_uses_the_session_git_remote() {
+    let dir = std::env::temp_dir().join(format!("grok-cloud-cwd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-b", "feature"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/payments.git",
+            ])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut adapter = CursorAdapter::new(None, false);
+    let opened = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "session/new",
+        "params": { "cwd": dir, "mcpServers": [] }
+    });
+    let _ = adapter.outbound(&opened.to_string());
+    let created = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": { "sessionId": "s-repo" }
+    });
+    let _ = adapter.inbound(&created.to_string());
+    let prompt = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "s-repo",
+            "prompt": [{ "type": "text", "text": "& fix the tests" }]
+        }
+    });
+    let sent = adapter.outbound(&prompt.to_string());
+    let Routed::Cloud {
+        repo,
+        agent_id,
+        request,
+        ..
+    } = &sent[0]
+    else {
+        panic!("expected a cloud create: {sent:?}");
+    };
+    assert_eq!(agent_id, &None);
+    assert_eq!(request, &CloudRequest::Send("fix the tests".to_owned()));
+    let repo = repo.as_ref().expect("git remote");
+    assert_eq!(repo.url, "https://github.com/acme/payments");
+    assert_eq!(repo.starting_ref.as_deref(), Some("feature"));
+
+    adapter.note_cloud_agent("s-repo", "bc-1");
+    let follow = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "session/prompt",
+        "params": {
+            "sessionId": "s-repo",
+            "prompt": [{ "type": "text", "text": "& add a note" }]
+        }
+    });
+    let sent = adapter.outbound(&follow.to_string());
+    let Routed::Cloud { repo, agent_id, .. } = &sent[0] else {
+        panic!("expected a follow-up: {sent:?}");
+    };
+    assert_eq!(agent_id.as_deref(), Some("bc-1"));
+    assert!(repo.is_none());
+    let _ = std::fs::remove_dir_all(&dir);
 }
