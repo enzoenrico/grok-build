@@ -599,40 +599,49 @@ pub(crate) fn parse_cloud_response(body: &str) -> Result<CloudAgent, String> {
     })
 }
 
-fn pr_url(value: &Value) -> Option<String> {
+fn git_branches(value: &Value) -> Option<&Vec<Value>> {
     for pointer in ["/run/git/branches", "/git/branches"] {
-        let Some(branches) = value.pointer(pointer).and_then(Value::as_array) else {
-            continue;
-        };
-        if let Some(url) = branches
-            .iter()
-            .find_map(|branch| branch.get("prUrl").and_then(Value::as_str))
+        if let Some(branches) = value.pointer(pointer).and_then(Value::as_array)
+            && !branches.is_empty()
         {
-            return Some(url.to_owned());
+            return Some(branches);
         }
     }
     None
 }
 
-fn git_place(value: &Value) -> Option<String> {
-    for pointer in ["/run/git/branches", "/git/branches"] {
-        let Some(branches) = value.pointer(pointer).and_then(Value::as_array) else {
-            continue;
-        };
-        let Some(branch) = branches.first() else {
-            continue;
-        };
-        let name = branch.get("branch").and_then(Value::as_str).unwrap_or("");
-        let repo = branch.get("repoUrl").and_then(Value::as_str).unwrap_or("");
-        let line = match (repo.is_empty(), name.is_empty()) {
-            (true, true) => continue,
-            (false, true) => repo.to_owned(),
-            (true, false) => name.to_owned(),
-            (false, false) => format!("{repo} {name}"),
-        };
-        return Some(line);
+fn pr_url(value: &Value) -> Option<String> {
+    let urls: Vec<&str> = git_branches(value)?
+        .iter()
+        .filter_map(|branch| branch.get("prUrl").and_then(Value::as_str))
+        .filter(|url| !url.is_empty())
+        .collect();
+    if urls.is_empty() {
+        None
+    } else {
+        Some(urls.join("\n"))
     }
-    None
+}
+
+fn git_place(value: &Value) -> Option<String> {
+    let lines: Vec<String> = git_branches(value)?
+        .iter()
+        .filter_map(|branch| {
+            let name = branch.get("branch").and_then(Value::as_str).unwrap_or("");
+            let repo = branch.get("repoUrl").and_then(Value::as_str).unwrap_or("");
+            match (repo.is_empty(), name.is_empty()) {
+                (true, true) => None,
+                (false, true) => Some(repo.to_owned()),
+                (true, false) => Some(name.to_owned()),
+                (false, false) => Some(format!("{repo} {name}")),
+            }
+        })
+        .collect();
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 fn refresh(api_base: &str, auth: &CloudAuth, agent: &mut CloudAgent) -> Result<(), String> {
@@ -675,11 +684,11 @@ fn refresh(api_base: &str, auth: &CloudAuth, agent: &mut CloudAgent) -> Result<(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .or(agent.result.take());
-    if agent.pr_url.is_none() {
-        agent.pr_url = pr_url(&run);
+    if let Some(url) = pr_url(&run) {
+        agent.pr_url = Some(url);
     }
-    if agent.branch.is_none() {
-        agent.branch = git_place(&run);
+    if let Some(place) = git_place(&run) {
+        agent.branch = Some(place);
     }
     Ok(())
 }
@@ -1307,6 +1316,21 @@ data: {}
         assert_eq!(
             event_text(&result, true).as_deref(),
             Some("Run FINISHED.\ngithub.com/your-org/your-repo cursor/add-readme-a1b2\n")
+        );
+    }
+
+    #[test]
+    fn a_stacked_run_names_every_branch_and_pull_request() {
+        let result = super::decode_event(
+            "result",
+            r#"{"status":"FINISHED","text":"Stacked.","git":{"branches":[{"repoUrl":"github.com/acme/app","branch":"cursor/one","prUrl":"https://github.com/acme/app/pull/1"},{"repoUrl":"github.com/acme/app","branch":"cursor/two","prUrl":"https://github.com/acme/app/pull/2"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event_text(&result, false).as_deref(),
+            Some(
+                "Run FINISHED.\nStacked.\nhttps://github.com/acme/app/pull/1\nhttps://github.com/acme/app/pull/2\ngithub.com/acme/app cursor/one\ngithub.com/acme/app cursor/two\n"
+            )
         );
     }
 

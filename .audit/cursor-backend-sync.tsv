@@ -48,3 +48,4 @@ ts	phase	decision	why	evidence	result
 2026-10-15T20:26:19Z	modes	a cloud task uses plan when the pager is in plan, and agent after leaving it	the cloud API defaults every create and follow-up to agent	adapter cloud_handoff_sends_plan_mode_and_keeps_it_through_ask	55 cursor pager tests passed
 2026-10-15T20:32:30Z	cloud	a cloud task sends attached images	prompt images were dropped, so a screenshot never reached the agent	adapter cloud_handoff_sends_attached_images	57 cursor pager tests passed
 2026-10-15T20:38:00Z	cloud	the first cloud task uses the session model	create omitted model, so the cloud agent used the account default	adapter cloud_create_uses_the_session_model	59 cursor pager tests passed
+2026-10-15T20:42:26Z	cloud	a stacked cloud run shows every pushed branch and pull request	only the first git.branches entry was shown	cloud a_stacked_run_names_every_branch_and_pull_request	60 cursor pager tests passed
