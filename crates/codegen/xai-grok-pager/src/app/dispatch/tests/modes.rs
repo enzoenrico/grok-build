@@ -113,13 +113,11 @@ fn show_word_select_tip_targets_the_takeover_child() {
         .agents
         .get(&root_id)
         .unwrap_or_else(|| panic!("missing root agent"));
-    assert!(
-        !root
-            .subagent_view(child_sid)
-            .unwrap()
-            .ephemeral_tip
-            .is_active()
-    );
+    assert!(!root
+        .subagent_view(child_sid)
+        .unwrap()
+        .ephemeral_tip
+        .is_active());
     crate::appearance::cache::set_keep_text_selection(TextSelection::Flash);
 }
 
@@ -2555,6 +2553,30 @@ fn cycle_mode_under_the_policy_pin_returns_to_the_first_published_mode() {
     assert_eq!(vec!["persist:ask"], effects);
     assert_eq!(Some(POLICY_WARNING), agent_toast(&app).as_deref());
     assert!(!test_agent(&app, AgentId(0)).session.is_yolo());
+}
+
+#[test]
+fn cycle_mode_keeps_a_published_mode_the_pager_does_not_model() {
+    let mut app = test_app_with_agent();
+    app.agents
+        .get_mut(&AgentId(0))
+        .expect("the test agent exists")
+        .apply_session_modes(Some(acp::SessionModeState::new(
+            "default",
+            vec![
+                acp::SessionMode::new("default", "Agent"),
+                acp::SessionMode::new("debug", "Debug"),
+                acp::SessionMode::new("plan", "Plan"),
+            ],
+        )));
+
+    let (banner, effects) = press_shift_tab(&mut app);
+    assert_eq!("Switched to mode: Debug", banner);
+    assert_eq!(vec!["set_mode:debug".to_owned()], effects);
+
+    let (banner, effects) = press_shift_tab(&mut app);
+    assert_eq!("Switched to mode: Plan", banner);
+    assert_eq!(vec!["set_mode:plan".to_owned()], effects);
 }
 
 /// Gives the test agent the default, ask, and plan modes.

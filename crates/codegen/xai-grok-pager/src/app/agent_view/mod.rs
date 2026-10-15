@@ -1283,6 +1283,7 @@ pub struct AgentView {
     pub(crate) available_modes: Vec<agent_client_protocol::SessionMode>,
     /// Last confirmed mode. Plan surfaces still read `plan_mode_active`; this covers the rest.
     pub(crate) session_mode: xai_grok_tools::types::SessionMode,
+    pub(crate) extension_mode_id: Option<String>,
     /// Optimistic Shift+Tab pick over `available_modes`, cleared like `plan_mode_pending`.
     pub(crate) session_mode_pending: Option<xai_grok_tools::types::SessionMode>,
     /// Session mode to apply once this agent's ACP session exists. Set when the agent is spawned from the dashboard with `/plan` active (the session does not exist yet, so the mode can't be sent immediately).

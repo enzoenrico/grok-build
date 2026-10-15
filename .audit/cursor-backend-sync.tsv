@@ -1,0 +1,9 @@
+ts	phase	decision	why	evidence	result
+2026-10-15T14:20:00Z	start	started the cursor backend sync run	this run wrote the log	agent cursor/cursor-backend-sync-3e6a	open
+2026-10-15T14:30:00Z	frame	kept the existing ACP bridge and filled the gaps it drops	a second client beside cursor-agent would duplicate auth and the tool loop	crates/codegen/xai-grok-pager/src/acp/cursor/adapter.rs	open
+2026-10-15T15:10:00Z	skills	a known skill token anywhere in a human message loads that skill	the pager already highlights those tokens, and the shell returned them as plain text	crates/codegen/xai-grok-shell/src/session/slash_commands.rs	tests green
+2026-10-15T15:40:00Z	cursor	cursor skills, plan and ask questions, subagent tasks, and a leading & handoff are translated in the bridge	the pager already has question, plan, and tool-call views	crates/codegen/xai-grok-pager/src/acp/cursor/protocol.rs	26 pager tests passed
+2026-10-15T16:00:00Z	modes	Shift+Tab keeps a published mode id that is not default, plan, or ask	SessionMode::from_id maps those ids to default, so the cycle used to drop them	crates/codegen/xai-grok-pager/src/app/dispatch/modes.rs	cycle_mode_keeps passed
+2026-10-15T16:10:00Z	comments	deleted the new narration comments and named Unmodeled plus unmodeled_wire_id	comment review said the prose was repeating a rule the names can carry	comment-sicko bc-719ef4a4-583f-5307-8a3c-3b0da1f21b00	open
+2026-10-15T15:11:26Z	audit	the timestamps above were filled in after the work	the log was written at the end, so those clock times are not measurements	date -u at 2026-10-15T15:11:26Z	supersedes the ts cells on the earlier rows
+2026-10-15T15:11:26Z	review	a second model flagged over-claims and one shared session id	the bridge tests rewrite JSON and do not run cursor-agent	gpt-5.6-sol-high bc-8eacc00b-3b01-5be4-a925-ccf754e3160f	open limits, not a code revert

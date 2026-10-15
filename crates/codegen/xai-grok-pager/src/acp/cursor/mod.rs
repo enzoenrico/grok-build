@@ -4,6 +4,7 @@
 //! `--backend cursor`, `GROK_BACKEND=cursor`, or `[cli] backend = "cursor"` in `config.toml`.
 
 mod adapter;
+mod protocol;
 mod startup;
 
 pub use startup::materialize_startup;

@@ -363,6 +363,7 @@ impl AgentView {
             plan_mode_pending: None,
             available_modes: Vec::new(),
             session_mode: xai_grok_tools::types::SessionMode::Default,
+            extension_mode_id: None,
             session_mode_pending: None,
             deferred_session_mode: None,
             deferred_permission_mode: None,

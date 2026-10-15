@@ -11,7 +11,10 @@ impl AgentView {
         let Some(modes) = modes else {
             return;
         };
-        self.session_mode = SessionMode::from_id(&modes.current_mode_id.0);
+        let wire_id = modes.current_mode_id.0.as_ref();
+        let parsed = SessionMode::from_id(wire_id);
+        self.extension_mode_id = SessionMode::unmodeled_wire_id(wire_id).map(str::to_owned);
+        self.session_mode = parsed;
         self.session_mode_pending = None;
         self.plan_mode_active = self.session_mode.is_plan();
         self.available_modes = modes.available_modes;

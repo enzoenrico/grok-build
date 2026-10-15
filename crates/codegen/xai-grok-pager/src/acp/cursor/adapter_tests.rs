@@ -34,7 +34,8 @@ fn session_new_response(id: u64) -> String {
 #[test]
 fn grok_extension_requests_are_answered_locally() {
     let mut adapter = CursorAdapter::new(None, false);
-    let out = adapter.outbound(r#"{"jsonrpc":"2.0","id":7,"method":"_x.ai/session/list","params":{}}"#);
+    let out =
+        adapter.outbound(r#"{"jsonrpc":"2.0","id":7,"method":"_x.ai/session/list","params":{}}"#);
     assert_eq!(out.len(), 1);
     let Routed::ToClient(line) = &out[0] else {
         panic!("extension request must not reach cursor: {out:?}");
@@ -88,12 +89,21 @@ fn new_session_maps_modes_and_applies_requested_model() {
     };
     let set_model: Value = serde_json::from_str(set_model).unwrap();
     assert_eq!(set_model["method"], "session/set_model");
-    assert_eq!(set_model["params"]["modelId"], "grok-4.7[context=256k,fast=true]");
+    assert_eq!(
+        set_model["params"]["modelId"],
+        "grok-4.7[context=256k,fast=true]"
+    );
 
     let resp = parse(&out[1]);
-    assert_eq!(resp["result"]["models"]["currentModelId"], "grok-4.7[context=256k,fast=true]");
+    assert_eq!(
+        resp["result"]["models"]["currentModelId"],
+        "grok-4.7[context=256k,fast=true]"
+    );
     assert_eq!(resp["result"]["modes"]["currentModeId"], "default");
-    assert_eq!(resp["result"]["modes"]["availableModes"][0]["id"], "default");
+    assert_eq!(
+        resp["result"]["modes"]["availableModes"][0]["id"],
+        "default"
+    );
 
     let internal_ack = json!({"jsonrpc":"2.0","id": set_model["id"], "result": {}}).to_string();
     assert!(adapter.inbound(&internal_ack).is_empty());
@@ -119,7 +129,10 @@ fn set_model_and_set_mode_are_translated() {
     let out = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":2,"method":"session/set_model","params":{"sessionId":"s1","modelId":"GROK-4.7"}}"#,
     );
-    assert_eq!(parse(&out[0])["params"]["modelId"], "grok-4.7[context=256k,fast=true]");
+    assert_eq!(
+        parse(&out[0])["params"]["modelId"],
+        "grok-4.7[context=256k,fast=true]"
+    );
 
     let out = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{"sessionId":"s1","modeId":"default"}}"#,
@@ -129,7 +142,10 @@ fn set_model_and_set_mode_are_translated() {
     let out = adapter.inbound(
         r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"current_mode_update","currentModeId":"agent"}}}"#,
     );
-    assert_eq!(parse(&out[0])["params"]["update"]["currentModeId"], "default");
+    assert_eq!(
+        parse(&out[0])["params"]["update"]["currentModeId"],
+        "default"
+    );
 }
 
 #[test]
@@ -180,6 +196,128 @@ fn preferred_model_beats_grok_default_and_follows_switches() {
         panic!("a later session must follow the switched model: {out:?}");
     };
     assert!(set_model.contains("grok-4.7[context=256k,fast=true]"));
+}
+
+#[test]
+fn ask_and_debug_modes_pass_through() {
+    let mut adapter = CursorAdapter::new(None, false);
+    adapter.outbound(r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#);
+    let created = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "sessionId": "s1",
+            "modes": {
+                "currentModeId": "ask",
+                "availableModes": [
+                    {"id": "agent", "name": "Agent"},
+                    {"id": "plan", "name": "Plan"},
+                    {"id": "ask", "name": "Ask"},
+                    {"id": "debug", "name": "Debug"}
+                ]
+            }
+        }
+    })
+    .to_string();
+    let out = adapter.inbound(&created);
+    let resp = parse(&out[0]);
+    assert_eq!(resp["result"]["modes"]["currentModeId"], "ask");
+    assert_eq!(
+        resp["result"]["modes"]["availableModes"][0]["id"],
+        "default"
+    );
+    assert_eq!(resp["result"]["modes"]["availableModes"][3]["id"], "debug");
+
+    let out = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{"sessionId":"s1","modeId":"debug"}}"#,
+    );
+    assert_eq!(parse(&out[0])["params"]["modeId"], "debug");
+}
+
+#[test]
+fn cursor_skills_hoist_from_the_middle_of_a_prompt() {
+    let mut adapter = CursorAdapter::new(None, false);
+    adapter.outbound(r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#);
+    let created = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "sessionId": "s1",
+            "skills": [{ "name": "poteto-mode", "description": "Poteto", "path": "/skills/poteto-mode/SKILL.md" }]
+        }
+    })
+    .to_string();
+    let out = adapter.inbound(&created);
+    let cmd = &parse(&out[0])["result"]["availableCommands"][0];
+    assert_eq!(cmd["name"], "poteto-mode");
+    assert_eq!(cmd["_meta"]["scope"], "user");
+
+    let out = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"please /poteto-mode review this"}]}}"#,
+    );
+    assert_eq!(
+        parse(&out[0])["params"]["prompt"][0]["text"],
+        "/poteto-mode please review this"
+    );
+}
+
+#[test]
+fn cloud_handoff_is_forwarded_and_a_follow_up_keeps_the_agent_id() {
+    let mut adapter = CursorAdapter::new(None, false);
+    let sent = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& refactor the auth module"}]}}"#,
+    );
+    assert_eq!(
+        parse(&sent[0])["params"]["prompt"][0]["text"],
+        "& refactor the auth module"
+    );
+    assert_eq!(parse(&sent[0])["params"]["_meta"]["cloudHandoff"], true);
+
+    let done = adapter.inbound(
+        r#"{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","cloudAgentId":"bc-123"}}"#,
+    );
+    assert_eq!(
+        parse(&done[0])["params"]["update"]["content"]["text"],
+        "Cloud agent bc-123 is running. Send another message to follow up.\n"
+    );
+
+    let follow = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"also add tests"}]}}"#,
+    );
+    assert_eq!(
+        parse(&follow[0])["params"]["_meta"]["cloudAgentId"],
+        "bc-123"
+    );
+    assert_eq!(
+        parse(&follow[0])["params"]["prompt"][0]["text"],
+        "also add tests"
+    );
+}
+
+#[test]
+fn cursor_question_is_answered_through_the_pager_ext_method() {
+    let mut adapter = CursorAdapter::new(None, false);
+    adapter.outbound(r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#);
+    adapter.inbound(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s1","modes":{"currentModeId":"agent","availableModes":[]}}}"#,
+    );
+    let asked = adapter.inbound(
+        r#"{"jsonrpc":"2.0","id":9,"method":"cursor/ask_question","params":{"toolCallId":"call_123","questions":[{"id":"q1","prompt":"Which mode?","options":[{"id":"plan","label":"Plan"}]}]}}"#,
+    );
+    assert_eq!(parse(&asked[0])["method"], "ext_method");
+    assert_eq!(parse(&asked[0])["params"]["params"]["sessionId"], "s1");
+
+    let answered = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":9,"result":{"outcome":"accepted","answers":{"Which mode?":["Plan"]}}}"#,
+    );
+    assert_eq!(
+        parse(&answered[0])["result"]["outcome"]["outcome"],
+        "answered"
+    );
+    assert_eq!(
+        parse(&answered[0])["result"]["outcome"]["answers"][0]["selectedOptionIds"][0],
+        "plan"
+    );
 }
 
 #[test]

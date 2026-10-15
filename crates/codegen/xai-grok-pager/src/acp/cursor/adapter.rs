@@ -5,12 +5,12 @@
 //! parameterized model ids (`grok-4.7[context=256k,...]`) and an `agent` mode. This adapter translates between the two
 //! one line at a time so neither side needs to know about the other.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
-const GROK_DEFAULT_MODE: &str = "default";
-const CURSOR_AGENT_MODE: &str = "agent";
+use super::protocol;
+
 const INTERNAL_ID_PREFIX: &str = "grok-cursor-bridge-";
 const METHOD_NOT_FOUND: i64 = -32601;
 
@@ -32,6 +32,7 @@ enum Pending {
     },
     Prompt {
         session_id: String,
+        cloud_handoff: bool,
     },
 }
 
@@ -53,6 +54,10 @@ pub(crate) struct CursorAdapter {
     preferred_model: Option<String>,
     /// Cursor loads its own MCP config; the pager's list (which already includes `~/.cursor/mcp.json`) is dropped unless opted in.
     forward_mcp_servers: bool,
+    skill_names: HashSet<String>,
+    cloud_agent_id: Option<String>,
+    last_session_id: Option<String>,
+    bridge_wait: HashMap<String, protocol::PendingBridge>,
 }
 
 impl CursorAdapter {
@@ -72,7 +77,13 @@ impl CursorAdapter {
         let method = msg.get("method").and_then(Value::as_str).map(str::to_owned);
         let id = msg.get("id").cloned();
         let Some(method) = method else {
-            return vec![Routed::ToAgent(line.to_owned())];
+            if let Some(id) = &id
+                && let Some(pending) = self.bridge_wait.remove(&id_key(id))
+                && let Some(result) = msg.get_mut("result")
+            {
+                *result = protocol::cursor_result_from_ext(&pending, result);
+            }
+            return vec![Routed::ToAgent(msg.to_string())];
         };
 
         if is_grok_extension(&method) {
@@ -87,6 +98,7 @@ impl CursorAdapter {
         }
 
         match method.as_str() {
+            "initialize" => protocol::advertise_cursor_client(&mut msg),
             "session/new" | "session/load" => {
                 if !self.forward_mcp_servers
                     && let Some(servers) = msg.pointer_mut("/params/mcpServers")
@@ -96,8 +108,9 @@ impl CursorAdapter {
                 if let Some(id) = &id {
                     let params = msg.get("params");
                     if method == "session/load"
-                        && let Some(session_id) =
-                            params.and_then(|p| p.get("sessionId")).and_then(Value::as_str)
+                        && let Some(session_id) = params
+                            .and_then(|p| p.get("sessionId"))
+                            .and_then(Value::as_str)
                     {
                         let no_replay = params
                             .and_then(|p| p.pointer("/_meta/noReplay"))
@@ -132,13 +145,22 @@ impl CursorAdapter {
                 }
             }
             "session/set_mode" => {
-                if let Some(mode) = msg.pointer_mut("/params/modeId")
-                    && mode.as_str() == Some(GROK_DEFAULT_MODE)
-                {
-                    *mode = Value::String(CURSOR_AGENT_MODE.to_owned());
+                if let Some(mode) = msg.pointer_mut("/params/modeId") {
+                    protocol::rewrite_mode_value(mode, false);
                 }
             }
             "session/prompt" => {
+                let mut cloud_handoff = false;
+                if let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) {
+                    protocol::hoist_skill_prompt(params, &self.skill_names);
+                    cloud_handoff = protocol::prompt_is_cloud_handoff(params);
+                    let follow = if cloud_handoff {
+                        None
+                    } else {
+                        self.cloud_agent_id.as_deref()
+                    };
+                    protocol::stamp_cloud_handoff(params, follow);
+                }
                 let session_id = msg
                     .pointer("/params/sessionId")
                     .and_then(Value::as_str)
@@ -148,12 +170,18 @@ impl CursorAdapter {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 if let Some(session_id) = session_id {
+                    self.last_session_id = Some(session_id.clone());
                     if let Some(prompt_id) = prompt_id {
                         self.active_prompts.insert(session_id.clone(), prompt_id);
                     }
                     if let Some(id) = &id {
-                        self.pending
-                            .insert(id_key(id), Pending::Prompt { session_id });
+                        self.pending.insert(
+                            id_key(id),
+                            Pending::Prompt {
+                                session_id,
+                                cloud_handoff,
+                            },
+                        );
                     }
                 }
             }
@@ -168,9 +196,34 @@ impl CursorAdapter {
             return vec![Routed::ToClient(line.to_owned())];
         };
 
-        if let Some(method) = msg.get("method").and_then(Value::as_str) {
-            if method == "session/update" && !self.stamp_session_update(&mut msg) {
-                return Vec::new();
+        if let Some(method) = msg.get("method").and_then(Value::as_str).map(str::to_owned) {
+            if method == "session/update" {
+                self.note_session_update(&mut msg);
+                if !self.stamp_session_update(&mut msg) {
+                    return Vec::new();
+                }
+                return vec![Routed::ToClient(msg.to_string())];
+            }
+            if let Some(translated) =
+                protocol::translate_cursor_inbound(&msg, self.last_session_id.as_deref())
+            {
+                if let (Some(id), Some(pending)) = (msg.get("id"), translated.pending) {
+                    self.bridge_wait.insert(id_key(id), pending);
+                }
+                let mut routed = Vec::new();
+                routed.extend(
+                    translated
+                        .to_agent
+                        .into_iter()
+                        .map(|value| Routed::ToAgent(value.to_string())),
+                );
+                routed.extend(
+                    translated
+                        .to_client
+                        .into_iter()
+                        .map(|value| Routed::ToClient(value.to_string())),
+                );
+                return routed;
             }
             return vec![Routed::ToClient(msg.to_string())];
         }
@@ -178,7 +231,10 @@ impl CursorAdapter {
         let Some(id) = msg.get("id").cloned() else {
             return vec![Routed::ToClient(line.to_owned())];
         };
-        if id.as_str().is_some_and(|s| s.starts_with(INTERNAL_ID_PREFIX)) {
+        if id
+            .as_str()
+            .is_some_and(|s| s.starts_with(INTERNAL_ID_PREFIX))
+        {
             if let Some(error) = msg.get("error") {
                 tracing::warn!(%error, "cursor backend: internal request failed");
             }
@@ -200,20 +256,37 @@ impl CursorAdapter {
                         .and_then(Value::as_str)
                         .map(str::to_owned)
                         .or(session_id);
+                    if let Some(session_id) = &session_id {
+                        self.last_session_id = Some(session_id.clone());
+                    }
                     rewrite_modes(result);
+                    protocol::absorb_cursor_skills(result);
+                    self.remember_skills(result.get("availableCommands"));
                     self.record_models(result);
                     if let (Some(session_id), Some(requested)) = (session_id, requested_model)
-                        && let Some(set_model) = self.apply_requested_model(result, &session_id, &requested)
+                        && let Some(set_model) =
+                            self.apply_requested_model(result, &session_id, &requested)
                     {
                         out.push(Routed::ToAgent(set_model));
                     }
                 }
             }
-            Some(Pending::Prompt { session_id }) => {
-                if let Some(prompt_id) = self.active_prompts.remove(&session_id)
-                    && let Some(result) = msg.get_mut("result").and_then(Value::as_object_mut)
-                {
-                    meta_mut(result).entry("promptId").or_insert(Value::String(prompt_id));
+            Some(Pending::Prompt {
+                session_id,
+                cloud_handoff,
+            }) => {
+                if let Some(result) = msg.get_mut("result").and_then(Value::as_object_mut) {
+                    if let Some(prompt_id) = self.active_prompts.remove(&session_id) {
+                        meta_mut(result)
+                            .entry("promptId")
+                            .or_insert(Value::String(prompt_id));
+                    }
+                    if cloud_handoff && let Some(agent_id) = protocol::cloud_agent_id(result) {
+                        self.cloud_agent_id = Some(agent_id.clone());
+                        out.push(Routed::ToClient(
+                            protocol::cloud_status_update(&session_id, &agent_id).to_string(),
+                        ));
+                    }
                 }
             }
             None => {}
@@ -227,7 +300,10 @@ impl CursorAdapter {
         let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) else {
             return true;
         };
-        let session_id = params.get("sessionId").and_then(Value::as_str).unwrap_or_default();
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let replay = self.loading.get(session_id).copied();
         if replay == Some(true) {
             return false;
@@ -236,9 +312,8 @@ impl CursorAdapter {
         if let Some(update) = params.get_mut("update").and_then(Value::as_object_mut)
             && update.get("sessionUpdate").and_then(Value::as_str) == Some("current_mode_update")
             && let Some(mode) = update.get_mut("currentModeId")
-            && mode.as_str() == Some(CURSOR_AGENT_MODE)
         {
-            *mode = Value::String(GROK_DEFAULT_MODE.to_owned());
+            protocol::rewrite_mode_value(mode, true);
         }
         let meta = meta_mut(params);
         if replay.is_some() {
@@ -249,6 +324,27 @@ impl CursorAdapter {
         meta.entry("agentTimestampMs")
             .or_insert_with(|| json!(chrono_now_ms()));
         true
+    }
+
+    fn note_session_update(&mut self, msg: &mut Value) {
+        let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) else {
+            return;
+        };
+        if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
+            self.last_session_id = Some(session_id.to_owned());
+        }
+        let Some(update) = params.get_mut("update").and_then(Value::as_object_mut) else {
+            return;
+        };
+        if update.get("sessionUpdate").and_then(Value::as_str) == Some("available_commands_update")
+        {
+            protocol::normalize_commands(update.get_mut("availableCommands"));
+            self.remember_skills(update.get("availableCommands"));
+        }
+    }
+
+    fn remember_skills(&mut self, commands: Option<&Value>) {
+        self.skill_names.extend(protocol::skill_names(commands));
     }
 
     fn record_models(&mut self, result: &Map<String, Value>) {
@@ -314,7 +410,9 @@ impl CursorAdapter {
         let base = model_base(requested);
         self.models
             .iter()
-            .find(|m| model_base(&m.id).eq_ignore_ascii_case(base) || m.name.eq_ignore_ascii_case(base))
+            .find(|m| {
+                model_base(&m.id).eq_ignore_ascii_case(base) || m.name.eq_ignore_ascii_case(base)
+            })
             .map(|m| m.id.clone())
     }
 }
@@ -324,24 +422,26 @@ fn model_base(id: &str) -> &str {
 }
 
 fn is_grok_extension(method: &str) -> bool {
-    method.strip_prefix('_').unwrap_or(method).starts_with("x.ai/")
+    method
+        .strip_prefix('_')
+        .unwrap_or(method)
+        .starts_with("x.ai/")
 }
 
 fn rewrite_modes(result: &mut Map<String, Value>) {
     let Some(modes) = result.get_mut("modes").and_then(Value::as_object_mut) else {
         return;
     };
-    if let Some(current) = modes.get_mut("currentModeId")
-        && current.as_str() == Some(CURSOR_AGENT_MODE)
-    {
-        *current = Value::String(GROK_DEFAULT_MODE.to_owned());
+    if let Some(current) = modes.get_mut("currentModeId") {
+        protocol::rewrite_mode_value(current, true);
     }
-    if let Some(available) = modes.get_mut("availableModes").and_then(Value::as_array_mut) {
+    if let Some(available) = modes
+        .get_mut("availableModes")
+        .and_then(Value::as_array_mut)
+    {
         for mode in available {
-            if let Some(id) = mode.get_mut("id")
-                && id.as_str() == Some(CURSOR_AGENT_MODE)
-            {
-                *id = Value::String(GROK_DEFAULT_MODE.to_owned());
+            if let Some(id) = mode.get_mut("id") {
+                protocol::rewrite_mode_value(id, true);
             }
         }
     }
@@ -354,7 +454,8 @@ fn meta_mut(obj: &mut Map<String, Value>) -> &mut Map<String, Value> {
     if !meta.is_object() {
         *meta = Value::Object(Map::new());
     }
-    meta.as_object_mut().expect("just ensured _meta is an object")
+    meta.as_object_mut()
+        .expect("just ensured _meta is an object")
 }
 
 fn id_key(id: &Value) -> String {
