@@ -26,8 +26,10 @@ fn cloud_handoff_notice(
     let (text, recorded) = match outcome {
         Ok(agent) => {
             let url = agent.url.clone().unwrap_or_default();
+            let status = agent.run_status.clone().unwrap_or_default();
+            let reply = agent.result.clone().unwrap_or_default();
             (
-                format!("Cloud agent {} {url}\n", agent.id),
+                format!("Cloud agent {} {url}\nRun status {status}.\n{reply}", agent.id),
                 Some(agent.id),
             )
         }

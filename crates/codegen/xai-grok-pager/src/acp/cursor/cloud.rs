@@ -11,7 +11,9 @@ use serde_json::{Value, json};
 pub(crate) struct CloudAgent {
     pub id: String,
     pub url: Option<String>,
+    pub run_id: Option<String>,
     pub run_status: Option<String>,
+    pub result: Option<String>,
 }
 
 pub(crate) fn handoff_text(prompt: &str) -> Option<String> {
@@ -48,15 +50,70 @@ pub(crate) fn parse_cloud_response(body: &str) -> Result<CloudAgent, String> {
         .get("url")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let run_id = value
+        .pointer("/run/id")
+        .and_then(Value::as_str)
+        .or_else(|| agent.get("latestRunId").and_then(Value::as_str))
+        .map(str::to_owned);
     let run_status = value
         .pointer("/run/status")
+        .or_else(|| agent.get("status"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let result = value
+        .pointer("/run/result")
         .and_then(Value::as_str)
         .map(str::to_owned);
     Ok(CloudAgent {
         id,
         url,
+        run_id,
         run_status,
+        result,
     })
+}
+
+fn refresh(api_base: &str, api_key: &str, agent: &mut CloudAgent) -> Result<(), String> {
+    let record = request(
+        "GET",
+        &format!("{api_base}/v1/agents/{}", agent.id),
+        api_key,
+        None,
+    )?;
+    let value: Value = serde_json::from_str(&record).map_err(|err| err.to_string())?;
+    if agent.url.is_none() {
+        agent.url = value
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+    let run_id = value
+        .get("latestRunId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| agent.run_id.clone());
+    let Some(run_id) = run_id else {
+        return Ok(());
+    };
+    let run = request(
+        "GET",
+        &format!("{api_base}/v1/agents/{}/runs/{run_id}", agent.id),
+        api_key,
+        None,
+    )?;
+    let run: Value = serde_json::from_str(&run).map_err(|err| err.to_string())?;
+    agent.run_id = Some(run_id);
+    agent.run_status = run
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or(agent.run_status.take());
+    agent.result = run
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or(agent.result.take());
+    Ok(())
 }
 
 pub(crate) fn dispatch(
@@ -72,35 +129,47 @@ pub(crate) fn dispatch(
         ),
         None => (format!("{api_base}/v1/agents"), create_body(text)),
     };
-    let raw = post_json(&url, api_key, &body)?;
-    parse_cloud_response(&raw)
+    let raw = request("POST", &url, api_key, Some(&body))?;
+    let mut agent = parse_cloud_response(&raw)?;
+    let _ = refresh(api_base, api_key, &mut agent);
+    Ok(agent)
 }
 
-pub(crate) fn post_json(url: &str, api_key: &str, body: &str) -> Result<String, String> {
+fn request(
+    method: &str,
+    url: &str,
+    api_key: &str,
+    body: Option<&str>,
+) -> Result<String, String> {
     if url.starts_with("https://") {
-        return post_via_curl(url, api_key, body);
+        return request_via_curl(method, url, api_key, body);
     }
-    post_via_tcp(url, api_key, body)
+    request_via_tcp(method, url, api_key, body)
 }
 
-fn post_via_curl(url: &str, api_key: &str, body: &str) -> Result<String, String> {
-    let output = std::process::Command::new("curl")
-        .args([
-            "-sS",
-            "-u",
-            &format!("{api_key}:"),
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            "Accept: application/json",
-            "-d",
-            body,
-            "-w",
-            "\n%{http_code}",
-            url,
-        ])
-        .output()
-        .map_err(|err| err.to_string())?;
+fn request_via_curl(
+    method: &str,
+    url: &str,
+    api_key: &str,
+    body: Option<&str>,
+) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args([
+        "-sS",
+        "-X",
+        method,
+        "-u",
+        &format!("{api_key}:"),
+        "-H",
+        "Accept: application/json",
+        "-w",
+        "\n%{http_code}",
+        url,
+    ]);
+    if let Some(body) = body {
+        cmd.args(["-H", "Content-Type: application/json", "-d", body]);
+    }
+    let output = cmd.output().map_err(|err| err.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
@@ -114,7 +183,12 @@ fn post_via_curl(url: &str, api_key: &str, body: &str) -> Result<String, String>
     Ok(payload.to_owned())
 }
 
-fn post_via_tcp(url: &str, api_key: &str, body: &str) -> Result<String, String> {
+fn request_via_tcp(
+    method: &str,
+    url: &str,
+    api_key: &str,
+    body: Option<&str>,
+) -> Result<String, String> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("unsupported cloud API url {url}"))?;
@@ -127,8 +201,9 @@ fn post_via_tcp(url: &str, api_key: &str, body: &str) -> Result<String, String> 
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|err| err.to_string())?;
     let token = basic_token(api_key);
+    let body = body.unwrap_or("");
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nAuthorization: Basic {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nAuthorization: Basic {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
@@ -167,21 +242,18 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
-            for expected in ["/v1/agents", "/v1/agents/bc-1/runs"] {
+            let replies = [
+                r#"{"agent":{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"ACTIVE"},"run":{"id":"run-1","status":"CREATING"}}"#,
+                r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"ACTIVE","latestRunId":"run-1"}"#,
+                r#"{"id":"run-1","agentId":"bc-1","status":"FINISHED","result":"Refactored auth."}"#,
+                r#"{"run":{"id":"run-2","agentId":"bc-1","status":"CREATING"}}"#,
+                r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"IDLE","latestRunId":"run-2"}"#,
+                r#"{"id":"run-2","agentId":"bc-1","status":"FINISHED","result":"Added the tests."}"#,
+            ];
+            for body in replies {
                 let (mut sock, _) = listener.accept().unwrap();
                 let mut buf = [0_u8; 8192];
-                let n = sock.read(&mut buf).unwrap();
-                let req = String::from_utf8_lossy(&buf[..n]);
-                assert!(
-                    req.starts_with(&format!("POST {expected} ")),
-                    "{req}"
-                );
-                assert!(req.contains("refactor") || req.contains("add tests"));
-                let body = if expected.ends_with("/runs") {
-                    r#"{"run":{"id":"run-2","agentId":"bc-1","status":"CREATING"}}"#
-                } else {
-                    r#"{"agent":{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"ACTIVE"},"run":{"id":"run-1","status":"CREATING"}}"#
-                };
+                let _ = sock.read(&mut buf).unwrap();
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -196,8 +268,11 @@ mod tests {
             created.url.as_deref(),
             Some("https://cursor.com/agents/bc-1")
         );
+        assert_eq!(created.run_status.as_deref(), Some("FINISHED"));
+        assert_eq!(created.result.as_deref(), Some("Refactored auth."));
         let follow = dispatch(&base, "test-key", Some("bc-1"), "add tests").unwrap();
         assert_eq!(follow.id, "bc-1");
-        assert_eq!(follow.run_status.as_deref(), Some("CREATING"));
+        assert_eq!(follow.run_status.as_deref(), Some("FINISHED"));
+        assert_eq!(follow.result.as_deref(), Some("Added the tests."));
     }
 }
