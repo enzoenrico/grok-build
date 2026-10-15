@@ -345,7 +345,12 @@ pub(crate) fn hoist_skill_prompt(params: &mut Map<String, Value>, skills: &HashS
 
 pub(crate) fn hoist_skill_text(text: &str, skills: &HashSet<String>) -> Option<String> {
     let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('&') {
+    if trimmed.is_empty() || trimmed.starts_with('&') {
+        return None;
+    }
+    if let Some(word) = leading_slash_word(trimmed)
+        && skills.contains(word)
+    {
         return None;
     }
     let bytes = trimmed.as_bytes();
@@ -383,6 +388,13 @@ pub(crate) fn hoist_skill_text(text: &str, skills: &HashSet<String>) -> Option<S
         i = end.max(start);
     }
     None
+}
+
+fn leading_slash_word(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('/')?;
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let word = &rest[..end];
+    (!word.is_empty()).then_some(word)
 }
 
 pub(crate) fn prompt_is_cloud_handoff(params: &Map<String, Value>) -> bool {
@@ -858,6 +870,10 @@ mod tests {
         );
         assert_eq!(hoist_skill_text("/poteto-mode review", &skills), None);
         assert_eq!(hoist_skill_text("see /tmp/file", &skills), None);
+        assert_eq!(
+            hoist_skill_text("/compact please /poteto-mode review", &skills).as_deref(),
+            Some("/poteto-mode /compact please review")
+        );
     }
 
     #[test]

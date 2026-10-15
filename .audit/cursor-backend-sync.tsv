@@ -31,3 +31,4 @@ ts	phase	decision	why	evidence	result
 2026-10-15T18:00:19Z	auth	a later session retries cursor_login after the first wait times out	giving up permanently left every later session/new unauthenticated	adapter session_new_waits_for_cursor_login	2 pager tests passed
 2026-10-15T18:05:04Z	cloud	the cloud handoff prompt result decodes as PromptResponse end_turn and echoes promptId	the pager closes the turn from that type	bare_ampersand_refreshes_the_recorded_agent	passed
 2026-10-15T18:11:52Z	runtime	the bridge initialize line is what agent 2026.10.14 accepts for subagents and cursor_login	hand-built JSON was not the adapter output	installed_agent_accepts_the_bridge_initialize	passed in 1.10s
+2026-10-15T18:17:46Z	skills	a skill after another leading slash is moved to the front	cursor-agent resolveLeadingSlashCommand ignores a prompt that does not start with the skill	protocol mid_message_skill_moves_to_the_front_for_cursor	4 pager tests passed
