@@ -393,7 +393,7 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
 fn bare_ampersand_refreshes_the_recorded_agent() {
     let mut adapter = CursorAdapter::new(None, false);
     let missing = adapter.outbound(
-        r#"{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"&"}]}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s1","_meta":{"promptId":"p-9"},"prompt":[{"type":"text","text":"&"}]}}"#,
     );
     let Routed::ToClient(line) = &missing[0] else {
         panic!("expected a client notice: {missing:?}");
@@ -409,6 +409,10 @@ fn bare_ampersand_refreshes_the_recorded_agent() {
     };
     assert_eq!(end["id"], 4);
     assert_eq!(end["result"]["stopReason"], "end_turn");
+    assert_eq!(end["result"]["_meta"]["promptId"], "p-9");
+    let closed: agent_client_protocol::PromptResponse =
+        serde_json::from_value(end["result"].clone()).expect("pager prompt result");
+    assert_eq!(closed.stop_reason, agent_client_protocol::StopReason::EndTurn);
 
     adapter.note_cloud_agent("s1", "bc-123");
     for text in ["&", "& ", "& status", "& Status"] {
