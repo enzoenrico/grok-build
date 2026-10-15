@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -164,6 +165,131 @@ fn rollout_id(path: &Path) -> Option<String> {
     let id = value.get(id_start..)?;
     uuid::Uuid::try_parse(id).ok()?;
     Some(id.to_owned())
+}
+
+pub(super) fn read_transcript(
+    _cwd: &Path,
+    session_id: &str,
+) -> Vec<super::cursor::CursorTranscriptTurn> {
+    if uuid::Uuid::try_parse(session_id).is_err() {
+        return Vec::new();
+    }
+    let Some(codex_home) = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| xai_dirs::home_dir().map(|home| home.join(".codex")))
+    else {
+        return Vec::new();
+    };
+    let Some(root) = ApprovedRoot::new(&codex_home) else {
+        return Vec::new();
+    };
+    let Some(path) = find_rollout(&root, session_id) else {
+        return Vec::new();
+    };
+    let Some(mut opened) = root.open_regular_file(&path) else {
+        return Vec::new();
+    };
+    let mut bytes = Vec::new();
+    let _ = opened.file.take(1024 * 1024).read_to_end(&mut bytes);
+    codex_turns(&String::from_utf8_lossy(&bytes))
+}
+
+fn find_rollout(root: &ApprovedRoot, session_id: &str) -> Option<PathBuf> {
+    let sessions = root.subroot(&root.join("sessions"))?;
+    let mut years = Vec::new();
+    sessions.for_each_entry_bounded(8, |name| {
+        years.push(name.to_string_lossy().into_owned());
+    });
+    years.sort();
+    years.reverse();
+    let mut examined = 0usize;
+    for year in years {
+        let Some(year_root) = sessions.subroot(&sessions.join(&year)) else {
+            continue;
+        };
+        let mut months = Vec::new();
+        year_root.for_each_entry_bounded(12, |name| {
+            months.push(name.to_string_lossy().into_owned());
+        });
+        months.sort();
+        months.reverse();
+        for month in months {
+            let month_root = match year_root.subroot(&year_root.join(&month)) {
+                Some(root) => root,
+                None => continue,
+            };
+            let mut days = Vec::new();
+            month_root.for_each_entry_bounded(31, |name| {
+                days.push(name.to_string_lossy().into_owned());
+            });
+            for day in days {
+                let day_root = match month_root.subroot(&month_root.join(&day)) {
+                    Some(root) => root,
+                    None => continue,
+                };
+                let mut files = Vec::new();
+                day_root.for_each_entry_bounded(64, |name| {
+                    files.push(name.to_string_lossy().into_owned());
+                });
+                for file in files {
+                    examined += 1;
+                    if examined > 256 {
+                        return None;
+                    }
+                    if file.contains(session_id) && file.ends_with(".jsonl") {
+                        return Some(day_root.join(file));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn codex_turns(text: &str) -> Vec<super::cursor::CursorTranscriptTurn> {
+    let mut turns = Vec::new();
+    for line in text.lines() {
+        if turns.len() == 120 {
+            break;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some((user, body)) = codex_turn(&entry) else {
+            continue;
+        };
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let body = body.chars().take(8_000).collect();
+        turns.push(super::cursor::CursorTranscriptTurn { user, text: body });
+    }
+    turns
+}
+
+fn codex_turn(entry: &Value) -> Option<(bool, String)> {
+    let payload = entry.get("payload").unwrap_or(entry);
+    if let Some(message) = payload.get("message").and_then(Value::as_str) {
+        let user = payload.get("type").and_then(Value::as_str) != Some("agent_message");
+        return Some((user, message.to_owned()));
+    }
+    let role = payload.get("role").and_then(Value::as_str)?;
+    let user = role == "user";
+    if role != "user" && role != "assistant" {
+        return None;
+    }
+    let content = payload.get("content")?;
+    let body = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str).map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    Some((user, body))
 }
 
 fn title(primary: &str, fallback: &str) -> Option<String> {

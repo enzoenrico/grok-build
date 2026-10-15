@@ -1061,9 +1061,12 @@ pub(in crate::app::dispatch) fn drain_startup_actions(app: &mut AppView) -> Vec<
             }
         }
         Some(DeferredSessionStartup::ForeignResume { tool, native_id }) => {
-            if tool == xai_grok_foreign_sessions::ForeignSessionTool::Cursor {
-                effects.extend(super::load::cursor_resume_now(
+            let importable = tool == xai_grok_foreign_sessions::ForeignSessionTool::Cursor
+                || (!app.backend.is_cursor() && uuid::Uuid::try_parse(&native_id).is_ok());
+            if importable {
+                effects.extend(super::load::materialize_foreign_now(
                     app,
+                    tool,
                     native_id,
                     app.cwd.to_string_lossy().into_owned(),
                     String::new(),

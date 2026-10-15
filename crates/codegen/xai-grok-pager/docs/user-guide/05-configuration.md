@@ -397,7 +397,7 @@ disabled = ["wip-skill"]              # skill names to keep listed but inactive
 
 ### Harness compatibility
 
-Control vendor compatibility for Cursor, Claude, and Codex. Every cell defaults to `true`. Cursor sessions show up in the Ctrl-R picker when `sessions` is on, with no `resume-cursor` skill. Claude and Codex session cells stay staged until their scanners run, and each of those tools needs both its `sessions` cell and the matching `resume-claude` or `resume-codex` skill — a missing skill means zero filesystem I/O for that tool.
+Control vendor compatibility for Cursor, Claude, and Codex. Every cell defaults to `true`. When `sessions` is on, Ctrl-R lists Cursor, Claude, and Codex chats for this workspace with no resume skill. Picking a Cursor CLI chat loads it. Picking a Cursor IDE sidepane chat imports the transcript on the grok backend (`cursor-agent` cannot resume those ids). Claude and Codex picks import a transcript when one is on disk, and otherwise send `/resume-claude` or `/resume-codex`.
 
 ```toml
 [compat.cursor]
@@ -406,7 +406,7 @@ rules = true      # scan ~/.cursor/rules/ and <dir>/.cursor/rules/
 agents = true     # scan ~/.cursor/ for named instruction files
 mcps = true       # scan ~/.cursor/mcp.json, parent .cursor/mcp.json files, and Cursor plugin mcp.json
 hooks = true      # scan ~/.cursor/hooks.json and <cwd>/.cursor/hooks.json
-sessions = true   # Ctrl-R lists Cursor agent transcripts and CLI chats for this workspace
+sessions = true   # Ctrl-R lists Cursor CLI chats and IDE sidepane chats for this workspace
 
 [compat.claude]
 skills = true     # scan ~/.claude/skills/ and <cwd>/.claude/skills/
@@ -414,10 +414,10 @@ rules = true      # scan ~/.claude/rules/ and <dir>/.claude/rules/
 agents = true     # scan ~/.claude/ and <dir>/.claude/CLAUDE*.md
 mcps = true       # scan ~/.claude.json for MCP servers
 hooks = true      # scan ~/.claude/settings.json for hooks
-sessions = true   # staged; no scanner consumer yet
+sessions = true   # Ctrl-R lists Claude Code sessions for this workspace
 
 [compat.codex]
-sessions = true   # staged; no scanner consumer yet
+sessions = true   # Ctrl-R lists Codex sessions for this workspace
 ```
 
 Codex's `skills`, `rules`, `agents`, `mcps`, and `hooks` cells are reserved and currently inert — they do not enable `.codex` discovery.

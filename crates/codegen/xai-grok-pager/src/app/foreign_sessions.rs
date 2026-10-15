@@ -265,12 +265,12 @@ impl ForeignPickerSource {
             Self::Cursor => enabled.cursor = true,
         }
     }
-    /// Claude and Codex resume through a bundled skill. Cursor sessions load through `session/load`
-    /// (Cursor backend) or a local transcript import (Grok backend), so the skill is not required.
+    /// Listing no longer waits on a resume skill. Cursor, Claude, and Codex rows show up from
+    /// their session stores. Resume still imports a transcript when one exists, and falls back
+    /// to `/resume-claude` or `/resume-codex` when it does not.
     const fn requires_skill(self) -> bool {
         match self {
-            Self::Claude | Self::Codex => true,
-            Self::Cursor => false,
+            Self::Claude | Self::Codex | Self::Cursor => false,
         }
     }
     pub(crate) fn resume_prompt(self, native_id: &str) -> String {
@@ -533,7 +533,7 @@ mod tests {
         assert!(probed.borrow().is_empty());
     }
     #[tokio::test]
-    async fn async_gate_missing_skill_prevents_store_work() {
+    async fn async_gate_scans_without_a_resume_skill() {
         let probed = RefCell::new(Vec::new());
         let store_calls = std::rc::Rc::new(std::cell::Cell::new(0));
         let store_calls_for_work = std::rc::Rc::clone(&store_calls);
@@ -553,15 +553,15 @@ mod tests {
             },
         )
         .await;
-        assert!(result.is_none());
-        let probed = probed.borrow();
-        assert_eq!(probed.len(), 2);
-        assert!(
-            probed
-                .iter()
-                .all(|path| path.to_string_lossy().contains("resume-codex"))
+        assert_eq!(
+            result,
+            Some(EnabledForeignSessionSources {
+                codex: true,
+                ..Default::default()
+            })
         );
-        assert_eq!(store_calls.get(), 0);
+        assert!(probed.borrow().is_empty());
+        assert_eq!(store_calls.get(), 1);
     }
     #[tokio::test]
     async fn cursor_sessions_scan_without_the_resume_skill() {

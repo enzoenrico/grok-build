@@ -573,32 +573,61 @@ pub(crate) fn execute(
             session_id,
             cwd,
             title,
+            tool,
+            cursor_backend,
         } => {
             tasks.spawn(async move {
-                let turns = tokio::task::spawn_blocking({
+                let planned = tokio::task::spawn_blocking({
                     let cwd = cwd.clone();
                     let session_id = session_id.clone();
                     move || {
-                        xai_grok_foreign_sessions::read_cursor_transcript(
+                        xai_grok_foreign_sessions::plan_foreign_import(
+                            tool,
                             std::path::Path::new(&cwd),
                             &session_id,
+                            cursor_backend,
                         )
                     }
                 })
                 .await
-                .unwrap_or_default();
-                let error = match xai_grok_shell::session::cursor_import::materialize_cursor_session(
-                    &session_id, &cwd, &title, &turns,
-                )
-                .await
-                {
-                    Ok(()) => None,
-                    Err(error) => Some(error.to_string()),
+                .unwrap_or_else(|_| {
+                    xai_grok_foreign_sessions::ForeignImportPlan::Toast(
+                        "could not read the foreign session".into(),
+                    )
+                });
+                let (error, native_load, fallback_prompt) = match planned {
+                    xai_grok_foreign_sessions::ForeignImportPlan::NativeCursorLoad => {
+                        (None, true, None)
+                    }
+                    xai_grok_foreign_sessions::ForeignImportPlan::NeedsSkill => (
+                        None,
+                        false,
+                        Some(
+                            crate::app::foreign_sessions::ForeignPickerSource::from_tool(tool)
+                                .resume_prompt(&session_id),
+                        ),
+                    ),
+                    xai_grok_foreign_sessions::ForeignImportPlan::Toast(message) => {
+                        (Some(message), false, None)
+                    }
+                    xai_grok_foreign_sessions::ForeignImportPlan::Import(turns) => {
+                        let error = match xai_grok_shell::session::cursor_import::materialize_cursor_session(
+                            &session_id, &cwd, &title, &turns,
+                        )
+                        .await
+                        {
+                            Ok(()) => None,
+                            Err(error) => Some(error.to_string()),
+                        };
+                        (error, false, None)
+                    }
                 };
                 TaskResult::CursorSessionMaterialized {
                     session_id,
                     cwd,
                     error,
+                    native_load,
+                    fallback_prompt,
                 }
             });
         }
@@ -2446,10 +2475,14 @@ pub(crate) fn execute(
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
-                    let params = serde_json::json!({
-                    "sessionId": session_id.0.to_string(),
-                    "cache": cache,
-                });
+                    let params = if session_id.0.is_empty() {
+                        serde_json::json!({ "cache": cache })
+                    } else {
+                        serde_json::json!({
+                            "sessionId": session_id.0.to_string(),
+                            "cache": cache,
+                        })
+                    };
                     let req = acp::ExtRequest::new(
                         "x.ai/mcp/list",
                         serde_json::value::to_raw_value(&params)

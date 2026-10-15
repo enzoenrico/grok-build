@@ -183,7 +183,9 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 age_secs = hint.age.as_secs(),
                 "foreign_resume accepted"
             );
-            if source == crate::app::foreign_sessions::ForeignPickerSource::Cursor {
+            let importable = source == crate::app::foreign_sessions::ForeignPickerSource::Cursor
+                || (!app.backend.is_cursor() && uuid::Uuid::try_parse(&hint.native_id).is_ok());
+            if importable {
                 if !app.session_startup_allowed() {
                     app.deferred_startup.session = Some(
                         crate::app::session_startup::DeferredSessionStartup::ForeignResume {
@@ -193,8 +195,9 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                     );
                     return vec![];
                 }
-                return super::session::load::cursor_resume_now(
+                return super::session::load::materialize_foreign_now(
                     app,
+                    hint.tool,
                     hint.native_id,
                     app.cwd.to_string_lossy().into_owned(),
                     String::new(),
@@ -825,9 +828,11 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 modal.mcps_data = crate::views::extensions_modal::TabDataState::Loading;
                 modal.clear_managed_connectors_wait();
             }
-            let Some(session_id) = agent.session.session_id.clone() else {
-                return vec![];
-            };
+            let session_id = agent
+                .session
+                .session_id
+                .clone()
+                .unwrap_or_else(|| agent_client_protocol::SessionId::new(String::new()));
             vec![Effect::FetchMcpsList {
                 agent_id: id,
                 session_id,

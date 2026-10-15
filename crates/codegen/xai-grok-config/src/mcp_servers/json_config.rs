@@ -643,6 +643,165 @@ pub fn parse_mcp_config_with_oauth(
     (servers, oauth_configs)
 }
 
+/// Write Cursor's `disabled` flag into the `mcp.json` that defines `name`.
+/// `Ok(None)` means the name is not a Cursor server. Cursor's CLI reads this flag;
+/// grok's `disabled_mcp_servers` list is a separate store.
+pub fn set_cursor_mcp_server_disabled(
+    cwd: &Path,
+    name: &str,
+    disabled: bool,
+) -> std::io::Result<Option<PathBuf>> {
+    let Some(listing) = list_cursor_mcp_for_display(cwd)
+        .into_iter()
+        .find(|row| row.name == name)
+    else {
+        return Ok(None);
+    };
+    if !set_cursor_mcp_disabled_at(&listing.location, name, disabled)? {
+        return Ok(None);
+    }
+    Ok(Some(listing.location))
+}
+
+/// Set or clear `disabled` on one server inside `path`. Returns whether the file changed.
+pub fn set_cursor_mcp_disabled_at(
+    path: &Path,
+    name: &str,
+    disabled: bool,
+) -> std::io::Result<bool> {
+    let text = std::fs::read_to_string(path)?;
+    let mut value: serde_json::Value = serde_json::from_str(&text).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mcp.json at {} is not JSON: {error}", path.display()),
+        )
+    })?;
+    let Some(entry) = value
+        .get_mut("mcpServers")
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|servers| servers.get_mut(name))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(false);
+    };
+    if disabled {
+        let already = entry.get("disabled").and_then(serde_json::Value::as_bool) == Some(true)
+            && !entry.contains_key("enabled");
+        if already {
+            return Ok(false);
+        }
+        entry.insert("disabled".to_owned(), serde_json::Value::Bool(true));
+        entry.remove("enabled");
+    } else {
+        let already = entry.get("disabled").is_none()
+            && entry.get("enabled").and_then(serde_json::Value::as_bool) != Some(false);
+        if already {
+            return Ok(false);
+        }
+        entry.remove("disabled");
+        if entry.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+            entry.remove("enabled");
+        }
+    }
+    let rendered = serde_json::to_string_pretty(&value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    std::fs::write(path, rendered + "\n")?;
+    Ok(true)
+}
+
+/// `ready` when an enabled server looks reachable, `unavailable` otherwise.
+/// HTTP and SSE get a short TCP connect. Stdio checks that the command exists.
+/// Nothing is spawned: a project server could be untrusted.
+pub fn cursor_mcp_connection_status(listing: &CursorMcpListing) -> &'static str {
+    if !listing.enabled {
+        return "unavailable";
+    }
+    let reachable = match listing.transport {
+        "http" | "sse" => tcp_reachable(&listing.detail),
+        "stdio" => stdio_command_exists(&listing.detail),
+        _ => false,
+    };
+    if reachable { "ready" } else { "unavailable" }
+}
+
+/// Parallel reachability for a display list. Disabled rows stay `unavailable` and are not probed.
+pub fn cursor_mcp_connection_statuses(rows: &[CursorMcpListing]) -> Vec<&'static str> {
+    let mut out = vec!["unavailable"; rows.len()];
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            if !row.enabled {
+                continue;
+            }
+            handles.push(scope.spawn(move || (index, cursor_mcp_connection_status(row))));
+        }
+        for handle in handles {
+            if let Ok((index, status)) = handle.join()
+                && let Some(slot) = out.get_mut(index)
+            {
+                *slot = status;
+            }
+        }
+    });
+    out
+}
+
+fn tcp_reachable(url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Some((host, port)) = http_host_port(url) else {
+        return false;
+    };
+    let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
+        return false;
+    };
+    let timeout = std::time::Duration::from_millis(300);
+    for addr in addrs.take(2) {
+        if std::net::TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn http_host_port(url: &str) -> Option<(String, u16)> {
+    let (body, default_port) = url
+        .strip_prefix("https://")
+        .map(|rest| (rest, 443))
+        .or_else(|| url.strip_prefix("http://").map(|rest| (rest, 80)))?;
+    let authority = body.split(['/', '?', '#']).next().unwrap_or(body);
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(host) = authority.strip_prefix('[') {
+        let (host, rest) = host.split_once(']')?;
+        let port = rest
+            .strip_prefix(':')
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default_port);
+        return Some((host.to_owned(), port));
+    }
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return Some((host.to_owned(), port));
+    }
+    Some((authority.to_owned(), default_port))
+}
+
+fn stdio_command_exists(detail: &str) -> bool {
+    let command = detail.split_whitespace().next().unwrap_or("");
+    if command.is_empty() {
+        return false;
+    }
+    let path = Path::new(command);
+    if command.contains('/') || command.contains('\\') {
+        return path.is_file();
+    }
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(command).is_file()))
+}
+
 #[cfg(test)]
 #[path = "json_config_tests.rs"]
 mod tests;

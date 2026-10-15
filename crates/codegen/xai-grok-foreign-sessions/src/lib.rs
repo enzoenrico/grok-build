@@ -103,6 +103,49 @@ pub fn scan_foreign_sessions(
 }
 pub use cursor::{CursorTranscriptTurn, read_transcript as read_cursor_transcript};
 
+/// What a picker pick should do with a foreign session id.
+#[derive(Debug)]
+pub enum ForeignImportPlan {
+    /// `cursor-agent` can `session/load` this CLI transcript.
+    NativeCursorLoad,
+    /// Copy these turns into a grok session, then load that.
+    Import(Vec<CursorTranscriptTurn>),
+    /// No local transcript. The pager sends `/resume-claude` or `/resume-codex`.
+    NeedsSkill,
+    /// Nothing to load. The string is a toast.
+    Toast(String),
+}
+
+pub fn plan_foreign_import(
+    tool: ForeignSessionTool,
+    cwd: &Path,
+    session_id: &str,
+    cursor_backend: bool,
+) -> ForeignImportPlan {
+    match tool {
+        ForeignSessionTool::Cursor => cursor::plan_import(cwd, session_id, cursor_backend),
+        ForeignSessionTool::Claude => {
+            import_or_skill(cursor_backend, claude::read_transcript(cwd, session_id))
+        }
+        ForeignSessionTool::Codex => {
+            import_or_skill(cursor_backend, codex::read_transcript(cwd, session_id))
+        }
+    }
+}
+
+fn import_or_skill(cursor_backend: bool, turns: Vec<CursorTranscriptTurn>) -> ForeignImportPlan {
+    if cursor_backend {
+        return ForeignImportPlan::Toast(
+            "cursor-agent cannot resume Claude or Codex sessions. Switch to the grok backend to import the transcript.".into(),
+        );
+    }
+    if turns.is_empty() {
+        ForeignImportPlan::NeedsSkill
+    } else {
+        ForeignImportPlan::Import(turns)
+    }
+}
+
 pub fn most_recent_foreign_session(
     cwd: &Path,
     enabled: EnabledForeignSessionSources,

@@ -24,8 +24,11 @@ writes the items you selected into your `.grok` config. Re-run it anytime.
 
 ## Pick up where you left off
 
-The **`/resume-claude`**, **`/resume-codex`**, and **`/resume-cursor`**
-skills continue a recent session from those tools right here.
+Ctrl-R lists recent Cursor, Claude, and Codex sessions for this workspace.
+Cursor CLI chats load directly. Cursor IDE sidepane chats import when the
+grok backend can read the transcript (`cursor-agent` cannot resume those).
+**`/resume-claude`** and **`/resume-codex`** are the fallback when a
+transcript is not on disk.
 
 ## Check what was discovered
 

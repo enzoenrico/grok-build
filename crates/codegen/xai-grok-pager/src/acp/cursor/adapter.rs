@@ -288,8 +288,7 @@ impl CursorAdapter {
             }
             _ => {}
         }
-        if matches!(method.as_str(), "session/new" | "session/load") && !self.cursor_authenticated
-        {
+        if matches!(method.as_str(), "session/new" | "session/load") && !self.cursor_authenticated {
             self.held_for_auth.push(msg.to_string());
             return self.start_cursor_auth();
         }
@@ -313,10 +312,9 @@ impl CursorAdapter {
                 }
                 return vec![Routed::ToClient(msg.to_string())];
             }
-            if let Some(translated) = protocol::translate_cursor_inbound(
-                &msg,
-                self.inbound_session_id(&msg).as_deref(),
-            ) {
+            if let Some(translated) =
+                protocol::translate_cursor_inbound(&msg, self.inbound_session_id(&msg).as_deref())
+            {
                 if let (Some(id), Some(pending)) = (msg.get("id"), translated.pending) {
                     self.bridge_wait.insert(id_key(id), pending);
                 }
@@ -560,10 +558,7 @@ impl CursorAdapter {
     }
 
     fn inbound_session_id(&self, msg: &Value) -> Option<String> {
-        if let Some(session_id) = msg
-            .pointer("/params/sessionId")
-            .and_then(Value::as_str)
-        {
+        if let Some(session_id) = msg.pointer("/params/sessionId").and_then(Value::as_str) {
             return Some(session_id.to_owned());
         }
         if self.sessions.len() == 1 {
@@ -692,16 +687,19 @@ fn cursor_local_extension_result(method: &str) -> Option<Value> {
 
 fn cursor_mcp_list_result() -> Value {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let servers: Vec<Value> = xai_grok_config::mcp_servers::list_cursor_mcp_for_display(&cwd)
-        .into_iter()
-        .map(|server| {
+    let listed = xai_grok_config::mcp_servers::list_cursor_mcp_for_display(&cwd);
+    let statuses = xai_grok_config::mcp_servers::cursor_mcp_connection_statuses(&listed);
+    let servers: Vec<Value> = listed
+        .iter()
+        .zip(statuses)
+        .map(|(server, status)| {
             json!({
                 "name": server.name,
                 "source": "local",
                 "sourceLabel": server.source_label(),
                 "session": {
                     "enabled": server.enabled,
-                    "status": if server.enabled { "ready" } else { "unavailable" },
+                    "status": status,
                 },
             })
         })

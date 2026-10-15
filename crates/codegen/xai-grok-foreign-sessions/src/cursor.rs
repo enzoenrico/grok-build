@@ -1,15 +1,19 @@
-//! Cursor Agent CLI and Agents-window sessions.
+//! Cursor Agent CLI, Agents-window, and IDE sidepane sessions.
 //!
-//! Two stores, both under `${CURSOR_CONFIG_DIR:-~/.cursor}`:
+//! CLI stores, both under `${CURSOR_CONFIG_DIR:-~/.cursor}`:
 //! - `projects/<slug>/agent-transcripts/<id>/<id>.jsonl` — transcript the CLI and the Agents window share
 //! - `chats/<md5(cwd)>/<id>/meta.json` — CLI chat metadata (`agent --resume <id>`)
 //!
-//! IDE sidepane blobs in `state.vscdb` are not listed. The Cursor CLI cannot resume those ids.
+//! IDE sidepane chats live in `state.vscdb` under the Cursor user-data directory
+//! (`CURSOR_USER_DATA_DIR`, or `dirs::config_dir()/Cursor/User`). `cursor-agent` cannot
+//! resume those composer ids. They are listed anyway; a grok-backend pick imports the
+//! bubble text when the database has it.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -33,10 +37,22 @@ pub struct CursorTranscriptTurn {
 }
 
 pub(super) fn scan(cwd: &Path, now: SystemTime) -> Vec<ForeignSessionSummary> {
-    let Some(config_dir) = config_dir() else {
-        return Vec::new();
-    };
-    scan_in(&config_dir, cwd, now)
+    let mut sessions = config_dir()
+        .map(|dir| scan_in(&dir, cwd, now))
+        .unwrap_or_default();
+    let seen: HashSet<String> = sessions
+        .iter()
+        .map(|session| session.native_id.clone())
+        .collect();
+    if let Some(user_dir) = ide_user_dir() {
+        for session in scan_ide_in(&user_dir, cwd, now) {
+            if seen.contains(&session.native_id) {
+                continue;
+            }
+            sessions.push(session);
+        }
+    }
+    sessions
 }
 
 pub(super) fn most_recent(
@@ -472,6 +488,385 @@ fn hash_candidates(cwd: &Path) -> Vec<String> {
         .collect()
 }
 
+pub(super) fn plan_import(
+    cwd: &Path,
+    session_id: &str,
+    cursor_backend: bool,
+) -> super::ForeignImportPlan {
+    if uuid::Uuid::try_parse(session_id).is_err() {
+        return super::ForeignImportPlan::Toast("cursor session id must be a uuid".into());
+    }
+    let cli = read_transcript(cwd, session_id);
+    if cursor_backend {
+        if cli.is_empty() {
+            let ide = read_ide_transcript(cwd, session_id);
+            if !ide.is_empty() || ide_lists_session(cwd, session_id) {
+                let detail = if ide.is_empty() {
+                    "There is no transcript text to import."
+                } else {
+                    "Switch to the grok backend to import the transcript into a grok session."
+                };
+                return super::ForeignImportPlan::Toast(format!(
+                    "This is a Cursor IDE sidepane chat. cursor-agent cannot resume it. {detail} Open it in the Cursor IDE."
+                ));
+            }
+        }
+        return super::ForeignImportPlan::NativeCursorLoad;
+    }
+    if !cli.is_empty() {
+        return super::ForeignImportPlan::Import(cli);
+    }
+    let ide = read_ide_transcript(cwd, session_id);
+    if !ide.is_empty() {
+        return super::ForeignImportPlan::Import(ide);
+    }
+    if ide_lists_session(cwd, session_id) {
+        return super::ForeignImportPlan::Toast(
+            "This Cursor IDE sidepane chat is listed so you can find it. cursor-agent cannot resume it, and there is no transcript text to import. Open it in the Cursor IDE.".into(),
+        );
+    }
+    super::ForeignImportPlan::Toast("cursor session has no transcript to resume".into())
+}
+
+fn ide_user_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("CURSOR_USER_DATA_DIR") {
+        let path = PathBuf::from(dir);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    let user = dirs::config_dir()?.join("Cursor").join("User");
+    user.is_dir().then_some(user)
+}
+
+fn scan_ide_in(user_dir: &Path, cwd: &Path, now: SystemTime) -> Vec<ForeignSessionSummary> {
+    let Some(root) = ApprovedRoot::new(user_dir) else {
+        return Vec::new();
+    };
+    let mut sessions = Vec::new();
+    let mut seen = HashSet::new();
+    let global = root.join("globalStorage").join("state.vscdb");
+    push_db_sessions(&root, &global, cwd, now, None, &mut sessions, &mut seen);
+    let storage = root.join("workspaceStorage");
+    let Some(storage_root) = root.subroot(&storage) else {
+        return sessions;
+    };
+    let mut names = Vec::new();
+    storage_root.for_each_entry_bounded(MAX_HASH_DIRS, |name| {
+        names.push(name.to_string_lossy().into_owned());
+    });
+    for name in names {
+        let dir = storage.join(&name);
+        let Some(folder) = workspace_folder(&root, &dir) else {
+            continue;
+        };
+        if !cwd_matches(&folder.to_string_lossy(), cwd) {
+            continue;
+        }
+        push_db_sessions(
+            &root,
+            &dir.join("state.vscdb"),
+            cwd,
+            now,
+            Some(&folder),
+            &mut sessions,
+            &mut seen,
+        );
+    }
+    sessions
+}
+
+fn push_db_sessions(
+    root: &ApprovedRoot,
+    db_path: &Path,
+    cwd: &Path,
+    now: SystemTime,
+    inherited: Option<&Path>,
+    sessions: &mut Vec<ForeignSessionSummary>,
+    seen: &mut HashSet<String>,
+) {
+    let Some(db) = super::capability::open_sqlite_transaction(root, db_path) else {
+        return;
+    };
+    let Some(bytes) = lookup_value(&db, "composer.composerData") else {
+        return;
+    };
+    let Some(value) = parse_json_bytes(&bytes) else {
+        return;
+    };
+    let Some(composers) = value.get("allComposers").and_then(Value::as_array) else {
+        return;
+    };
+    let db_mtime = root
+        .open_regular_file(db_path)
+        .and_then(|opened| opened.metadata.modified().ok());
+    for composer in composers {
+        if sessions.len() >= MAX_SESSIONS_PER_TOOL {
+            break;
+        }
+        let Some(summary) = composer_summary(composer, cwd, now, inherited, db_mtime) else {
+            continue;
+        };
+        if seen.insert(summary.native_id.clone()) {
+            sessions.push(summary);
+        }
+    }
+}
+
+fn composer_summary(
+    composer: &Value,
+    cwd: &Path,
+    now: SystemTime,
+    inherited: Option<&Path>,
+    db_mtime: Option<SystemTime>,
+) -> Option<ForeignSessionSummary> {
+    let id = composer.get("composerId").and_then(Value::as_str)?;
+    if uuid::Uuid::try_parse(id).is_err() {
+        return None;
+    }
+    if !composer_matches_cwd(composer, cwd, inherited) {
+        return None;
+    }
+    let updated_at = millis_time(composer).or(db_mtime)?;
+    if !is_within(updated_at, now, MAX_SESSION_AGE) {
+        return None;
+    }
+    let title = composer
+        .get("name")
+        .or_else(|| composer.get("title"))
+        .and_then(Value::as_str)
+        .and_then(normalize_title)
+        .unwrap_or_else(|| "Cursor IDE chat".to_owned());
+    Some(ForeignSessionSummary {
+        tool: ForeignSessionTool::Cursor,
+        source: ForeignSessionSource::CursorDesktop,
+        native_id: id.to_owned(),
+        title,
+        cwd: cwd.to_path_buf(),
+        updated_at,
+        branch: None,
+    })
+}
+
+fn composer_matches_cwd(composer: &Value, cwd: &Path, inherited: Option<&Path>) -> bool {
+    if let Some(recorded) = composer_workspace(composer) {
+        return workspace_matches(&recorded, cwd);
+    }
+    inherited.is_some_and(|dir| cwd_matches(&dir.to_string_lossy(), cwd))
+}
+
+fn composer_workspace(composer: &Value) -> Option<String> {
+    composer
+        .pointer("/workspaceIdentifier/uri/fsPath")
+        .or_else(|| composer.pointer("/workspaceIdentifier/uri/path"))
+        .or_else(|| composer.get("workspacePath"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn workspace_matches(recorded: &str, cwd: &Path) -> bool {
+    if let Some(path) = file_uri_to_path(recorded) {
+        return cwd_matches(&path.to_string_lossy(), cwd);
+    }
+    cwd_matches(recorded, cwd)
+}
+
+fn workspace_folder(root: &ApprovedRoot, dir: &Path) -> Option<PathBuf> {
+    let mut opened = root.open_regular_file(&dir.join("workspace.json"))?;
+    let mut buf = String::new();
+    opened.file.read_to_string(&mut buf).ok()?;
+    let value: Value = serde_json::from_str(&buf).ok()?;
+    let folder = value.get("folder").and_then(Value::as_str)?;
+    file_uri_to_path(folder).or_else(|| Some(PathBuf::from(folder)))
+}
+
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let path = percent_decode(rest);
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+fn percent_decode(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.find('%') {
+        let (head, tail) = rest.split_at(pos);
+        bytes.extend(head.as_bytes());
+        let after = tail.get(1..).unwrap_or("");
+        if let Some(hex) = after.get(..2)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            bytes.push(byte);
+            rest = after.get(2..).unwrap_or("");
+        } else {
+            bytes.push(b'%');
+            rest = after;
+        }
+    }
+    bytes.extend(rest.as_bytes());
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn millis_time(value: &Value) -> Option<SystemTime> {
+    let ms = value
+        .get("lastUpdatedAt")
+        .or_else(|| value.get("createdAt"))
+        .and_then(Value::as_i64)?;
+    if ms < 0 {
+        return None;
+    }
+    UNIX_EPOCH.checked_add(Duration::from_millis(ms as u64))
+}
+
+fn read_ide_transcript(cwd: &Path, session_id: &str) -> Vec<CursorTranscriptTurn> {
+    let Some(user_dir) = ide_user_dir() else {
+        return Vec::new();
+    };
+    read_ide_transcript_in(&user_dir, cwd, session_id)
+}
+
+fn read_ide_transcript_in(
+    user_dir: &Path,
+    cwd: &Path,
+    session_id: &str,
+) -> Vec<CursorTranscriptTurn> {
+    if !ide_lists_session_in(user_dir, cwd, session_id)
+        && !db_has_composer_blob(user_dir, session_id)
+    {
+        return Vec::new();
+    }
+    let Some(root) = ApprovedRoot::new(user_dir) else {
+        return Vec::new();
+    };
+    let key = format!("composerData:{session_id}");
+    for path in ide_db_paths(&root, cwd) {
+        let Some(db) = super::capability::open_sqlite_transaction(&root, &path) else {
+            continue;
+        };
+        if let Some(bytes) = lookup_value(&db, &key)
+            && let Some(turns) = turns_from_bytes(&bytes)
+            && !turns.is_empty()
+        {
+            return turns;
+        }
+    }
+    Vec::new()
+}
+
+fn db_has_composer_blob(user_dir: &Path, session_id: &str) -> bool {
+    let Some(root) = ApprovedRoot::new(user_dir) else {
+        return false;
+    };
+    let key = format!("composerData:{session_id}");
+    let global = root.join("globalStorage").join("state.vscdb");
+    super::capability::open_sqlite_transaction(&root, &global)
+        .is_some_and(|db| lookup_value(&db, &key).is_some())
+}
+
+fn ide_lists_session(cwd: &Path, session_id: &str) -> bool {
+    let Some(user_dir) = ide_user_dir() else {
+        return false;
+    };
+    ide_lists_session_in(&user_dir, cwd, session_id)
+}
+
+fn ide_lists_session_in(user_dir: &Path, cwd: &Path, session_id: &str) -> bool {
+    scan_ide_in(user_dir, cwd, SystemTime::now())
+        .iter()
+        .any(|session| session.native_id == session_id)
+}
+
+fn ide_db_paths(root: &ApprovedRoot, cwd: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![root.join("globalStorage").join("state.vscdb")];
+    let storage = root.join("workspaceStorage");
+    let Some(storage_root) = root.subroot(&storage) else {
+        return paths;
+    };
+    let mut names = Vec::new();
+    storage_root.for_each_entry_bounded(MAX_HASH_DIRS, |name| {
+        names.push(name.to_string_lossy().into_owned());
+    });
+    for name in names {
+        let dir = storage.join(&name);
+        if workspace_folder(root, &dir)
+            .is_some_and(|folder| cwd_matches(&folder.to_string_lossy(), cwd))
+        {
+            paths.push(dir.join("state.vscdb"));
+        }
+    }
+    paths
+}
+
+fn lookup_value(db: &super::capability::ReadTransactionSqlite, key: &str) -> Option<Vec<u8>> {
+    for sql in [
+        "SELECT value FROM ItemTable WHERE key = ?1",
+        "SELECT value FROM cursorDiskKV WHERE key = ?1",
+    ] {
+        if let Ok(bytes) = db.query_row(sql, [key], |row| row.get::<_, Vec<u8>>(0)) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+fn parse_json_bytes(bytes: &[u8]) -> Option<Value> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    if let Some(text) = value.as_str() {
+        return serde_json::from_str(text).ok();
+    }
+    Some(value)
+}
+
+fn turns_from_bytes(bytes: &[u8]) -> Option<Vec<CursorTranscriptTurn>> {
+    let value = parse_json_bytes(bytes)?;
+    let array = value
+        .get("conversation")
+        .or_else(|| value.get("bubbles"))
+        .or_else(|| value.get("messages"))
+        .and_then(Value::as_array)?;
+    let mut turns = Vec::new();
+    for item in array {
+        if turns.len() == MAX_TRANSCRIPT_TURNS {
+            break;
+        }
+        if let Some(turn) = bubble_turn(item) {
+            turns.push(turn);
+        }
+    }
+    Some(turns)
+}
+
+fn bubble_turn(value: &Value) -> Option<CursorTranscriptTurn> {
+    let text = value
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("richText").and_then(Value::as_str))?;
+    let text = truncate_chars(text.trim(), MAX_TURN_CHARS);
+    if text.is_empty() {
+        return None;
+    }
+    let user = match value.get("type") {
+        Some(Value::String(kind)) => matches!(kind.as_str(), "user" | "human"),
+        Some(Value::Number(number)) => number.as_i64() == Some(1),
+        _ => value.get("role").and_then(Value::as_str) == Some("user"),
+    };
+    let known = match value.get("type") {
+        Some(Value::String(kind)) => {
+            matches!(kind.as_str(), "user" | "human" | "assistant" | "ai")
+        }
+        Some(Value::Number(number)) => matches!(number.as_i64(), Some(1) | Some(2)),
+        _ => value.get("role").and_then(Value::as_str).is_some(),
+    };
+    if !known {
+        return None;
+    }
+    Some(CursorTranscriptTurn { user, text })
+}
+
 fn slug_candidates(cwd: &Path) -> Vec<String> {
     let canonical = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let slash = slash_slug(&canonical);
@@ -657,6 +1052,85 @@ mod tests {
         .unwrap();
         set_mtime(&path, now() - MAX_SESSION_AGE - Duration::from_secs(60));
         assert!(scan_in(&cursor, &cwd, now()).is_empty());
+    }
+
+    #[test]
+    fn ide_sidepane_chats_for_this_workspace_are_listed_and_importable() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = dunce::canonicalize(tmp.path()).unwrap();
+        let user = tmp.path().join("CursorUser");
+        let id = uuid::Uuid::from_u128(42);
+        let other = uuid::Uuid::from_u128(43);
+        let composers = json!({
+            "allComposers": [{
+                "composerId": id,
+                "name": "Sidepane chat",
+                "lastUpdatedAt": 1_800_000_000_000i64,
+                "workspaceIdentifier": {
+                    "uri": { "fsPath": cwd, "scheme": "file" }
+                }
+            }, {
+                "composerId": other,
+                "name": "Other workspace",
+                "lastUpdatedAt": 1_800_000_000_000i64,
+                "workspaceIdentifier": { "uri": { "fsPath": "/somewhere/else" } }
+            }]
+        });
+        let transcript = json!({
+            "conversation": [
+                {"type": 1, "text": "hello from the ide"},
+                {"type": 2, "text": "hi"}
+            ]
+        });
+        write_vscdb(
+            &user.join("globalStorage").join("state.vscdb"),
+            &composers,
+            &format!("composerData:{id}"),
+            &transcript,
+        );
+        let found = scan_ide_in(&user, &cwd, now());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].native_id, id.to_string());
+        assert_eq!(found[0].source, ForeignSessionSource::CursorDesktop);
+        assert_eq!(found[0].title, "Sidepane chat");
+        let turns = read_ide_transcript_in(&user, &cwd, &id.to_string());
+        assert_eq!(turns.len(), 2);
+        assert!(turns[0].user);
+        assert_eq!(turns[0].text, "hello from the ide");
+
+        let _guard = EnvGuard::set("CURSOR_USER_DATA_DIR", &user);
+        match plan_import(&cwd, &id.to_string(), false) {
+            crate::ForeignImportPlan::Import(turns) => assert_eq!(turns.len(), 2),
+            other => panic!("expected import, got {other:?}"),
+        }
+        match plan_import(&cwd, &id.to_string(), true) {
+            crate::ForeignImportPlan::Toast(message) => {
+                assert!(message.contains("cursor-agent cannot resume"));
+            }
+            other => panic!("expected toast, got {other:?}"),
+        }
+    }
+
+    fn write_vscdb(
+        path: &Path,
+        composers: &serde_json::Value,
+        key: &str,
+        transcript: &serde_json::Value,
+    ) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE ItemTable (key TEXT UNIQUE, value BLOB)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES ('composer.composerData', ?1)",
+            [serde_json::to_vec(composers).unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, serde_json::to_vec(transcript).unwrap()],
+        )
+        .unwrap();
     }
 
     struct EnvGuard {

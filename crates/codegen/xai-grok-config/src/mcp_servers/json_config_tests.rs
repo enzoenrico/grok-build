@@ -236,3 +236,73 @@ fn cursor_parent_mcp_json_is_visible_and_nearest_wins() {
     assert_eq!(by_name["lint"].plugin_name.as_deref(), Some("linter"));
     assert_eq!(by_name.len(), 6);
 }
+
+#[test]
+fn cursor_disabled_flag_is_written_into_mcp_json() {
+    let root = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let mcp = root.path().join(".cursor").join("mcp.json");
+    std::fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+    std::fs::write(
+        &mcp,
+        r#"{"mcpServers":{"lint":{"command":"npx","args":["lint"],"env":{"A":"b"}}}}"#,
+    )
+    .unwrap();
+    // Keep the user file out of this assertion: point config dir at an empty directory.
+    let _ = config_dir;
+    let changed = set_cursor_mcp_server_disabled(root.path(), "lint", true).unwrap();
+    assert_eq!(changed.as_deref(), Some(mcp.as_path()));
+    let listed = list_cursor_mcp_in(root.path(), Some(config_dir.path()));
+    let lint = listed.iter().find(|row| row.name == "lint").unwrap();
+    assert!(!lint.enabled);
+    let raw = std::fs::read_to_string(&mcp).unwrap();
+    assert!(raw.contains("\"disabled\": true"));
+    assert!(raw.contains("\"A\": \"b\"") || raw.contains("\"A\":\"b\""));
+    assert!(
+        set_cursor_mcp_server_disabled(root.path(), "lint", false)
+            .unwrap()
+            .is_some()
+    );
+    let listed = list_cursor_mcp_in(root.path(), Some(config_dir.path()));
+    assert!(
+        listed
+            .iter()
+            .find(|row| row.name == "lint")
+            .unwrap()
+            .enabled
+    );
+}
+
+#[test]
+fn connection_status_checks_stdio_on_path_and_tcp() {
+    let missing = CursorMcpListing {
+        name: "missing".into(),
+        transport: "stdio",
+        scope: "user",
+        location: std::path::PathBuf::from("mcp.json"),
+        detail: "grok-mcp-probe-missing-bin".into(),
+        enabled: true,
+        plugin_name: None,
+    };
+    assert_eq!(cursor_mcp_connection_status(&missing), "unavailable");
+    let shell = CursorMcpListing {
+        detail: "sh -c true".into(),
+        ..missing.clone()
+    };
+    assert_eq!(cursor_mcp_connection_status(&shell), "ready");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let up = CursorMcpListing {
+        transport: "http",
+        detail: format!("http://127.0.0.1:{port}/mcp"),
+        ..missing.clone()
+    };
+    assert_eq!(cursor_mcp_connection_status(&up), "ready");
+    drop(listener);
+    let down = CursorMcpListing {
+        transport: "http",
+        detail: "http://127.0.0.1:1/mcp".into(),
+        ..missing
+    };
+    assert_eq!(cursor_mcp_connection_status(&down), "unavailable");
+}

@@ -32,11 +32,13 @@ pub use config_toml::{
     parse_mcp_servers_from_toml,
 };
 pub use json_config::{
-    CursorMcpListing, list_cursor_mcp_for_display, load_claude_json_mcp_servers_as_configs,
+    CursorMcpListing, cursor_mcp_connection_status, cursor_mcp_connection_statuses,
+    list_cursor_mcp_for_display, load_claude_json_mcp_servers_as_configs,
     load_claude_json_mcp_servers_as_configs_unfiltered, load_cursor_mcp_servers_as_configs,
     load_mcp_json_file, load_mcp_json_servers, load_mcp_json_servers_as_configs,
     load_mcp_json_servers_as_configs_unfiltered, mcp_config_from_json_value,
-    parse_mcp_config_with_oauth, read_mcp_json,
+    parse_mcp_config_with_oauth, read_mcp_json, set_cursor_mcp_disabled_at,
+    set_cursor_mcp_server_disabled,
 };
 pub use preferences::{
     McpPreferencesLoad, load_mcp_preferences, load_mcp_preferences_from, mcp_preferences_path,

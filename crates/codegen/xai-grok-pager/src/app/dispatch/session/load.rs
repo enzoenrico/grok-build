@@ -298,23 +298,52 @@ fn dispatch_load_session_ungated(
     });
     effects
 }
-/// Resume a Cursor chat the way a native session resumes: `session/load` on the Cursor backend,
-/// or a one-time transcript import on the Grok backend.
+/// Resume a Cursor chat the way a native session resumes: `session/load` on the Cursor backend
+/// when the id is a CLI transcript, or a one-time transcript import on the Grok backend.
+/// IDE sidepane ids are resolved inside the effect, because `cursor-agent` cannot resume them.
 pub(in crate::app::dispatch) fn cursor_resume_now(
     app: &mut AppView,
     session_id: String,
     cwd: String,
     title: String,
 ) -> Vec<Effect> {
-    if app.backend.is_cursor() {
-        let session_cwd = (!cwd.is_empty()).then(|| std::path::PathBuf::from(cwd));
-        return dispatch_load_session(app, session_id, session_cwd, false);
-    }
+    materialize_foreign_now(
+        app,
+        xai_grok_foreign_sessions::ForeignSessionTool::Cursor,
+        session_id,
+        cwd,
+        title,
+    )
+}
+
+pub(in crate::app::dispatch) fn materialize_foreign_now(
+    app: &mut AppView,
+    tool: xai_grok_foreign_sessions::ForeignSessionTool,
+    session_id: String,
+    cwd: String,
+    title: String,
+) -> Vec<Effect> {
     vec![Effect::MaterializeCursorSession {
         session_id,
         cwd,
         title,
+        tool,
+        cursor_backend: app.backend.is_cursor(),
     }]
+}
+
+fn foreign_id_is_importable(
+    app: &AppView,
+    tool: xai_grok_foreign_sessions::ForeignSessionTool,
+    session_id: &str,
+) -> bool {
+    match tool {
+        xai_grok_foreign_sessions::ForeignSessionTool::Cursor => true,
+        xai_grok_foreign_sessions::ForeignSessionTool::Claude
+        | xai_grok_foreign_sessions::ForeignSessionTool::Codex => {
+            !app.backend.is_cursor() && uuid::Uuid::try_parse(session_id).is_ok()
+        }
+    }
 }
 
 fn cursor_resume_effects(
@@ -416,8 +445,21 @@ pub(in crate::app::dispatch) fn dispatch_pick_session(
     if let Some(foreign_source) =
         crate::app::foreign_sessions::ForeignPickerSource::from_picker_source(&source)
     {
-        if foreign_source == crate::app::foreign_sessions::ForeignPickerSource::Cursor {
-            return cursor_resume_effects(app, session_id, cwd, title);
+        if foreign_id_is_importable(app, foreign_source.tool(), &session_id) {
+            if foreign_source == crate::app::foreign_sessions::ForeignPickerSource::Cursor {
+                return cursor_resume_effects(app, session_id, cwd, title);
+            }
+            clear_startup_actions(app);
+            if !app.session_startup_allowed() {
+                app.deferred_startup.session = Some(
+                    crate::app::session_startup::DeferredSessionStartup::ForeignResume {
+                        tool: foreign_source.tool(),
+                        native_id: session_id,
+                    },
+                );
+                return vec![];
+            }
+            return materialize_foreign_now(app, foreign_source.tool(), session_id, cwd, title);
         }
         let prompt = foreign_source.resume_prompt(&session_id);
         clear_startup_actions(app);
