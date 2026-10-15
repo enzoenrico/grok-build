@@ -85,17 +85,10 @@ fn watch_cloud_run(
     std::thread::spawn(move || {
         let base = std::env::var("CURSOR_CLOUD_API")
             .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
-        let mut saw_assistant = false;
         let result = (|| {
             let auth = cloud::resolve_cloud_auth()?;
-            cloud::follow_run(&base, &auth, &agent_id, &run_id, |event| {
-                let text = cloud::event_text(&event, saw_assistant);
-                if matches!(event, cloud::CloudEvent::Assistant(_)) {
-                    saw_assistant = true;
-                }
-                if let Some(text) = text {
-                    let _ = tx.send(cloud_text_notice(&session_id, &text));
-                }
+            cloud::follow_run_or_recover(&base, &auth, &agent_id, &run_id, |text| {
+                let _ = tx.send(cloud_text_notice(&session_id, &text));
             })
         })();
         if let Err(err) = result {

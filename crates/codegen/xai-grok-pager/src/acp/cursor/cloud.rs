@@ -589,6 +589,62 @@ pub(crate) fn dispatch(
     Ok(agent)
 }
 
+pub(crate) fn recovered_run_text(agent: &CloudAgent) -> Option<String> {
+    let terminal = run_is_terminal(agent.run_status.as_deref());
+    let reply = agent.result.as_deref().filter(|text| !text.is_empty());
+    if !terminal && reply.is_none() {
+        return None;
+    }
+    let mut msg = format!("Run {}.\n", agent.run_status.as_deref().unwrap_or(""));
+    if let Some(text) = reply {
+        msg.push_str(text);
+        if !text.ends_with('\n') {
+            msg.push('\n');
+        }
+    }
+    if let Some(url) = &agent.pr_url {
+        msg.push_str(url);
+        msg.push('\n');
+    }
+    if let Some(branch) = &agent.branch {
+        msg.push_str(branch);
+        msg.push('\n');
+    }
+    Some(msg)
+}
+
+pub(crate) fn follow_run_or_recover(
+    api_base: &str,
+    auth: &CloudAuth,
+    agent_id: &str,
+    run_id: &str,
+    mut on_text: impl FnMut(String),
+) -> Result<(), String> {
+    let mut saw_assistant = false;
+    let followed = follow_run(api_base, auth, agent_id, run_id, |event| {
+        let text = event_text(&event, saw_assistant);
+        if matches!(event, CloudEvent::Assistant(_)) {
+            saw_assistant = true;
+        }
+        if let Some(text) = text {
+            on_text(text);
+        }
+    });
+    match followed {
+        Ok(()) => Ok(()),
+        Err(err) => match refresh_existing(api_base, auth, agent_id) {
+            Ok(agent) => match recovered_run_text(&agent) {
+                Some(text) => {
+                    on_text(text);
+                    Ok(())
+                }
+                None => Err(err),
+            },
+            Err(_) => Err(err),
+        },
+    }
+}
+
 pub(crate) fn follow_run(
     api_base: &str,
     auth: &CloudAuth,
@@ -1056,6 +1112,49 @@ data: {}
         assert_eq!(
             event_text(&result, true).as_deref(),
             Some("Run FINISHED.\ngithub.com/your-org/your-repo cursor/add-readme-a1b2\n")
+        );
+    }
+
+    #[test]
+    fn a_failed_stream_still_reads_the_finished_run() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let replies = [
+                ("500 Internal Server Error", r#"{"error":"stream_expired"}"#),
+                (
+                    "200 OK",
+                    r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","latestRunId":"run-1"}"#,
+                ),
+                (
+                    "200 OK",
+                    r#"{"id":"run-1","status":"FINISHED","result":"Added the tests.","git":{"branches":[{"repoUrl":"github.com/acme/app","branch":"cursor/tests"}]}}"#,
+                ),
+            ];
+            for (status, body) in replies {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let _ = sock.read(&mut buf).unwrap();
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let base = format!("http://{addr}");
+        let mut texts = Vec::new();
+        follow_run_or_recover(
+            &base,
+            &CloudAuth::Basic("test-key".to_owned()),
+            "bc-1",
+            "run-1",
+            |text| texts.push(text),
+        )
+        .unwrap();
+        assert_eq!(
+            texts,
+            vec!["Run FINISHED.\nAdded the tests.\ngithub.com/acme/app cursor/tests\n".to_owned()]
         );
     }
 
