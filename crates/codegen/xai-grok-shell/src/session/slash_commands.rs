@@ -1621,15 +1621,13 @@ fn finish_skill_or_workflow(
 ) -> Result<Vec<acp::ContentBlock>, SlashCommandOutcome> {
     let full_text = prompt_blocks
         .iter()
-        .find_map(|b| {
-            if let acp::ContentBlock::Text(t) = b {
-                Some(t.text.as_str())
-            } else {
-                None
-            }
+        .filter_map(|block| match block {
+            acp::ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
         })
-        .unwrap_or("");
-    if let Some(parsed_skills) = parse_skill_references_with_catalog(full_text, catalog) {
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(parsed_skills) = parse_skill_references_with_catalog(&full_text, catalog) {
         return Err(SlashCommandOutcome::InvokeSkill {
             blocks: prompt_blocks,
             skills: parsed_skills,

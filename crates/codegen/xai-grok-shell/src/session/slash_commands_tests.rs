@@ -1658,6 +1658,28 @@ fn resolve_invokes_a_skill_that_is_not_at_the_start() {
 }
 
 #[test]
+fn resolve_invokes_a_skill_in_a_later_text_block() {
+    let skills = vec![make_skill("poteto-mode", true)];
+    let outcome = resolve(
+        vec![
+            text_block("look at the diff"),
+            text_block("then /poteto-mode please"),
+        ],
+        &skills,
+        all_gated(),
+        SkillSlashRewrite::default(),
+        &[],
+    )
+    .unwrap_err();
+    let SlashCommandOutcome::InvokeSkill { skills, .. } = outcome else {
+        panic!("expected InvokeSkill");
+    };
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].name, "poteto-mode");
+    assert_eq!(skills[0].args, "please");
+}
+
+#[test]
 fn resolve_leaves_a_mid_message_builtin_alone() {
     let skills = vec![make_skill("commit", true)];
     let blocks = vec![text_block("do not /compact this /commit")];
