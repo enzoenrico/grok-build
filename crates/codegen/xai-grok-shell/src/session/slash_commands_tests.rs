@@ -1680,6 +1680,27 @@ fn resolve_invokes_a_skill_in_a_later_text_block() {
 }
 
 #[test]
+fn resolve_keeps_skill_args_inside_their_text_block() {
+    let skills = vec![make_skill("poteto-mode", true)];
+    let outcome = resolve(
+        vec![
+            text_block("please /poteto-mode review"),
+            text_block("unrelated notes"),
+        ],
+        &skills,
+        all_gated(),
+        SkillSlashRewrite::default(),
+        &[],
+    )
+    .unwrap_err();
+    let SlashCommandOutcome::InvokeSkill { skills, .. } = outcome else {
+        panic!("expected InvokeSkill");
+    };
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].args, "review");
+}
+
+#[test]
 fn resolve_leaves_a_mid_message_builtin_alone() {
     let skills = vec![make_skill("commit", true)];
     let blocks = vec![text_block("do not /compact this /commit")];

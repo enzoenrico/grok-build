@@ -1619,15 +1619,16 @@ fn finish_skill_or_workflow(
     catalog: &EffectiveCommandCatalog<'_>,
     prefix: Option<(&str, &str)>,
 ) -> Result<Vec<acp::ContentBlock>, SlashCommandOutcome> {
-    let full_text = prompt_blocks
-        .iter()
-        .filter_map(|block| match block {
-            acp::ContentBlock::Text(text) => Some(text.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if let Some(parsed_skills) = parse_skill_references_with_catalog(&full_text, catalog) {
+    let mut parsed_skills = Vec::new();
+    for block in &prompt_blocks {
+        let acp::ContentBlock::Text(text) = block else {
+            continue;
+        };
+        if let Some(refs) = parse_skill_references_with_catalog(&text.text, catalog) {
+            parsed_skills.extend(refs);
+        }
+    }
+    if !parsed_skills.is_empty() {
         return Err(SlashCommandOutcome::InvokeSkill {
             blocks: prompt_blocks,
             skills: parsed_skills,
