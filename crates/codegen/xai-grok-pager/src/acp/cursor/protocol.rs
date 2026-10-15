@@ -327,18 +327,36 @@ fn subagent_finish_status(state: &str) -> &'static str {
 }
 
 pub(crate) fn hoist_skill_prompt(params: &mut Map<String, Value>, skills: &HashSet<String>) {
-    let Some(prompt) = params.get_mut("prompt").and_then(Value::as_array_mut) else {
+    let Some(prompt) = params.get("prompt").and_then(Value::as_array) else {
         return;
     };
-    for block in prompt {
+    let mut indexes = Vec::new();
+    let mut parts = Vec::new();
+    for (index, block) in prompt.iter().enumerate() {
         if block.get("type").and_then(Value::as_str) != Some("text") {
             continue;
         }
         let Some(text) = block.get("text").and_then(Value::as_str) else {
             continue;
         };
-        if let Some(hoisted) = hoist_skill_text(text, skills) {
-            block["text"] = Value::String(hoisted);
+        indexes.push(index);
+        parts.push(text.to_owned());
+    }
+    if indexes.is_empty() {
+        return;
+    }
+    // Cursor joins text blocks with newlines, then runs a slash command only when that string starts with `/`.
+    let Some(hoisted) = hoist_skill_text(&parts.join("\n"), skills) else {
+        return;
+    };
+    let Some(prompt) = params.get_mut("prompt").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let first = indexes[0];
+    prompt[first]["text"] = Value::String(hoisted);
+    for index in indexes.into_iter().skip(1) {
+        if let Some(block) = prompt.get_mut(index) {
+            block["text"] = Value::String(String::new());
         }
     }
 }
@@ -888,8 +906,21 @@ mod tests {
             ]
         });
         hoist_skill_prompt(params.as_object_mut().unwrap(), &skills);
-        assert_eq!(params["prompt"][0]["text"], "look at the diff");
-        assert_eq!(params["prompt"][2]["text"], "/poteto-mode then please");
+        assert_eq!(
+            params["prompt"][0]["text"],
+            "/poteto-mode look at the diff\nthen please"
+        );
+        assert_eq!(params["prompt"][1]["data"], "abc");
+        assert_eq!(params["prompt"][2]["text"], "");
+        let joined = params["prompt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .map(|block| block["text"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.trim().starts_with("/poteto-mode"));
     }
 
     #[test]

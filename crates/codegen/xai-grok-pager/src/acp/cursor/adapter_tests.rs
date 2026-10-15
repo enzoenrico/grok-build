@@ -478,8 +478,11 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
         r#"{"jsonrpc":"2.0","id":8,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"please /poteto-mode the tests"},{"type":"text","text":"and /review later"}]}}"#,
     );
     let sent = parse(&first[0]);
-    assert_eq!(sent["params"]["prompt"][0]["text"], "/poteto-mode please the tests");
-    assert_eq!(sent["params"]["prompt"][1]["text"], "and /review later");
+    assert_eq!(
+        sent["params"]["prompt"][0]["text"],
+        "/poteto-mode please the tests\nand /review later"
+    );
+    assert_eq!(sent["params"]["prompt"][1]["text"], "");
     assert!(sent["params"].get("_meta").is_none());
 
     let second = adapter.outbound(
