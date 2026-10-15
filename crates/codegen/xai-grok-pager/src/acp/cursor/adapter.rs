@@ -21,6 +21,12 @@ pub(crate) enum Routed {
     ToAgent(String),
     /// Hand back to the pager's ACP client.
     ToClient(String),
+    /// Create or follow up a Cursor cloud agent. ACP does not do this.
+    Cloud {
+        session_id: String,
+        task: String,
+        agent_id: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -168,15 +174,42 @@ impl CursorAdapter {
                     .and_then(|id| self.sessions.get(id))
                     .and_then(|session| session.cloud_agent_id.clone());
                 let mut cloud_handoff = false;
+                let mut cloud_task = None;
                 if let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) {
-                    protocol::hoist_skill_prompt(params, &skills);
                     cloud_handoff = protocol::prompt_is_cloud_handoff(params);
-                    let follow = if cloud_handoff {
-                        None
+                    if cloud_handoff {
+                        cloud_task = params
+                            .get("prompt")
+                            .and_then(Value::as_array)
+                            .and_then(|blocks| {
+                                blocks.iter().find_map(|block| {
+                                    block.get("text").and_then(Value::as_str).map(str::to_owned)
+                                })
+                            })
+                            .as_deref()
+                            .and_then(super::cloud::handoff_text);
                     } else {
-                        cloud_agent_id.as_deref()
+                        protocol::hoist_skill_prompt(params, &skills);
+                    }
+                }
+                if cloud_handoff {
+                    let Some(session_id) = session_id.clone() else {
+                        return vec![Routed::ToClient(msg.to_string())];
                     };
-                    protocol::stamp_cloud_handoff(params, follow);
+                    let Some(task) = cloud_task else {
+                        return vec![Routed::ToClient(
+                            protocol::cloud_status_update(
+                                &session_id,
+                                "needs a task after &",
+                            )
+                            .to_string(),
+                        )];
+                    };
+                    return vec![Routed::Cloud {
+                        session_id,
+                        task,
+                        agent_id: cloud_agent_id,
+                    }];
                 }
                 let prompt_id = msg
                     .pointer("/params/_meta/promptId")
@@ -377,6 +410,13 @@ impl CursorAdapter {
             return self.sessions.keys().next().cloned();
         }
         None
+    }
+
+    pub(crate) fn note_cloud_agent(&mut self, session_id: &str, agent_id: &str) {
+        self.sessions
+            .entry(session_id.to_owned())
+            .or_default()
+            .cloud_agent_id = Some(agent_id.to_owned());
     }
 
     fn remember_skills(&mut self, session_id: &str, commands: Option<&Value>) {

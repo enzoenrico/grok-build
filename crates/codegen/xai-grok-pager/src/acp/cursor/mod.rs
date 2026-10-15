@@ -4,10 +4,51 @@
 //! `--backend cursor`, `GROK_BACKEND=cursor`, or `[cli] backend = "cursor"` in `config.toml`.
 
 mod adapter;
+mod cloud;
 mod protocol;
 mod startup;
 
 pub use startup::materialize_startup;
+
+fn cloud_handoff_notice(
+    session_id: &str,
+    task: &str,
+    agent_id: Option<&str>,
+) -> (String, Option<String>) {
+    let key = std::env::var("CURSOR_API_KEY").unwrap_or_default();
+    let base = std::env::var("CURSOR_CLOUD_API")
+        .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
+    let outcome = if key.is_empty() {
+        Err("Set CURSOR_API_KEY to send this to a Cursor cloud agent.".to_owned())
+    } else {
+        cloud::dispatch(&base, &key, agent_id, task)
+    };
+    let (text, recorded) = match outcome {
+        Ok(agent) => {
+            let url = agent.url.clone().unwrap_or_default();
+            (
+                format!("Cloud agent {} {url}\n", agent.id),
+                Some(agent.id),
+            )
+        }
+        Err(err) => (format!("Cloud agent handoff failed. {err}\n"), None),
+    };
+    (
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": text }
+                }
+            }
+        })
+        .to_string(),
+        recorded,
+    )
+}
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -225,6 +266,7 @@ impl CursorIo {
         let deliver = {
             let to_client_tx = to_client_tx.clone();
             let stdin_tx = stdin_tx.clone();
+            let adapter = adapter.clone();
             move |routed: Vec<Routed>| {
                 for r in routed {
                     match r {
@@ -233,6 +275,21 @@ impl CursorIo {
                         }
                         Routed::ToClient(line) => {
                             let _ = to_client_tx.send(line);
+                        }
+                        Routed::Cloud {
+                            session_id,
+                            task,
+                            agent_id,
+                        } => {
+                            let (notice, recorded) =
+                                cloud_handoff_notice(&session_id, &task, agent_id.as_deref());
+                            if let Some(id) = recorded {
+                                adapter
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .note_cloud_agent(&session_id, &id);
+                            }
+                            let _ = to_client_tx.send(notice);
                         }
                     }
                 }

@@ -3,6 +3,7 @@ use super::*;
 fn parse(routed: &Routed) -> Value {
     match routed {
         Routed::ToAgent(s) | Routed::ToClient(s) => serde_json::from_str(s).unwrap(),
+        Routed::Cloud { .. } => panic!("expected a JSON line, got a cloud handoff"),
     }
 }
 
@@ -262,36 +263,44 @@ fn cursor_skills_hoist_from_the_middle_of_a_prompt() {
 }
 
 #[test]
-fn cloud_handoff_is_forwarded_and_a_follow_up_keeps_the_agent_id() {
+fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
     let mut adapter = CursorAdapter::new(None, false);
     let sent = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& refactor the auth module"}]}}"#,
     );
-    assert_eq!(
-        parse(&sent[0])["params"]["prompt"][0]["text"],
-        "& refactor the auth module"
-    );
-    assert_eq!(parse(&sent[0])["params"]["_meta"]["cloudHandoff"], true);
+    let Routed::Cloud {
+        session_id,
+        task,
+        agent_id,
+    } = &sent[0]
+    else {
+        panic!("expected a cloud handoff: {sent:?}");
+    };
+    assert_eq!(session_id, "s1");
+    assert_eq!(task, "refactor the auth module");
+    assert_eq!(agent_id, &None);
 
-    let done = adapter.inbound(
-        r#"{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","cloudAgentId":"bc-123"}}"#,
+    adapter.note_cloud_agent("s1", "bc-123");
+    let local = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"keep going locally"}]}}"#,
     );
     assert_eq!(
-        parse(&done[0])["params"]["update"]["content"]["text"],
-        "Cloud agent bc-123 is running. Send another message to follow up.\n"
+        parse(&local[0])["params"]["prompt"][0]["text"],
+        "keep going locally"
     );
+    assert!(parse(&local[0])["params"].get("_meta").is_none());
 
     let follow = adapter.outbound(
-        r#"{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"also add tests"}]}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& add tests"}]}}"#,
     );
-    assert_eq!(
-        parse(&follow[0])["params"]["_meta"]["cloudAgentId"],
-        "bc-123"
-    );
-    assert_eq!(
-        parse(&follow[0])["params"]["prompt"][0]["text"],
-        "also add tests"
-    );
+    let Routed::Cloud {
+        task, agent_id, ..
+    } = &follow[0]
+    else {
+        panic!("expected a cloud follow-up: {follow:?}");
+    };
+    assert_eq!(task, "add tests");
+    assert_eq!(agent_id.as_deref(), Some("bc-123"));
 }
 
 #[test]
@@ -310,12 +319,15 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
             }
         });
         adapter.inbound(&created.to_string());
-        adapter.outbound(&format!(
+        let handoff = adapter.outbound(&format!(
             r#"{{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{{"sessionId":"{id}","prompt":[{{"type":"text","text":"& ship it"}}]}}}}"#
         ));
-        adapter.inbound(&format!(
-            r#"{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn","cloudAgentId":"{cloud}"}}}}"#
-        ));
+        let Routed::Cloud { task, agent_id, .. } = &handoff[0] else {
+            panic!("expected a cloud handoff: {handoff:?}");
+        };
+        assert_eq!(task, "ship it");
+        assert_eq!(agent_id, &None);
+        adapter.note_cloud_agent(id, cloud);
     }
 
     let first = adapter.outbound(
@@ -324,14 +336,21 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
     let sent = parse(&first[0]);
     assert_eq!(sent["params"]["prompt"][0]["text"], "/poteto-mode please the tests");
     assert_eq!(sent["params"]["prompt"][1]["text"], "and /review later");
-    assert_eq!(sent["params"]["_meta"]["cloudAgentId"], "bc-one");
+    assert!(sent["params"].get("_meta").is_none());
 
     let second = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"s2","prompt":[{"type":"text","text":"please /review the diff"}]}}"#,
     );
     let sent = parse(&second[0]);
     assert_eq!(sent["params"]["prompt"][0]["text"], "/review please the diff");
-    assert_eq!(sent["params"]["_meta"]["cloudAgentId"], "bc-two");
+    assert!(sent["params"].get("_meta").is_none());
+    let again = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{"sessionId":"s2","prompt":[{"type":"text","text":"& keep going"}]}}"#,
+    );
+    let Routed::Cloud { agent_id, .. } = &again[0] else {
+        panic!("expected s2 follow-up: {again:?}");
+    };
+    assert_eq!(agent_id.as_deref(), Some("bc-two"));
 
     let asked = adapter.inbound(
         r#"{"jsonrpc":"2.0","id":11,"method":"cursor/ask_question","params":{"sessionId":"s2","toolCallId":"q","questions":[{"id":"q1","prompt":"Ship?","options":[{"id":"yes","label":"Yes"}]}]}}"#,
