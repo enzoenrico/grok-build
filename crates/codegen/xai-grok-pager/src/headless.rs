@@ -3,7 +3,7 @@
 //! Runs the agent in-process and drives the ACP lifecycle (init, auth, session, prompt).
 //! Streams to stdout and exits via `CancellationToken`.
 use crate::acp::model_state::{EffortTokenError, ModelState};
-use crate::acp::spawn::{AgentShutdownGuard, SpawnedAgent, spawn_grok_shell};
+use crate::acp::spawn::AgentShutdownGuard;
 use crate::app::prompt_ack::{PromptAckDeadlines, PromptAckWatch};
 use crate::app::subagent::{
     SubagentLifecycleEffect, SubagentLifecycleReduction, SubagentLifecycleState,
@@ -92,6 +92,8 @@ pub struct HeadlessOptions {
     pub memory_flush: bool,
     /// CLI `--experimental-memory` / `--no-memory` override for the headless agent.
     pub memory_enabled_override: Option<bool>,
+    /// `--backend`; resolved against `GROK_BACKEND` and config once per turn.
+    pub backend: Option<crate::acp::backend::BackendKind>,
 }
 struct HeadlessEmitter {
     format: OutputFormat,
@@ -422,16 +424,6 @@ fn auth_required_message(interactive: bool) -> String {
          or run `grok login` on a machine with a browser."
             .to_string()
     }
-}
-/// The same backend switch the TUI applies; the shell unless another backend is enabled.
-async fn spawn_agent(
-    agent_config: AgentConfig,
-    cancel: &CancellationToken,
-    memory_config: Option<xai_grok_shell::config::MemoryConfig>,
-    options: &HeadlessOptions,
-) -> Result<SpawnedAgent> {
-    let _ = options;
-    spawn_grok_shell(agent_config, cancel, memory_config).await
 }
 /// Authenticate via the agent's `defaultAuthMethodId`, failing closed when none is available.
 /// Returns whether the selected method is API-key auth.
@@ -823,6 +815,10 @@ pub async fn run_single_turn(
     let t_spawn = Instant::now();
     let raw_config = xai_grok_shell::config::load_effective_config()
         .map_err(|e| anyhow::anyhow!("Failed to load config: {e}"))?;
+    let backend = crate::acp::backend::AgentBackend::resolve(options.backend, &raw_config);
+    if options.memory_flush && backend.kind().is_cursor() {
+        anyhow::bail!("--memory-flush is not supported by the Cursor backend");
+    }
     let mut agent_config = AgentConfig::new_from_toml_cfg(&raw_config)
         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
     if let Some(ref token) = options.reasoning_effort
@@ -877,8 +873,45 @@ pub async fn run_single_turn(
         report_cli_trust_grant(&grant_folder_trust(&cwd));
     }
     let cancel = CancellationToken::new();
-    let memory_config = agent_config.memory_config.clone();
     let mut pending_startup = Some(PendingStartup::new());
+    use crate::app::session_startup::{self, MaterializedStartup, SessionStartupFlags};
+    let has_resume_id = options.resume.as_deref().filter(|s| !s.is_empty());
+    let resume_most_recent = options.resume.as_deref() == Some("");
+    let worktree =
+        WorktreeSpec::from_cli(options.worktree.as_deref(), options.worktree_ref.as_deref());
+    let intent = session_startup::session_startup_intent_from_flags(SessionStartupFlags {
+        session_id: options.session_id.as_deref(),
+        resume_session_id: has_resume_id,
+        resume_most_recent,
+        continue_last_session: options.continue_last_session,
+        fork_session: options.fork_session,
+        has_worktree: worktree.is_some(),
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))
+    .inspect_err(|_| {
+        PendingStartup::finish_held(&mut pending_startup, crate::acp::StartupOutcome::Error);
+    })?;
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let materialized = match &backend {
+        crate::acp::backend::AgentBackend::Cursor(cmd) => {
+            crate::acp::cursor::materialize_startup(cmd, intent, &cwd_str).await
+        }
+        crate::acp::backend::AgentBackend::Grok => {
+            session_startup::materialize_startup_for_cwd(
+                headless_materialize_ctx(
+                    options.resume_title_pinned,
+                    options.restore_code,
+                    worktree.is_some(),
+                ),
+                intent,
+                &cwd_str,
+            )
+            .await
+        }
+    }
+    .inspect_err(|_| {
+        PendingStartup::finish_held(&mut pending_startup, crate::acp::StartupOutcome::Error);
+    })?;
     let timer = xai_grok_telemetry::startup::begin(crate::acp::Owner::Client);
     let mut report_startup_failure = |timer: &crate::acp::StartupTimer| {
         timer.emit_telemetry(
@@ -889,7 +922,7 @@ pub async fn run_single_turn(
         );
         PendingStartup::finish_held(&mut pending_startup, crate::acp::StartupOutcome::Error);
     };
-    let spawned = match spawn_agent(agent_config, &cancel, memory_config, &options).await {
+    let spawned = match backend.spawn(agent_config, &cancel, options.yolo).await {
         Ok(s) => s,
         Err(e) => {
             report_startup_failure(&timer);
@@ -952,37 +985,6 @@ pub async fn run_single_turn(
         None,
         false,
     );
-    use crate::app::session_startup::{self, MaterializedStartup, SessionStartupFlags};
-    let has_resume_id = options.resume.as_deref().filter(|s| !s.is_empty());
-    let resume_most_recent = options.resume.as_deref() == Some("");
-    let worktree =
-        WorktreeSpec::from_cli(options.worktree.as_deref(), options.worktree_ref.as_deref());
-    let intent = session_startup::session_startup_intent_from_flags(SessionStartupFlags {
-        session_id: options.session_id.as_deref(),
-        resume_session_id: has_resume_id,
-        resume_most_recent,
-        continue_last_session: options.continue_last_session,
-        fork_session: options.fork_session,
-        has_worktree: worktree.is_some(),
-    })
-    .map_err(|e| anyhow::anyhow!("{e}"))
-    .inspect_err(|_| {
-        PendingStartup::finish_held(&mut pending_startup, crate::acp::StartupOutcome::Error);
-    })?;
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let materialized = session_startup::materialize_startup_for_cwd(
-        headless_materialize_ctx(
-            options.resume_title_pinned,
-            options.restore_code,
-            worktree.is_some(),
-        ),
-        intent,
-        &cwd_str,
-    )
-    .await
-    .inspect_err(|_| {
-        PendingStartup::finish_held(&mut pending_startup, crate::acp::StartupOutcome::Error);
-    })?;
     let restore_code = match &materialized {
         MaterializedStartup::Resume {
             suppress_code_restore: true,

@@ -1,5 +1,6 @@
 #![cfg_attr(rustfmt, rustfmt::skip)]
 use super::*;
+use crate::acp::backend::BackendKind;
 fn nth<T>(xs: &[T], i: usize) -> &T {
     let Some(x) = xs.get(i) else {
         panic!("expected index {i}, len {}", xs.len());
@@ -953,7 +954,7 @@ fn probe_stage_reports_a_failed_persist_with_its_error() {
 #[tokio::test]
 async fn persist_setting_unknown_key_returns_err() {
     use crate::settings::SettingValue;
-    let result = persist_setting("not-a-real-setting", SettingValue::Bool(true)).await;
+    let result = persist_setting("not-a-real-setting", SettingValue::Bool(true), BackendKind::Grok).await;
     match result {
         Err(msg) => {
             assert!(
@@ -968,7 +969,7 @@ async fn persist_setting_unknown_key_returns_err() {
 #[tokio::test]
 async fn persist_setting_type_mismatch_errors_compact_mode() {
     use crate::settings::SettingValue;
-    let r = persist_setting("compact_mode", SettingValue::String("nope".into())).await;
+    let r = persist_setting("compact_mode", SettingValue::String("nope".into()), BackendKind::Grok).await;
     let err = r.expect_err("compact_mode with String payload must return Err");
     assert!(
             err.contains("persist_setting(compact_mode) expected Bool"),
@@ -979,7 +980,7 @@ async fn persist_setting_type_mismatch_errors_compact_mode() {
 #[tokio::test]
 async fn persist_setting_type_mismatch_errors_show_timestamps() {
     use crate::settings::SettingValue;
-    let r = persist_setting("show_timestamps", SettingValue::String("nope".into()))
+    let r = persist_setting("show_timestamps", SettingValue::String("nope".into()), BackendKind::Grok)
         .await;
     let err = r.expect_err("show_timestamps with String payload must return Err");
     assert!(
@@ -991,7 +992,7 @@ async fn persist_setting_type_mismatch_errors_show_timestamps() {
 #[tokio::test]
 async fn persist_setting_type_mismatch_errors_show_timeline() {
     use crate::settings::SettingValue;
-    let r = persist_setting("show_timeline", SettingValue::String("nope".into())).await;
+    let r = persist_setting("show_timeline", SettingValue::String("nope".into()), BackendKind::Grok).await;
     let err = r.expect_err("show_timeline with String payload must return Err");
     assert!(
             err.contains("persist_setting(show_timeline) expected Bool"),
@@ -1004,6 +1005,7 @@ async fn persist_setting_type_mismatch_errors_dashboard_preview() {
     let error = persist_setting(
             "dashboard_preview",
             SettingValue::String("nope".to_owned()),
+            BackendKind::Grok,
         )
         .await
         .expect_err("dashboard preview rejects a non-boolean value");
@@ -1012,7 +1014,7 @@ async fn persist_setting_type_mismatch_errors_dashboard_preview() {
 #[tokio::test]
 async fn persist_setting_type_mismatch_errors_page_flip_on_send() {
     use crate::settings::SettingValue;
-    let r = persist_setting("page_flip_on_send", SettingValue::String("nope".into()))
+    let r = persist_setting("page_flip_on_send", SettingValue::String("nope".into()), BackendKind::Grok)
         .await;
     let err = r.expect_err("page_flip_on_send with String payload must return Err");
     assert!(
@@ -1023,7 +1025,7 @@ async fn persist_setting_type_mismatch_errors_page_flip_on_send() {
 #[tokio::test]
 async fn persist_setting_type_mismatch_errors_confirm_before_rewind() {
     use crate::settings::SettingValue;
-    let r = persist_setting("confirm_before_rewind", SettingValue::String("nope".into()))
+    let r = persist_setting("confirm_before_rewind", SettingValue::String("nope".into()), BackendKind::Grok)
         .await;
     let err = r.expect_err("confirm_before_rewind with String payload must return Err");
     assert!(
@@ -1037,6 +1039,7 @@ async fn persist_setting_type_mismatch_errors_combine_queued_prompts() {
     let r = persist_setting(
             "combine_queued_prompts",
             SettingValue::String("nope".into()),
+            BackendKind::Grok,
         )
         .await;
     let err = r.expect_err("combine_queued_prompts with String payload must return Err");
@@ -1049,7 +1052,7 @@ async fn persist_setting_type_mismatch_errors_combine_queued_prompts() {
 #[tokio::test]
 async fn persist_setting_type_mismatch_errors_simple_mode() {
     use crate::settings::SettingValue;
-    let r = persist_setting("simple_mode", SettingValue::Int(42)).await;
+    let r = persist_setting("simple_mode", SettingValue::Int(42), BackendKind::Grok).await;
     let err = r.expect_err("simple_mode with Int payload must return Err");
     assert!(
             err.contains("persist_setting(simple_mode) expected Bool"),

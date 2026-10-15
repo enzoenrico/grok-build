@@ -284,6 +284,7 @@ fn test_app() -> AppView {
         welcome_shimmer_frame: 0,
         startup_warnings: Vec::new(),
         is_api_key_auth: false,
+        backend: crate::acp::backend::BackendKind::Grok,
         pending_update_version: None,
         foreign_resume_launch_generation: 0,
         foreign_resume_launch: None,

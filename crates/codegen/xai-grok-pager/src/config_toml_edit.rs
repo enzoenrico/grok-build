@@ -26,28 +26,58 @@ pub(crate) fn read_config_document_for_edit(path: &Path) -> Option<toml_edit::Do
     }
 }
 
+fn user_config_path() -> std::path::PathBuf {
+    xai_grok_tools::util::grok_home::grok_home().join(xai_grok_config::USER_CONFIG_FILENAME)
+}
+
 /// Set `[hints].<key>` to `value` in `~/.grok/config.toml`, preserving every other key and table. No-ops when the
 /// existing file is non-blank but unparseable, so a malformed config is never clobbered.
 pub(crate) fn set_hint(key: &str, value: impl Into<toml_edit::Value>) -> std::io::Result<()> {
-    let path =
-        xai_grok_tools::util::grok_home::grok_home().join(xai_grok_config::USER_CONFIG_FILENAME);
-    set_hint_at(&path, key, value)
+    set_hint_at(&user_config_path(), key, value)
+}
+
+/// Set or remove `[table].<key>` in `~/.grok/config.toml`. `None` removes the key.
+pub(crate) fn set_config_key(
+    table: &str,
+    key: &str,
+    value: Option<toml_edit::Value>,
+) -> std::io::Result<()> {
+    set_table_key_at(&user_config_path(), table, key, value)
 }
 
 /// Core of [`set_hint`]; takes the path so tests can point it at a temp dir.
 fn set_hint_at(path: &Path, key: &str, value: impl Into<toml_edit::Value>) -> std::io::Result<()> {
+    set_table_key_at(path, "hints", key, Some(value.into()))
+}
+
+/// Set or remove `key` in `[table]`. `None` removes the key and does not create a missing table.
+fn set_table_key_at(
+    path: &Path,
+    table: &str,
+    key: &str,
+    value: Option<toml_edit::Value>,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let Some(mut doc) = read_config_document_for_edit(path) else {
         return Ok(());
     };
-    if let Some(table) = doc
-        .entry("hints")
-        .or_insert(toml_edit::table())
-        .as_table_mut()
-    {
-        table.insert(key, toml_edit::value(value));
+    match value {
+        Some(value) => {
+            if let Some(section) = doc
+                .entry(table)
+                .or_insert(toml_edit::table())
+                .as_table_mut()
+            {
+                section.insert(key, toml_edit::value(value));
+            }
+        }
+        None => {
+            if let Some(section) = doc.get_mut(table).and_then(|item| item.as_table_mut()) {
+                section.remove(key);
+            }
+        }
     }
     std::fs::write(path, doc.to_string())
 }
@@ -162,6 +192,28 @@ mod tests {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         assert!(disabled, "should read back true after set_hint write");
+    }
+
+    #[test]
+    fn set_table_key_at_removes_key_and_keeps_siblings() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(xai_grok_config::USER_CONFIG_FILENAME);
+        fs::write(
+            &path,
+            "[cursor]\nmodel = \"gpt-5.5\"\nbin = \"/opt/agent\"\n",
+        )
+        .unwrap();
+
+        set_table_key_at(&path, "cursor", "model", None).unwrap();
+
+        let doc = read_config_document_for_edit(&path).expect("reparse");
+        assert!(doc.get("cursor").and_then(|t| t.get("model")).is_none());
+        assert_eq!(
+            doc.get("cursor")
+                .and_then(|t| t.get("bin"))
+                .and_then(|v| v.as_str()),
+            Some("/opt/agent"),
+        );
     }
 
     #[test]
