@@ -5,7 +5,7 @@
 
 mod adapter;
 mod cloud;
-mod protocol;
+pub(crate) mod protocol;
 mod startup;
 
 pub use startup::materialize_startup;
