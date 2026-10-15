@@ -136,7 +136,36 @@ use adapter::{CloudRequest, CursorAdapter, Routed};
 
 pub const CURSOR_AGENT_BIN_ENV: &str = "GROK_CURSOR_AGENT_BIN";
 const DEFAULT_CURSOR_AGENT_BIN: &str = "cursor-agent";
+const AGENT_BIN_FALLBACK: &str = "agent";
 const CHILD_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn resolve_cursor_program(configured: &std::path::Path) -> std::path::PathBuf {
+    if configured.components().nth(1).is_some() {
+        return configured.to_path_buf();
+    }
+    if configured != std::path::Path::new(DEFAULT_CURSOR_AGENT_BIN) {
+        return configured.to_path_buf();
+    }
+    let name = pick_default_cursor_bin(bin_on_path(DEFAULT_CURSOR_AGENT_BIN), bin_on_path(AGENT_BIN_FALLBACK));
+    std::path::PathBuf::from(name)
+}
+
+fn pick_default_cursor_bin(cursor_agent_on_path: bool, agent_on_path: bool) -> &'static str {
+    if cursor_agent_on_path || !agent_on_path {
+        DEFAULT_CURSOR_AGENT_BIN
+    } else {
+        AGENT_BIN_FALLBACK
+    }
+}
+
+fn bin_on_path(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            let candidate = dir.join(name);
+            candidate.is_file()
+        })
+    })
+}
 
 /// How to launch the Cursor agent (`<program> <args...> acp`) and how to talk to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,7 +231,7 @@ impl CursorAgentCommand {
 
     /// Program, configured args, `--yolo` when asked and not already forced, then `acp`.
     pub fn tokio_command(&self, yolo: bool) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new(&self.program);
+        let mut cmd = tokio::process::Command::new(resolve_cursor_program(&self.program));
         cmd.args(&self.args);
         if yolo
             && !self
@@ -543,5 +572,13 @@ mod tests {
 
         let already = CursorAgentCommand::from_config(&config("[cursor]\nargs = [\"-f\"]\n"), None);
         assert_eq!(argv(&already, true), ["-f", "acp"]);
+    }
+
+    #[test]
+    fn default_bin_uses_agent_when_cursor_agent_is_missing() {
+        assert_eq!(pick_default_cursor_bin(true, true), "cursor-agent");
+        assert_eq!(pick_default_cursor_bin(true, false), "cursor-agent");
+        assert_eq!(pick_default_cursor_bin(false, false), "cursor-agent");
+        assert_eq!(pick_default_cursor_bin(false, true), "agent");
     }
 }
