@@ -311,6 +311,7 @@ impl CursorAdapter {
                     return vec![Routed::ToClient(ext.to_string())];
                 }
                 self.note_session_update(&mut msg);
+                protocol::normalize_plan_session_update(&mut msg);
                 if !self.stamp_session_update(&mut msg) {
                     return Vec::new();
                 }

@@ -749,13 +749,36 @@ fn plan_wait(params: &Value) -> QuestionWait {
 }
 
 fn plan_as_question(params: &Value) -> Value {
-    let plan = params.get("plan").and_then(Value::as_str).unwrap_or("");
     let name = params.get("name").and_then(Value::as_str).unwrap_or("Plan");
+    let mut prompt = format!("Accept this plan ({name})?");
+    for field in ["overview", "plan"] {
+        if let Some(text) = params.get(field).and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            prompt.push_str("\n\n");
+            prompt.push_str(text);
+        }
+    }
+    if let Some(todos) = params.get("todos").and_then(Value::as_array) {
+        let lines: Vec<&str> = todos
+            .iter()
+            .filter_map(|todo| todo.get("content").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .collect();
+        if !lines.is_empty() {
+            prompt.push_str("\n\n");
+            for line in lines {
+                prompt.push_str("- ");
+                prompt.push_str(line);
+                prompt.push('\n');
+            }
+        }
+    }
     json!({
         "toolCallId": params.get("toolCallId").cloned().unwrap_or_else(|| json!("plan")),
         "questions": [{
             "id": "plan",
-            "prompt": format!("Accept this plan ({name})?\n\n{plan}"),
+            "prompt": prompt,
             "allowMultiple": false,
             "options": [
                 {"id": "accepted", "label": "Accept"},
@@ -763,6 +786,35 @@ fn plan_as_question(params: &Value) -> Value {
             ]
         }]
     })
+}
+
+pub(crate) fn normalize_plan_session_update(msg: &mut Value) {
+    let Some(update) = msg.pointer_mut("/params/update") else {
+        return;
+    };
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("plan") {
+        return;
+    }
+    let Some(entries) = update.get_mut("entries").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for entry in entries {
+        let status = entry
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
+        entry["status"] = json!(plan_status(status));
+        if entry.get("priority").and_then(Value::as_str).is_none() {
+            entry["priority"] = json!("medium");
+        }
+        if entry.get("content").and_then(Value::as_str).is_none() {
+            let content = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("Plan task");
+            entry["content"] = json!(content);
+        }
+    }
 }
 
 fn ask_user_params(session_id: Option<&str>, params: &Value, wait: &QuestionWait) -> Value {
@@ -1148,6 +1200,23 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(question.contains("1. Inspect"));
+        let overview = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "cursor/create_plan",
+            "params": {
+                "name": "Auth",
+                "overview": "Replace the token check.",
+                "plan": "",
+                "todos": [{"id": "t1", "content": "Read the login file", "status": "pending"}]
+            }
+        });
+        let translated = translate_cursor_inbound(&overview, Some("s1")).unwrap();
+        let question = translated.to_client[0]["params"]["params"]["questions"][0]["question"]
+            .as_str()
+            .unwrap();
+        assert!(question.contains("Replace the token check."));
+        assert!(question.contains("Read the login file"));
         let PendingBridge::Plan(wait) = translated.pending.unwrap() else {
             panic!("plan wait");
         };
@@ -1177,5 +1246,35 @@ mod tests {
         assert_eq!(update["sessionUpdate"], "tool_call");
         assert_eq!(update["title"], "explore: Explore codebase");
         assert_eq!(update["toolCallId"], "call_126");
+    }
+
+    #[test]
+    fn a_cursor_plan_update_decodes_for_the_pager() {
+        let mut msg = json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "plan",
+                    "entries": [{"content": "Read the login file", "status": "cancelled"}]
+                }
+            }
+        });
+        normalize_plan_session_update(&mut msg);
+        let note: agent_client_protocol::SessionNotification =
+            serde_json::from_value(msg["params"].clone()).expect("pager plan update");
+        let agent_client_protocol::SessionUpdate::Plan(plan) = note.update else {
+            panic!("expected a plan");
+        };
+        assert_eq!(plan.entries[0].content, "Read the login file");
+        assert_eq!(
+            plan.entries[0].status,
+            agent_client_protocol::PlanEntryStatus::Completed
+        );
+        assert_eq!(
+            plan.entries[0].priority,
+            agent_client_protocol::PlanEntryPriority::Medium
+        );
     }
 }
