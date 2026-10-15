@@ -67,6 +67,28 @@ pub(crate) fn rewrite_mode_value(mode: &mut Value, from_cursor: bool) {
     }
 }
 
+pub(crate) fn rewrite_mode_config_options(result: &mut Map<String, Value>, from_cursor: bool) {
+    let Some(options) = result.get_mut("configOptions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for option in options {
+        if option.get("id").and_then(Value::as_str) != Some("mode") {
+            continue;
+        }
+        if let Some(current) = option.get_mut("currentValue") {
+            rewrite_mode_value(current, from_cursor);
+        }
+        let Some(values) = option.get_mut("options").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for value in values {
+            if let Some(id) = value.get_mut("value") {
+                rewrite_mode_value(id, from_cursor);
+            }
+        }
+    }
+}
+
 pub(crate) fn advertise_cursor_client(msg: &mut Value) {
     let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) else {
         return;

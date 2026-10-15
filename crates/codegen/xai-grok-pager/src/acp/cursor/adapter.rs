@@ -183,6 +183,13 @@ impl CursorAdapter {
                     protocol::rewrite_mode_value(mode, false);
                 }
             }
+            "session/set_config_option" => {
+                if msg.pointer("/params/configId").and_then(Value::as_str) == Some("mode")
+                    && let Some(value) = msg.pointer_mut("/params/value")
+                {
+                    protocol::rewrite_mode_value(value, false);
+                }
+            }
             "authenticate" => {
                 if let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) {
                     params.insert(
@@ -377,6 +384,7 @@ impl CursorAdapter {
                         }
                     }
                     rewrite_modes(result);
+                    protocol::rewrite_mode_config_options(result, true);
                     protocol::absorb_cursor_skills(result);
                     if let Some(session_id) = &session_id {
                         self.remember_skills(session_id, result.get("availableCommands"));
@@ -412,6 +420,9 @@ impl CursorAdapter {
                 }
             }
             None => {}
+        }
+        if let Some(result) = msg.get_mut("result").and_then(Value::as_object_mut) {
+            protocol::rewrite_mode_config_options(result, true);
         }
         out.push(Routed::ToClient(msg.to_string()));
         out

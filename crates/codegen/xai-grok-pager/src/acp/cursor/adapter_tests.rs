@@ -113,6 +113,65 @@ fn new_session_maps_modes_and_applies_requested_model() {
 }
 
 #[test]
+fn cursor_mode_setting_uses_the_pager_mode_ids() {
+    let mut adapter = CursorAdapter::new(None, false);
+    adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "sessionId": "s1",
+            "modes": {
+                "currentModeId": "agent",
+                "availableModes": [
+                    {"id": "agent", "name": "Agent"},
+                    {"id": "plan", "name": "Plan"},
+                    {"id": "ask", "name": "Ask"}
+                ]
+            },
+            "models": {
+                "currentModelId": "composer-2",
+                "availableModels": [{"modelId": "composer-2", "name": "Composer"}]
+            },
+            "configOptions": [{
+                "id": "mode",
+                "name": "Mode",
+                "category": "mode",
+                "type": "select",
+                "currentValue": "agent",
+                "options": [
+                    {"value": "agent", "name": "Agent"},
+                    {"value": "plan", "name": "Plan"},
+                    {"value": "ask", "name": "Ask"}
+                ]
+            }]
+        }
+    });
+    let out = adapter.inbound(&response.to_string());
+    let resp = parse(out.last().unwrap());
+    let decoded: agent_client_protocol::NewSessionResponse =
+        serde_json::from_value(resp["result"].clone()).expect("pager session");
+    let modes = decoded.modes.expect("modes");
+    assert_eq!(modes.current_mode_id.0.as_ref(), "default");
+    assert_eq!(modes.available_modes[0].id.0.as_ref(), "default");
+    assert_eq!(modes.available_modes[1].id.0.as_ref(), "plan");
+    assert_eq!(resp["result"]["configOptions"][0]["currentValue"], "default");
+    assert_eq!(resp["result"]["configOptions"][0]["options"][0]["value"], "default");
+    assert_eq!(resp["result"]["configOptions"][0]["options"][1]["value"], "plan");
+
+    let set = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/set_config_option","params":{"sessionId":"s1","configId":"mode","value":"default"}}"#,
+    );
+    assert_eq!(parse(&set[0])["params"]["value"], "agent");
+    let plan = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{"sessionId":"s1","configId":"mode","value":"plan"}}"#,
+    );
+    assert_eq!(parse(&plan[0])["params"]["value"], "plan");
+}
+
+#[test]
 fn already_selected_model_sends_no_switch() {
     let mut adapter = CursorAdapter::new(None, false);
     adapter.outbound(
