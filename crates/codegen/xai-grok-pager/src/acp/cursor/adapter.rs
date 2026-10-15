@@ -21,13 +21,19 @@ pub(crate) enum Routed {
     ToAgent(String),
     /// Hand back to the pager's ACP client.
     ToClient(String),
-    /// Create, follow up, or refresh a Cursor cloud agent. ACP does not do this.
-    /// An empty `task` refreshes `agent_id` and does not start a run.
+    /// Create, follow up, refresh, or cancel a Cursor cloud agent. ACP does not do this.
     Cloud {
         session_id: String,
-        task: String,
+        request: CloudRequest,
         agent_id: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CloudRequest {
+    Send(String),
+    Refresh,
+    Cancel,
 }
 
 #[derive(Debug)]
@@ -197,27 +203,21 @@ impl CursorAdapter {
                     let Some(session_id) = session_id.clone() else {
                         return vec![Routed::ToClient(msg.to_string())];
                     };
-                    let Some(task) = cloud_task
-                        .filter(|task| !task.eq_ignore_ascii_case("status"))
-                    else {
-                        let Some(agent_id) = cloud_agent_id.clone() else {
-                            return vec![Routed::ToClient(
-                                protocol::agent_notice(
-                                    &session_id,
-                                    "No cloud agent on this session yet. Send & and a task to start one.\n",
-                                )
-                                .to_string(),
-                            )];
-                        };
-                        return vec![Routed::Cloud {
-                            session_id,
-                            task: String::new(),
-                            agent_id: Some(agent_id),
-                        }];
-                    };
+                    let request = cloud_request(cloud_task);
+                    if matches!(request, CloudRequest::Refresh | CloudRequest::Cancel)
+                        && cloud_agent_id.is_none()
+                    {
+                        return vec![Routed::ToClient(
+                            protocol::agent_notice(
+                                &session_id,
+                                "No cloud agent on this session yet. Send & and a task to start one.\n",
+                            )
+                            .to_string(),
+                        )];
+                    }
                     return vec![Routed::Cloud {
                         session_id,
-                        task,
+                        request,
                         agent_id: cloud_agent_id,
                     }];
                 }
@@ -518,6 +518,19 @@ fn is_grok_extension(method: &str) -> bool {
         .strip_prefix('_')
         .unwrap_or(method)
         .starts_with("x.ai/")
+}
+
+fn cloud_request(task: Option<String>) -> CloudRequest {
+    let Some(task) = task else {
+        return CloudRequest::Refresh;
+    };
+    if task.is_empty() || task.eq_ignore_ascii_case("status") {
+        CloudRequest::Refresh
+    } else if task.eq_ignore_ascii_case("cancel") {
+        CloudRequest::Cancel
+    } else {
+        CloudRequest::Send(task)
+    }
 }
 
 fn rewrite_modes(result: &mut Map<String, Value>) {

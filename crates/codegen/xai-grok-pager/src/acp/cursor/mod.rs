@@ -12,7 +12,7 @@ pub use startup::materialize_startup;
 
 fn cloud_handoff_notice(
     session_id: &str,
-    task: &str,
+    request: &CloudRequest,
     agent_id: Option<&str>,
 ) -> (String, Option<cloud::CloudAgent>) {
     let key = std::env::var("CURSOR_API_KEY").unwrap_or_default();
@@ -20,15 +20,24 @@ fn cloud_handoff_notice(
         .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
     let outcome = if key.is_empty() {
         Err("Set CURSOR_API_KEY to send this to a Cursor cloud agent.".to_owned())
-    } else if task.trim().is_empty() {
-        match agent_id {
-            Some(id) => cloud::refresh_existing(&base, &key, id),
-            None => Err(
-                "No cloud agent on this session yet. Send & and a task to start one.".to_owned(),
-            ),
-        }
     } else {
-        cloud::dispatch(&base, &key, agent_id, task)
+        match request {
+            CloudRequest::Send(task) => cloud::dispatch(&base, &key, agent_id, task),
+            CloudRequest::Refresh => match agent_id {
+                Some(id) => cloud::refresh_existing(&base, &key, id),
+                None => Err(
+                    "No cloud agent on this session yet. Send & and a task to start one."
+                        .to_owned(),
+                ),
+            },
+            CloudRequest::Cancel => match agent_id {
+                Some(id) => cloud::cancel_existing(&base, &key, id),
+                None => Err(
+                    "No cloud agent on this session yet. Send & and a task to start one."
+                        .to_owned(),
+                ),
+            },
+        }
     };
     let (text, recorded) = match outcome {
         Ok(agent) => {
@@ -118,7 +127,7 @@ use xai_grok_shell::leader::ReconnectPolicy;
 
 use super::leader_bridge::bridge_channels;
 use super::spawn::{SpawnedAgent, spawn_runtime_thread};
-use adapter::{CursorAdapter, Routed};
+use adapter::{CloudRequest, CursorAdapter, Routed};
 
 pub const CURSOR_AGENT_BIN_ENV: &str = "GROK_CURSOR_AGENT_BIN";
 const DEFAULT_CURSOR_AGENT_BIN: &str = "cursor-agent";
@@ -334,11 +343,11 @@ impl CursorIo {
                         }
                         Routed::Cloud {
                             session_id,
-                            task,
+                            request,
                             agent_id,
                         } => {
                             let (notice, recorded) =
-                                cloud_handoff_notice(&session_id, &task, agent_id.as_deref());
+                                cloud_handoff_notice(&session_id, &request, agent_id.as_deref());
                             if let Some(agent) = &recorded {
                                 adapter
                                     .lock()

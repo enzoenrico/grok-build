@@ -270,14 +270,14 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
     );
     let Routed::Cloud {
         session_id,
-        task,
+        request,
         agent_id,
     } = &sent[0]
     else {
         panic!("expected a cloud handoff: {sent:?}");
     };
     assert_eq!(session_id, "s1");
-    assert_eq!(task, "refactor the auth module");
+    assert_eq!(request, &CloudRequest::Send("refactor the auth module".to_owned()));
     assert_eq!(agent_id, &None);
 
     adapter.note_cloud_agent("s1", "bc-123");
@@ -294,12 +294,12 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
         r#"{"jsonrpc":"2.0","id":6,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& add tests"}]}}"#,
     );
     let Routed::Cloud {
-        task, agent_id, ..
+        request, agent_id, ..
     } = &follow[0]
     else {
         panic!("expected a cloud follow-up: {follow:?}");
     };
-    assert_eq!(task, "add tests");
+    assert_eq!(request, &CloudRequest::Send("add tests".to_owned()));
     assert_eq!(agent_id.as_deref(), Some("bc-123"));
 }
 
@@ -324,12 +324,25 @@ fn bare_ampersand_refreshes_the_recorded_agent() {
             r#"{{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{{"sessionId":"s1","prompt":[{{"type":"text","text":"{text}"}}]}}}}"#
         ));
         let Routed::Cloud {
-            task, agent_id, ..
+            request, agent_id, ..
         } = &refresh[0]
         else {
             panic!("expected a refresh for {text}: {refresh:?}");
         };
-        assert_eq!(task, "");
+        assert_eq!(request, &CloudRequest::Refresh);
+        assert_eq!(agent_id.as_deref(), Some("bc-123"));
+    }
+    for text in ["& cancel", "& Cancel"] {
+        let cancel = adapter.outbound(&format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"session/prompt","params":{{"sessionId":"s1","prompt":[{{"type":"text","text":"{text}"}}]}}}}"#
+        ));
+        let Routed::Cloud {
+            request, agent_id, ..
+        } = &cancel[0]
+        else {
+            panic!("expected a cancel for {text}: {cancel:?}");
+        };
+        assert_eq!(request, &CloudRequest::Cancel);
         assert_eq!(agent_id.as_deref(), Some("bc-123"));
     }
 }
@@ -353,10 +366,10 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
         let handoff = adapter.outbound(&format!(
             r#"{{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{{"sessionId":"{id}","prompt":[{{"type":"text","text":"& ship it"}}]}}}}"#
         ));
-        let Routed::Cloud { task, agent_id, .. } = &handoff[0] else {
+        let Routed::Cloud { request, agent_id, .. } = &handoff[0] else {
             panic!("expected a cloud handoff: {handoff:?}");
         };
-        assert_eq!(task, "ship it");
+        assert_eq!(request, &CloudRequest::Send("ship it".to_owned()));
         assert_eq!(agent_id, &None);
         adapter.note_cloud_agent(id, cloud);
     }

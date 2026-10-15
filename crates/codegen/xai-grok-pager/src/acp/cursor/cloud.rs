@@ -1,6 +1,6 @@
 //! Cursor Cloud Agents HTTP API. ACP `session/prompt` does not create a cloud agent.
-//! A message that starts with `&` and a task is sent here. A bare `&` only reads the latest run.
-//! A run that is still going is followed on its event stream.
+//! A message that starts with `&` and a task is sent here. `&` and `& status` only read the latest run.
+//! `& cancel` stops that run. A run that is still going is followed on its event stream.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -196,6 +196,28 @@ pub(crate) fn refresh_existing(
         pr_url: None,
     };
     refresh(api_base, api_key, &mut agent)?;
+    Ok(agent)
+}
+
+pub(crate) fn cancel_existing(
+    api_base: &str,
+    api_key: &str,
+    agent_id: &str,
+) -> Result<CloudAgent, String> {
+    let mut agent = refresh_existing(api_base, api_key, agent_id)?;
+    if run_is_terminal(agent.run_status.as_deref()) {
+        return Ok(agent);
+    }
+    let Some(run_id) = agent.run_id.clone() else {
+        return Err("cloud agent has no run to cancel".to_owned());
+    };
+    let _ = request(
+        "POST",
+        &format!("{api_base}/v1/agents/{}/runs/{run_id}/cancel", agent.id),
+        api_key,
+        None,
+    )?;
+    let _ = refresh(api_base, api_key, &mut agent);
     Ok(agent)
 }
 
@@ -655,5 +677,74 @@ data: {}
                 "Run FINISHED.\nhttps://github.com/acme/app/pull/123\n".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn cancel_stops_a_running_cloud_run() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let replies = [
+                r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"ACTIVE","latestRunId":"run-1"}"#,
+                r#"{"id":"run-1","agentId":"bc-1","status":"RUNNING"}"#,
+                r#"{"id":"run-1"}"#,
+                r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"IDLE","latestRunId":"run-1"}"#,
+                r#"{"id":"run-1","agentId":"bc-1","status":"CANCELLED","result":"Stopped."}"#,
+            ];
+            for (i, body) in replies.into_iter().enumerate() {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let ok = if i == 2 {
+                    req.starts_with("POST ") && req.contains("/cancel")
+                } else {
+                    req.starts_with("GET ")
+                };
+                let payload = if ok {
+                    body.to_owned()
+                } else {
+                    r#"{"error":"wrong method"}"#.to_owned()
+                };
+                let status = if ok { "200 OK" } else { "400 Bad Request" };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let base = format!("http://{addr}");
+        let agent = cancel_existing(&base, "test-key", "bc-1").unwrap();
+        assert_eq!(agent.id, "bc-1");
+        assert_eq!(agent.run_id.as_deref(), Some("run-1"));
+        assert_eq!(agent.run_status.as_deref(), Some("CANCELLED"));
+        assert_eq!(agent.result.as_deref(), Some("Stopped."));
+    }
+
+    #[test]
+    fn cancel_leaves_a_finished_run_alone() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let replies = [
+                r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"IDLE","latestRunId":"run-1"}"#,
+                r#"{"id":"run-1","agentId":"bc-1","status":"FINISHED","result":"Already done."}"#,
+            ];
+            for body in replies {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let _ = sock.read(&mut buf).unwrap();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let base = format!("http://{addr}");
+        let agent = cancel_existing(&base, "test-key", "bc-1").unwrap();
+        assert_eq!(agent.run_status.as_deref(), Some("FINISHED"));
+        assert_eq!(agent.result.as_deref(), Some("Already done."));
     }
 }
