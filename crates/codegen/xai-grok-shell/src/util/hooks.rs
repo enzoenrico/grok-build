@@ -1,6 +1,7 @@
 use std::path::Path;
+use std::sync::Arc;
 
-use xai_grok_hooks::discovery::DiscoveryOptions;
+use xai_grok_hooks::discovery::{DiscoveryOptions, HookRegistry};
 use xai_grok_hooks::error::HookError;
 use xai_grok_hooks::trust::DisabledHooks;
 use xai_grok_hooks::trust::Trust;
@@ -35,4 +36,44 @@ pub(crate) fn discover_hooks(
             trust,
         },
     )
+}
+
+/// The hooks a session at `cwd` runs, as a mid-session reload rebuilds them.
+pub(crate) struct CwdHooks {
+    pub registry: Option<Arc<HookRegistry>>,
+    pub disabled: DisabledHooks,
+    pub load_errors: Vec<String>,
+    pub project_trusted: bool,
+}
+
+/// Re-discover the hooks for `cwd`: folder trust is reconciled first (so a `/hooks-trust` or `--trust` grant counts),
+/// project sources are gated on that verdict, and the plugin registry's hooks are appended.
+pub(crate) fn hooks_for_cwd(
+    cwd: &Path,
+    compat: &xai_grok_tools::types::compat::CompatConfig,
+    plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
+) -> CwdHooks {
+    let git_root = xai_grok_workspace::session::git::find_git_root_from_path(cwd).ok();
+    let project_trusted = crate::agent::folder_trust::resolve_and_record(cwd, None, false);
+    let (inputs, disabled) = session_hook_inputs();
+    let (registry, errors) = discover_hooks(
+        &inputs,
+        git_root.as_deref(),
+        compat,
+        Trust::from_verdict(project_trusted),
+    );
+    for err in &errors {
+        tracing::warn!("hook reload error: {err}");
+    }
+    let registry = xai_grok_agent::plugins::hooks_adapter::with_plugin_hooks_filtered(
+        (!registry.is_empty()).then(|| Arc::new(registry)),
+        xai_grok_agent::plugins::hooks_adapter::PluginHookSource::Registry(plugin_registry),
+        compat.cursor.hooks,
+    );
+    CwdHooks {
+        registry,
+        disabled,
+        load_errors: errors.iter().map(ToString::to_string).collect(),
+        project_trusted,
+    }
 }

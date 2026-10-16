@@ -27,20 +27,21 @@ pub(crate) struct CloudAgent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CloudEvent {
     Assistant(String),
-    ToolDone { name: String },
+    ToolDone {
+        name: String,
+    },
     Result {
         status: String,
         text: String,
         pr_url: Option<String>,
     },
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 pub(crate) fn run_is_terminal(status: Option<&str>) -> bool {
-    matches!(
-        status,
-        Some("FINISHED" | "ERROR" | "CANCELLED" | "EXPIRED")
-    )
+    matches!(status, Some("FINISHED" | "ERROR" | "CANCELLED" | "EXPIRED"))
 }
 
 pub(crate) fn event_text(event: &CloudEvent, saw_assistant: bool) -> Option<String> {
@@ -90,11 +91,7 @@ pub(crate) fn resolve_cloud_auth() -> Result<CloudAuth, String> {
     let auth_token = std::env::var("CURSOR_AUTH_TOKEN").ok();
     let api_key = std::env::var("CURSOR_API_KEY").ok();
     let stored = read_stored_login()?;
-    cloud_auth_from_sources(
-        auth_token.as_deref(),
-        api_key.as_deref(),
-        stored.as_ref(),
-    )
+    cloud_auth_from_sources(auth_token.as_deref(), api_key.as_deref(), stored.as_ref())
 }
 
 pub(crate) fn cloud_auth_from_sources(
@@ -202,9 +199,7 @@ fn cursor_auth_path_for(
 #[cfg(target_os = "macos")]
 fn keychain_is_default_store() -> bool {
     !matches!(
-        std::env::var("AGENT_CLI_CREDENTIAL_STORE")
-            .ok()
-            .as_deref(),
+        std::env::var("AGENT_CLI_CREDENTIAL_STORE").ok().as_deref(),
         Some("file" | "memory")
     )
 }
@@ -273,11 +268,7 @@ pub(crate) struct CloudRepo {
     pub starting_ref: Option<String>,
 }
 
-pub(crate) fn create_body(
-    text: &str,
-    repo: Option<&CloudRepo>,
-    model_id: Option<&str>,
-) -> String {
+pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>, model_id: Option<&str>) -> String {
     let mut body = json!({ "prompt": { "text": text } });
     if let Some(repo) = repo {
         let mut entry = json!({ "url": repo.url });
@@ -430,17 +421,10 @@ pub(crate) fn parse_cloud_response(body: &str) -> Result<CloudAgent, String> {
     let id = agent
         .get("id")
         .and_then(Value::as_str)
-        .or_else(|| {
-            value
-                .pointer("/run/agentId")
-                .and_then(Value::as_str)
-        })
+        .or_else(|| value.pointer("/run/agentId").and_then(Value::as_str))
         .ok_or_else(|| "cloud agent response has no id".to_owned())?
         .to_owned();
-    let url = agent
-        .get("url")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let url = agent.get("url").and_then(Value::as_str).map(str::to_owned);
     let run_id = value
         .pointer("/run/id")
         .and_then(Value::as_str)
@@ -489,10 +473,7 @@ fn refresh(api_base: &str, auth: &CloudAuth, agent: &mut CloudAgent) -> Result<(
     )?;
     let value: Value = serde_json::from_str(&record).map_err(|err| err.to_string())?;
     if agent.url.is_none() {
-        agent.url = value
-            .get("url")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        agent.url = value.get("url").and_then(Value::as_str).map(str::to_owned);
     }
     let run_id = value
         .get("latestRunId")
@@ -578,7 +559,10 @@ pub(crate) fn dispatch(
             format!("{api_base}/v1/agents/{id}/runs"),
             follow_up_body(text, model_id),
         ),
-        None => (format!("{api_base}/v1/agents"), create_body(text, repo, model_id)),
+        None => (
+            format!("{api_base}/v1/agents"),
+            create_body(text, repo, model_id),
+        ),
     };
     let raw = match request("POST", &url, auth, Some(&body)) {
         Ok(raw) => raw,
@@ -726,7 +710,8 @@ fn follow_via_curl(
         "Accept: text/event-stream".to_owned(),
         url.to_owned(),
     ]);
-    let mut child = std::process::Command::new("curl").args(args)
+    let mut child = std::process::Command::new("curl")
+        .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -838,7 +823,9 @@ fn request_via_tcp(
         .write_all(request.as_bytes())
         .map_err(|err| err.to_string())?;
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).map_err(|err| err.to_string())?;
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|err| err.to_string())?;
     let text = String::from_utf8_lossy(&raw);
     let (head, payload) = text
         .split_once("\r\n\r\n")
@@ -889,7 +876,15 @@ mod tests {
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module", None, None).unwrap();
+        let created = dispatch(
+            &base,
+            &CloudAuth::Basic("test-key".to_owned()),
+            None,
+            "refactor the auth module",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(created.id, "bc-1");
         assert_eq!(
             created.url.as_deref(),
@@ -897,7 +892,15 @@ mod tests {
         );
         assert_eq!(created.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(created.result.as_deref(), Some("Refactored auth."));
-        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None).unwrap();
+        let follow = dispatch(
+            &base,
+            &CloudAuth::Basic("test-key".to_owned()),
+            Some("bc-1"),
+            "add tests",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(follow.id, "bc-1");
         assert_eq!(follow.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(follow.result.as_deref(), Some("Added the tests."));
@@ -932,12 +935,10 @@ mod tests {
             }
         });
         let base = format!("http://{addr}");
-        let agent = refresh_existing(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1").unwrap();
+        let agent =
+            refresh_existing(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1").unwrap();
         assert_eq!(agent.id, "bc-1");
-        assert_eq!(
-            agent.url.as_deref(),
-            Some("https://cursor.com/agents/bc-1")
-        );
+        assert_eq!(agent.url.as_deref(), Some("https://cursor.com/agents/bc-1"));
         assert_eq!(agent.run_id.as_deref(), Some("run-9"));
         assert_eq!(agent.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(agent.result.as_deref(), Some("Still the same answer."));
@@ -1002,12 +1003,27 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme", None, None).unwrap();
+        let created = dispatch(
+            &base,
+            &CloudAuth::Basic("test-key".to_owned()),
+            None,
+            "update the readme",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(created.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(created.result, None);
         assert!(!run_is_terminal(created.run_status.as_deref()));
         let mut events = Vec::new();
-        follow_run(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1", "run-1", |event| events.push(event)).unwrap();
+        follow_run(
+            &base,
+            &CloudAuth::Basic("test-key".to_owned()),
+            "bc-1",
+            "run-1",
+            |event| events.push(event),
+        )
+        .unwrap();
         assert_eq!(
             events,
             vec![
@@ -1079,7 +1095,8 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let agent = cancel_existing(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1").unwrap();
+        let agent =
+            cancel_existing(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1").unwrap();
         assert_eq!(agent.id, "bc-1");
         assert_eq!(agent.run_id.as_deref(), Some("run-1"));
         assert_eq!(agent.run_status.as_deref(), Some("CANCELLED"));
@@ -1107,7 +1124,8 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let agent = cancel_existing(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1").unwrap();
+        let agent =
+            cancel_existing(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1").unwrap();
         assert_eq!(agent.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(agent.result.as_deref(), Some("Already done."));
     }
@@ -1151,7 +1169,15 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None).unwrap();
+        let agent = dispatch(
+            &base,
+            &CloudAuth::Basic("test-key".to_owned()),
+            Some("bc-1"),
+            "add tests",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(agent.id, "bc-1");
         assert_eq!(agent.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(
@@ -1230,7 +1256,11 @@ data: {}
             } else {
                 r#"{"error":"missing bearer"}"#
             };
-            let status = if body.contains("bc-1") { "200 OK" } else { "401 Unauthorized" };
+            let status = if body.contains("bc-1") {
+                "200 OK"
+            } else {
+                "401 Unauthorized"
+            };
             let resp = format!(
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -1278,9 +1308,18 @@ data: {}
             .current_dir(&dir)
             .output()
             .unwrap();
-        assert!(init.status.success(), "{}", String::from_utf8_lossy(&init.stderr));
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
         let remote = std::process::Command::new("git")
-            .args(["remote", "add", "origin", "git@github.com:acme/payments.git"])
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:acme/payments.git",
+            ])
             .current_dir(&dir)
             .status()
             .unwrap();

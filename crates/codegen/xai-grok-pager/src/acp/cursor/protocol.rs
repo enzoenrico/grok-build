@@ -221,7 +221,7 @@ pub(crate) fn skill_names(commands: Option<&Value>) -> HashSet<String> {
     names
 }
 
-fn command_is_skill(cmd: &Map<String, Value>) -> bool {
+pub(crate) fn command_is_skill(cmd: &Map<String, Value>) -> bool {
     let Some(meta) = cmd.get("_meta").and_then(Value::as_object) else {
         return false;
     };
@@ -954,7 +954,8 @@ mod tests {
         });
         let ext = cursor_subagent_ext(&msg).unwrap();
         assert_eq!(ext["method"], "_x.ai/session_notification");
-        let parsed: SessionUpdate = serde_json::from_value(ext["params"]["update"].clone()).unwrap();
+        let parsed: SessionUpdate =
+            serde_json::from_value(ext["params"]["update"].clone()).unwrap();
         let SessionUpdate::SubagentSpawned {
             subagent_id,
             parent_session_id,
@@ -984,8 +985,14 @@ mod tests {
             }
         });
         let ext = cursor_subagent_ext(&done).unwrap();
-        let parsed: SessionUpdate = serde_json::from_value(ext["params"]["update"].clone()).unwrap();
-        let SessionUpdate::SubagentFinished { status, child_session_id, .. } = parsed else {
+        let parsed: SessionUpdate =
+            serde_json::from_value(ext["params"]["update"].clone()).unwrap();
+        let SessionUpdate::SubagentFinished {
+            status,
+            child_session_id,
+            ..
+        } = parsed
+        else {
             panic!("expected SubagentFinished");
         };
         assert_eq!(child_session_id, "child-1");
@@ -1022,7 +1029,10 @@ mod tests {
         let mut msg = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}});
         advertise_cursor_client(&mut msg);
         assert_eq!(msg["params"]["clientCapabilities"]["subagents"], true);
-        assert_eq!(msg["params"]["clientCapabilities"]["_meta"]["subagents"], true);
+        assert_eq!(
+            msg["params"]["clientCapabilities"]["_meta"]["subagents"],
+            true
+        );
     }
 
     #[test]

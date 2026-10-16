@@ -73,20 +73,21 @@ impl SessionActor {
             }
             BuiltinAction::ContextInfo => ok_end_turn(0, None),
             BuiltinAction::HooksTrust => {
-                let msg = match Self::do_hooks_trust_project(&self.session_info.cwd) {
-                    Ok(root) => {
-                        xai_grok_telemetry::session_ctx::log_event(
-                            xai_grok_telemetry::events::HookTrusted { success: true },
-                        );
-                        format!("Trusted: {}.", root.display())
-                    }
-                    Err(e) => {
-                        xai_grok_telemetry::session_ctx::log_event(
-                            xai_grok_telemetry::events::HookTrusted { success: false },
-                        );
-                        e
-                    }
-                };
+                let msg =
+                    match crate::extensions::hook_actions::trust_project(&self.session_info.cwd) {
+                        Ok(root) => {
+                            xai_grok_telemetry::session_ctx::log_event(
+                                xai_grok_telemetry::events::HookTrusted { success: true },
+                            );
+                            format!("Trusted: {}.", root.display())
+                        }
+                        Err(e) => {
+                            xai_grok_telemetry::session_ctx::log_event(
+                                xai_grok_telemetry::events::HookTrusted { success: false },
+                            );
+                            e
+                        }
+                    };
                 self.send_host_turn_slash_command_output(&msg).await;
                 ok_end_turn(0, None)
             }
@@ -201,7 +202,9 @@ impl SessionActor {
                 ok_end_turn(0, None)
             }
             BuiltinAction::HooksUntrust => {
-                let msg = match Self::do_hooks_untrust_project(&self.session_info.cwd) {
+                let msg = match crate::extensions::hook_actions::untrust_project(
+                    &self.session_info.cwd,
+                ) {
                     Ok((root, true)) => format!("Untrusted: {}.", root.display()),
                     Ok((root, false)) => format!("Not currently trusted: {}", root.display()),
                     Err(e) => e,

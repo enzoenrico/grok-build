@@ -6,6 +6,12 @@ fn parse(routed: &Routed) -> Value {
     match routed {
         Routed::ToAgent(s) | Routed::ToClient(s) => serde_json::from_str(s).unwrap(),
         Routed::Cloud { .. } => panic!("expected a JSON line, got a cloud handoff"),
+        Routed::Catalog(request) => {
+            panic!("expected a JSON line, got a catalog request: {request:?}")
+        }
+        Routed::RecordPrompt { prompt, .. } => {
+            panic!("expected a JSON line, got a prompt-history entry: {prompt:?}")
+        }
     }
 }
 
@@ -38,7 +44,7 @@ fn session_new_response(id: u64) -> String {
 fn grok_extension_requests_are_answered_locally() {
     let mut adapter = CursorAdapter::new(None, false);
     let out =
-        adapter.outbound(r#"{"jsonrpc":"2.0","id":7,"method":"_x.ai/session/list","params":{}}"#);
+        adapter.outbound(r#"{"jsonrpc":"2.0","id":7,"method":"_x.ai/queue/clear","params":{}}"#);
     assert_eq!(out.len(), 1);
     let Routed::ToClient(line) = &out[0] else {
         panic!("extension request must not reach cursor: {out:?}");
@@ -184,16 +190,14 @@ fn mcp_servers_are_dropped_unless_forwarded() {
     let mut dropped = CursorAdapter::new(None, false);
     let auth = dropped.outbound(req);
     assert_eq!(parse(&auth[0])["params"]["methodId"], "cursor_login");
-    let released = dropped.inbound(
-        r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","result":{}}"#,
-    );
+    let released =
+        dropped.inbound(r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","result":{}}"#);
     assert_eq!(parse(&released[0])["params"]["mcpServers"], json!([]));
 
     let mut forwarded = CursorAdapter::new(None, true);
     forwarded.outbound(req);
-    let released = forwarded.inbound(
-        r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","result":{}}"#,
-    );
+    let released =
+        forwarded.inbound(r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","result":{}}"#);
     assert_eq!(parse(&released[0])["params"]["mcpServers"][0]["name"], "x");
 }
 
@@ -214,10 +218,12 @@ fn session_new_waits_for_cursor_login() {
         r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","error":{"code":-32000,"message":"Authentication required"}}"#,
     );
     assert_eq!(failed.len(), 2);
-    assert!(parse(&failed[0])["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("agent login"));
+    assert!(
+        parse(&failed[0])["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("agent login")
+    );
 
     let again = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":6,"method":"authenticate","params":{"methodId":"xai.api_key"}}"#,
@@ -242,10 +248,12 @@ fn session_new_waits_for_cursor_login() {
     let notices = stalled.auth_timed_out();
     assert_eq!(notices.len(), 1);
     let notice: Value = serde_json::from_str(&notices[0]).unwrap();
-    assert!(notice["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("agent login"));
+    assert!(
+        notice["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("agent login")
+    );
     let after = stalled.outbound(
         r#"{"jsonrpc":"2.0","id":10,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
     );
@@ -365,7 +373,10 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
         panic!("expected a cloud handoff: {sent:?}");
     };
     assert_eq!(session_id, "s1");
-    assert_eq!(request, &CloudRequest::Send("refactor the auth module".to_owned()));
+    assert_eq!(
+        request,
+        &CloudRequest::Send("refactor the auth module".to_owned())
+    );
     assert_eq!(agent_id, &None);
     assert_eq!(prompt_rpc_id.as_ref().and_then(Value::as_u64), Some(4));
     assert_eq!(prompt_id, &None);
@@ -418,7 +429,10 @@ fn bare_ampersand_refreshes_the_recorded_agent() {
     assert_eq!(end["result"]["_meta"]["promptId"], "p-9");
     let closed: agent_client_protocol::PromptResponse =
         serde_json::from_value(end["result"].clone()).expect("pager prompt result");
-    assert_eq!(closed.stop_reason, agent_client_protocol::StopReason::EndTurn);
+    assert_eq!(
+        closed.stop_reason,
+        agent_client_protocol::StopReason::EndTurn
+    );
 
     adapter.note_cloud_agent("s1", "bc-123");
     for text in ["&", "& ", "& status", "& Status"] {
@@ -468,7 +482,10 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
         let handoff = adapter.outbound(&format!(
             r#"{{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{{"sessionId":"{id}","prompt":[{{"type":"text","text":"& ship it"}}]}}}}"#
         ));
-        let Routed::Cloud { request, agent_id, .. } = &handoff[0] else {
+        let Routed::Cloud {
+            request, agent_id, ..
+        } = &handoff[0]
+        else {
             panic!("expected a cloud handoff: {handoff:?}");
         };
         assert_eq!(request, &CloudRequest::Send("ship it".to_owned()));
@@ -491,7 +508,10 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
         r#"{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{"sessionId":"s2","prompt":[{"type":"text","text":"please /review the diff"}]}}"#,
     );
     let sent = parse(&second[0]);
-    assert_eq!(sent["params"]["prompt"][0]["text"], "/review please the diff");
+    assert_eq!(
+        sent["params"]["prompt"][0]["text"],
+        "/review please the diff"
+    );
     assert!(sent["params"].get("_meta").is_none());
     let again = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{"sessionId":"s2","prompt":[{"type":"text","text":"& keep going"}]}}"#,
@@ -515,14 +535,20 @@ fn cursor_subagent_updates_become_child_session_notices() {
     );
     let notice = parse(&spawned[0]);
     assert_eq!(notice["method"], "_x.ai/session_notification");
-    assert_eq!(notice["params"]["update"]["sessionUpdate"], "subagent_spawned");
+    assert_eq!(
+        notice["params"]["update"]["sessionUpdate"],
+        "subagent_spawned"
+    );
     assert_eq!(notice["params"]["update"]["child_session_id"], "child-1");
     assert_eq!(notice["params"]["update"]["parent_session_id"], "s1");
 
     let init = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#,
     );
-    assert_eq!(parse(&init[0])["params"]["clientCapabilities"]["subagents"], true);
+    assert_eq!(
+        parse(&init[0])["params"]["clientCapabilities"]["subagents"],
+        true
+    );
 }
 
 #[test]
@@ -812,3 +838,570 @@ fn cursor_models_enrich_meta_and_apply_parameter_overrides() {
     );
 }
 
+/// Every catalog method the pager sends for the skills, hooks, plugins, marketplace, workflows, commands, and MCP
+/// surfaces, with the params it sends them with.
+fn catalog_requests() -> Vec<(&'static str, Value)> {
+    let session = json!({ "sessionId": "s1" });
+    vec![
+        (
+            "x.ai/skills/list",
+            json!({ "cwd": ".", "sessionId": "s1", "refresh": true }),
+        ),
+        ("x.ai/skills/config", json!({ "cwd": "." })),
+        ("x.ai/skills/refresh-baseline", json!({})),
+        ("x.ai/workflows/list", session.clone()),
+        ("x.ai/commands/list", session.clone()),
+        ("x.ai/hooks/list", session.clone()),
+        (
+            "x.ai/hooks/action",
+            json!({ "sessionId": "s1", "action": { "type": "reload" } }),
+        ),
+        ("x.ai/plugins/list", session.clone()),
+        (
+            "x.ai/plugins/action",
+            json!({ "sessionId": "s1", "action": { "type": "reload" } }),
+        ),
+        ("x.ai/plugins/reload", json!({})),
+        (
+            "x.ai/plugins/notify-updates",
+            json!({ "sessionId": "s1", "updates": [] }),
+        ),
+        ("x.ai/marketplace/list", session.clone()),
+        (
+            "x.ai/marketplace/action",
+            json!({ "sessionId": "s1", "action": { "type": "refresh" } }),
+        ),
+        ("x.ai/mcp/list", json!({ "sessionId": "s1", "cache": true })),
+        (
+            "x.ai/mcp/toggle",
+            json!({ "session_id": "s1", "server_name": "web", "enabled": true }),
+        ),
+    ]
+}
+
+/// A stand-in for the Cursor CLI's `agent mcp` commands; toggles are appended to `.toggles` in the cwd.
+#[cfg(unix)]
+fn fake_cursor_cli(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-cursor-agent");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+case "$1 $2" in
+  "mcp list") printf 'echo: ready\nweb: not loaded (needs approval)\n' ;;
+  "mcp list-tools") printf 'Tools for %s (1):\n- ping ()\n' "$3" ;;
+  "mcp enable"|"mcp disable") echo "$2 $3" >> .toggles ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(not(unix))]
+fn fake_cursor_cli(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("fake-cursor-agent")
+}
+
+fn no_disabled_skills() -> HashSet<String> {
+    HashSet::new()
+}
+
+fn lint_disabled() -> HashSet<String> {
+    HashSet::from(["lint".to_owned()])
+}
+
+/// An adapter with session `s1` open in `cwd` and Cursor's command catalog announced.
+fn adapter_with_session(cwd: &std::path::Path, disabled: fn() -> HashSet<String>) -> CursorAdapter {
+    let mut adapter = CursorAdapter::new(None, false)
+        .with_disabled_skills(disabled)
+        .with_cursor_program(fake_cursor_cli(cwd));
+    adapter.outbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": { "cwd": cwd, "mcpServers": [] },
+        })
+        .to_string(),
+    );
+    adapter.inbound(&session_new_response(1));
+    adapter.inbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        { "name": "cursor-team-review", "description": "Team review" },
+                        { "name": "lint", "description": "Lint" },
+                        { "name": "copy-request-id", "description": "Copy the last request ID" },
+                    ],
+                },
+            },
+        })
+        .to_string(),
+    );
+    adapter
+}
+
+fn catalog_request(
+    adapter: &mut CursorAdapter,
+    id: u64,
+    method: &str,
+    params: &Value,
+) -> CatalogRequest {
+    let out = adapter.outbound(
+        &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string(),
+    );
+    assert_eq!(out.len(), 1, "{method}: {out:?}");
+    let Routed::Catalog(request) = &out[0] else {
+        panic!("{method} must be answered locally, got {out:?}");
+    };
+    (**request).clone()
+}
+
+#[test]
+fn catalog_methods_are_answered_locally_for_the_session_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut adapter = adapter_with_session(dir.path(), no_disabled_skills);
+
+    for (index, (method, params)) in catalog_requests().into_iter().enumerate() {
+        for wire in [method.to_owned(), format!("_{method}")] {
+            let id = 100 + index as u64;
+            let request = catalog_request(&mut adapter, id, &wire, &params);
+            assert_eq!(request.method, method);
+            assert_eq!(request.id, json!(id));
+            assert_eq!(request.cwd, dir.path());
+            assert_eq!(request.session_id.as_deref(), Some("s1"));
+            assert_eq!(request.params, params);
+            let catalog = &request.sessions[0];
+            assert_eq!(catalog.0, "s1");
+            assert_eq!(
+                catalog
+                    .1
+                    .iter()
+                    .map(|c| c["name"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["cursor-team-review", "lint", "copy-request-id"]
+            );
+        }
+    }
+}
+
+#[test]
+fn catalog_notifications_are_dropped() {
+    let mut adapter = CursorAdapter::new(None, false);
+    assert!(
+        adapter
+            .outbound(r#"{"jsonrpc":"2.0","method":"_x.ai/skills/list","params":{"cwd":"."}}"#)
+            .is_empty()
+    );
+}
+
+#[test]
+fn every_catalog_method_succeeds_on_the_cursor_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut adapter = adapter_with_session(dir.path(), no_disabled_skills);
+
+    for (index, (method, params)) in catalog_requests().into_iter().enumerate() {
+        let id = 200 + index as u64;
+        let request = catalog_request(&mut adapter, id, &format!("_{method}"), &params);
+        let lines = catalog::answer_blocking(request);
+        let reply: Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(reply["id"], json!(id), "{method}: {reply}");
+        assert!(reply.get("error").is_none(), "{method} failed: {reply}");
+        let result = &reply["result"];
+        assert!(
+            result.get("error").is_none_or(Value::is_null),
+            "{method} answered an error: {reply}"
+        );
+        match method {
+            "x.ai/skills/list" => {
+                let names: Vec<&str> = result["result"]["skills"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|s| s["name"].as_str())
+                    .collect();
+                assert!(names.contains(&"cursor-team-review"), "{names:?}");
+                assert!(!names.contains(&"copy-request-id"), "{names:?}");
+            }
+            "x.ai/commands/list" => {
+                let names: Vec<&str> = result["commands"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|c| c["name"].as_str())
+                    .collect();
+                assert_eq!(names, ["cursor-team-review", "lint", "copy-request-id"]);
+            }
+            "x.ai/skills/config" => assert!(result["result"]["skills"].is_array()),
+            "x.ai/workflows/list" => assert!(result["result"]["workflows"].is_array()),
+            "x.ai/hooks/list" => assert!(result["result"]["hooks"].is_array()),
+            "x.ai/plugins/list" => assert!(result["result"]["plugins"].is_array()),
+            "x.ai/marketplace/list" => assert!(result["result"]["sources"].is_array()),
+            "x.ai/hooks/action" | "x.ai/plugins/action" | "x.ai/marketplace/action" => {
+                assert_eq!(result["result"]["status"], "success", "{method}: {reply}");
+            }
+            "x.ai/mcp/list" => assert!(result["servers"].is_array(), "{reply}"),
+            "x.ai/mcp/toggle" => assert_eq!(result, &json!({})),
+            _ => assert_eq!(result["result"]["ok"], true, "{method}: {reply}"),
+        }
+    }
+}
+
+#[test]
+fn refresh_baseline_republishes_each_sessions_cursor_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut adapter = adapter_with_session(dir.path(), no_disabled_skills);
+
+    let request = catalog_request(&mut adapter, 9, "_x.ai/skills/refresh-baseline", &json!({}));
+    let lines = catalog::answer_blocking(request);
+
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let update: Value = serde_json::from_str(&lines[1]).unwrap();
+    assert_eq!(update["method"], "session/update");
+    assert_eq!(update["params"]["sessionId"], "s1");
+    assert_eq!(
+        update["params"]["update"]["sessionUpdate"],
+        "available_commands_update"
+    );
+    assert!(update["params"]["update"]["availableCommands"].is_array());
+}
+
+#[test]
+fn disabled_skills_leave_the_slash_menu_but_stay_in_the_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut adapter = CursorAdapter::new(None, false).with_disabled_skills(lint_disabled);
+    adapter.outbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": { "cwd": dir.path(), "mcpServers": [] },
+        })
+        .to_string(),
+    );
+    adapter.inbound(&session_new_response(1));
+    let forwarded = adapter.inbound(
+        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"lint","description":"Lint"},{"name":"review","description":"Review"}]}}}"#,
+    );
+
+    let shown: Vec<String> = parse(&forwarded[0])["params"]["update"]["availableCommands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(shown, ["review"]);
+
+    let request = catalog_request(&mut adapter, 2, "x.ai/skills/list", &json!({ "cwd": "." }));
+    let names: Vec<&str> = request.sessions[0]
+        .1
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert_eq!(names, ["lint", "review"]);
+}
+
+#[test]
+fn cursor_skills_become_skill_entries_once() {
+    let commands = vec![
+        json!({ "name": "lint", "description": "Lint", "_meta": { "path": "cursor://skills/lint", "scope": "user" } }),
+        json!({ "name": "lint", "description": "Lint again", "_meta": { "path": "cursor://skills/lint", "scope": "user" } }),
+        json!({ "name": "copy-request-id", "description": "Copy" }),
+        json!({ "name": "deploy", "description": "", "_meta": { "path": "/repo/.cursor/skills/deploy/SKILL.md", "scope": "project" } }),
+    ];
+
+    let skills = catalog::cursor_skills(&commands);
+
+    assert_eq!(
+        skills
+            .iter()
+            .map(|s| (s.name.as_str(), s.path.as_str(), s.description.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("lint", "cursor://skills/lint", "Lint"),
+            ("deploy", "/repo/.cursor/skills/deploy/SKILL.md", "deploy"),
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcps_come_from_the_cursor_cli_and_toggle_through_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut adapter = adapter_with_session(dir.path(), no_disabled_skills);
+
+    let listed = catalog::answer_blocking(catalog_request(
+        &mut adapter,
+        3,
+        "_x.ai/mcp/list",
+        &json!({ "sessionId": "s1", "cache": false }),
+    ));
+    let reply: Value = serde_json::from_str(&listed[0]).unwrap();
+    assert_eq!(
+        reply["result"]["servers"],
+        json!([
+            {
+                "name": "echo",
+                "source": "local",
+                "sourceLabel": "Cursor",
+                "session": { "enabled": true, "status": "ready", "tools": [{ "name": "ping" }] },
+            },
+            {
+                "name": "web",
+                "source": "local",
+                "sourceLabel": "Cursor",
+                "session": { "enabled": false, "status": "unavailable", "tools": [] },
+            },
+        ])
+    );
+
+    for (id, enabled) in [(4, true), (5, false)] {
+        let toggled = catalog::answer_blocking(catalog_request(
+            &mut adapter,
+            id,
+            "_x.ai/mcp/toggle",
+            &json!({ "session_id": "s1", "server_name": "web", "enabled": enabled }),
+        ));
+        let reply: Value = serde_json::from_str(&toggled[0]).unwrap();
+        assert!(reply.get("error").is_none(), "{reply}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".toggles")).unwrap(),
+        "enable web\ndisable web\n"
+    );
+
+    let missing = catalog::answer_blocking(catalog_request(
+        &mut adapter,
+        6,
+        "_x.ai/mcp/toggle",
+        &json!({ "session_id": "s1", "enabled": true }),
+    ));
+    let reply: Value = serde_json::from_str(&missing[0]).unwrap();
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("server_name")
+    );
+}
+
+#[test]
+fn prompts_are_recorded_and_prompt_history_reads_them_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_string_lossy().into_owned();
+    let mut adapter = adapter_with_session(dir.path(), no_disabled_skills);
+
+    let sent = adapter.outbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "s1",
+                "_meta": { "promptId": "p-1" },
+                "prompt": [{ "type": "text", "text": " fix the flaky test " }, { "type": "image", "data": "" }],
+            },
+        })
+        .to_string(),
+    );
+    assert_eq!(parse(&sent[0])["method"], "session/prompt");
+    let Some(Routed::RecordPrompt {
+        cwd: recorded_cwd,
+        session_id,
+        prompt_id,
+        prompt,
+    }) = sent.get(1)
+    else {
+        panic!("the prompt must be recorded: {sent:?}");
+    };
+    assert_eq!(
+        (
+            recorded_cwd.as_str(),
+            session_id.as_str(),
+            prompt_id.as_deref(),
+            prompt.as_str()
+        ),
+        (cwd.as_str(), "s1", Some("p-1"), "fix the flaky test")
+    );
+
+    xai_grok_shell::extensions::catalog::record_prompt(
+        recorded_cwd,
+        session_id,
+        prompt_id.as_deref(),
+        prompt,
+    );
+    let request = catalog_request(
+        &mut adapter,
+        4,
+        "_x.ai/prompt_history",
+        &json!({ "cwd": cwd, "filter_session_id": "s1" }),
+    );
+    let lines = catalog::answer_blocking(request);
+    let _ = std::fs::remove_dir_all(xai_grok_config::sessions_cwd_dir(&cwd));
+    let reply: Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(reply["result"]["prompts"], json!(["fix the flaky test"]));
+
+    let unknown_session = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":"s9","prompt":[{"type":"text","text":"hi"}]}}"#,
+    );
+    assert_eq!(
+        unknown_session.len(),
+        1,
+        "no cwd, nothing to record: {unknown_session:?}"
+    );
+}
+
+#[test]
+fn other_grok_extensions_stay_unsupported() {
+    let mut adapter = CursorAdapter::new(None, false);
+    for method in [
+        "_x.ai/queue/clear",
+        "_x.ai/rewind/points",
+        "_x.ai/memory/flush",
+    ] {
+        let out = adapter.outbound(
+            &json!({ "jsonrpc": "2.0", "id": 5, "method": method, "params": {} }).to_string(),
+        );
+        assert_eq!(
+            parse(&out[0])["error"]["code"],
+            METHOD_NOT_FOUND,
+            "{method}"
+        );
+    }
+}
+
+/// An adapter whose Cursor login already went through, so requests reach Cursor directly.
+fn authenticated_adapter() -> CursorAdapter {
+    let mut adapter = CursorAdapter::new(None, false);
+    adapter.outbound(r#"{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{}}"#);
+    adapter.inbound(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+    adapter
+}
+
+fn session_list(adapter: &mut CursorAdapter, id: u64, params: Value) -> Vec<Routed> {
+    adapter.outbound(
+        &json!({ "jsonrpc": "2.0", "id": id, "method": "_x.ai/session/list", "params": params })
+            .to_string(),
+    )
+}
+
+#[test]
+fn session_list_reads_cursors_chats_as_picker_rows() {
+    let mut adapter = authenticated_adapter();
+    let out = session_list(
+        &mut adapter,
+        7,
+        json!({ "cwd": "/repo", "limit": 2, "headless": false, "query": "Auth" }),
+    );
+    let forwarded = parse(&out[0]);
+    assert_eq!(forwarded["method"], "session/list");
+    assert_eq!(forwarded["params"], json!({ "cwd": "/repo" }));
+
+    let reply = adapter.inbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": forwarded["id"],
+            "result": { "sessions": [
+                { "sessionId": "c1", "cwd": "/repo", "title": "Fix auth", "updatedAt": "2026-10-16T09:00:00Z" },
+                { "sessionId": "c2", "cwd": "/repo", "title": "Docs" },
+                { "sessionId": "c3", "cwd": "/repo", "title": "auth tests", "updatedAt": "2026-10-15T09:00:00Z" },
+                { "sessionId": "c4", "cwd": "/repo", "title": "More auth" },
+            ] },
+        })
+        .to_string(),
+    );
+    let Routed::ToClient(line) = &reply[0] else {
+        panic!("the list must answer the pager: {reply:?}");
+    };
+    let resp: Value = serde_json::from_str(line).unwrap();
+    assert_eq!(resp["id"], 7);
+    assert_eq!(
+        resp["result"]["sessions"],
+        json!([
+            { "sessionId": "c1", "summary": "Fix auth", "source": "local", "cwd": "/repo", "updatedAt": "2026-10-16T09:00:00Z" },
+            { "sessionId": "c3", "summary": "auth tests", "source": "local", "cwd": "/repo", "updatedAt": "2026-10-15T09:00:00Z" },
+        ])
+    );
+}
+
+#[test]
+fn session_list_without_an_absolute_cwd_lists_every_chat() {
+    let mut adapter = authenticated_adapter();
+    let out = session_list(&mut adapter, 7, json!({ "cwd": "." }));
+    let forwarded = parse(&out[0]);
+    assert_eq!(forwarded["params"], json!({}));
+    let reply = adapter.inbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": forwarded["id"],
+            "result": { "sessions": [{ "sessionId": "c1", "title": "  " }] },
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        parse(&reply[0])["result"]["sessions"],
+        json!([{ "sessionId": "c1", "summary": "Cursor chat", "source": "local" }])
+    );
+}
+
+#[test]
+fn a_failed_cursor_session_list_is_an_empty_list() {
+    let mut adapter = authenticated_adapter();
+    let forwarded = parse(&session_list(&mut adapter, 7, json!({ "cwd": "/repo" }))[0]);
+    let reply = adapter.inbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": forwarded["id"],
+            "error": { "code": -32000, "message": "Authentication required" },
+        })
+        .to_string(),
+    );
+    let resp = parse(&reply[0]);
+    assert_eq!(resp["id"], 7);
+    assert_eq!(resp["result"]["sessions"], json!([]));
+}
+
+#[test]
+fn session_list_waits_for_cursor_login() {
+    let mut adapter = CursorAdapter::new(None, false);
+    let first = session_list(&mut adapter, 7, json!({ "cwd": "/repo" }));
+    assert_eq!(first.len(), 1);
+    assert_eq!(parse(&first[0])["method"], "authenticate");
+    let released =
+        adapter.inbound(r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","result":{}}"#);
+    assert_eq!(parse(&released[0])["method"], "session/list");
+
+    let mut logged_out = CursorAdapter::new(None, false);
+    session_list(&mut logged_out, 8, json!({ "cwd": "/repo" }));
+    let failed = logged_out.inbound(
+        r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","error":{"code":-32000,"message":"Authentication required"}}"#,
+    );
+    let resp = parse(&failed[0]);
+    assert_eq!(resp["id"], 8);
+    assert_eq!(resp["result"]["sessions"], json!([]));
+
+    let mut stalled = CursorAdapter::new(None, false);
+    session_list(&mut stalled, 9, json!({ "cwd": "/repo" }));
+    let notices = stalled.auth_timed_out();
+    let resp: Value = serde_json::from_str(&notices[0]).unwrap();
+    assert_eq!(resp["id"], 9);
+    assert_eq!(resp["result"]["sessions"], json!([]));
+}
+
+#[test]
+fn session_list_notifications_are_dropped() {
+    let mut adapter = authenticated_adapter();
+    assert!(
+        adapter
+            .outbound(r#"{"jsonrpc":"2.0","method":"_x.ai/session/list","params":{}}"#)
+            .is_empty()
+    );
+}
