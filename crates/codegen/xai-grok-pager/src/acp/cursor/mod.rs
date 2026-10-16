@@ -6,6 +6,7 @@
 mod adapter;
 mod catalog;
 mod cloud;
+mod mcp;
 pub(crate) mod protocol;
 mod startup;
 
@@ -367,10 +368,10 @@ impl CursorIo {
         let mut stdin = child.stdin.take().context("cursor-agent stdin")?;
         let stdout = child.stdout.take().context("cursor-agent stdout")?;
         let stderr = child.stderr.take().context("cursor-agent stderr")?;
-        let adapter = Arc::new(Mutex::new(CursorAdapter::new(
-            command.default_model.clone(),
-            command.forward_mcp_servers,
-        )));
+        let adapter = Arc::new(Mutex::new(
+            CursorAdapter::new(command.default_model.clone(), command.forward_mcp_servers)
+                .with_cursor_program(resolve_cursor_program(&command.program)),
+        ));
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
 
         let deliver = {

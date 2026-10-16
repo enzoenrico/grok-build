@@ -44,7 +44,8 @@ pub(crate) enum Routed {
         prompt_rpc_id: Option<Value>,
         prompt_id: Option<String>,
     },
-    /// Answer a skills/hooks/plugins/marketplace/workflows/commands request locally; Cursor has none of them.
+    /// Answer a skills/hooks/plugins/marketplace/workflows/commands/MCP request off the ACP connection; Cursor's ACP has
+    /// none of them.
     Catalog(Box<CatalogRequest>),
 }
 
@@ -99,6 +100,8 @@ pub(crate) struct CursorAdapter {
     disabled_skills: Option<fn() -> HashSet<String>>,
     /// `x.ai/session/list` requests forwarded to Cursor as ACP `session/list`, keyed by the internal id.
     session_lists: HashMap<String, SessionListRequest>,
+    /// The resolved Cursor CLI, for catalog methods answered with `agent` subcommands.
+    cursor_program: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -792,6 +795,7 @@ impl CursorAdapter {
         let params = params.cloned().unwrap_or_else(|| json!({}));
         let session_id = params
             .get("sessionId")
+            .or_else(|| params.get("session_id"))
             .and_then(Value::as_str)
             .filter(|id| self.sessions.contains_key(*id))
             .map(str::to_owned)
@@ -820,7 +824,16 @@ impl CursorAdapter {
             cwd,
             session_id,
             sessions,
+            cursor_program: self
+                .cursor_program
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(super::DEFAULT_CURSOR_AGENT_BIN)),
         }
+    }
+
+    pub(crate) fn with_cursor_program(mut self, program: PathBuf) -> Self {
+        self.cursor_program = Some(program);
+        self
     }
 
     #[cfg(test)]

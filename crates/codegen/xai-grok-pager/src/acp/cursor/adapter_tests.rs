@@ -835,7 +835,7 @@ fn cursor_models_enrich_meta_and_apply_parameter_overrides() {
     );
 }
 
-/// Every catalog method the pager sends for the skills, hooks, plugins, marketplace, workflows, and commands
+/// Every catalog method the pager sends for the skills, hooks, plugins, marketplace, workflows, commands, and MCP
 /// surfaces, with the params it sends them with.
 fn catalog_requests() -> Vec<(&'static str, Value)> {
     let session = json!({ "sessionId": "s1" });
@@ -868,7 +868,38 @@ fn catalog_requests() -> Vec<(&'static str, Value)> {
             "x.ai/marketplace/action",
             json!({ "sessionId": "s1", "action": { "type": "refresh" } }),
         ),
+        ("x.ai/mcp/list", json!({ "sessionId": "s1", "cache": true })),
+        (
+            "x.ai/mcp/toggle",
+            json!({ "session_id": "s1", "server_name": "web", "enabled": true }),
+        ),
     ]
+}
+
+/// A stand-in for the Cursor CLI's `agent mcp` commands; toggles are appended to `.toggles` in the cwd.
+#[cfg(unix)]
+fn fake_cursor_cli(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-cursor-agent");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+case "$1 $2" in
+  "mcp list") printf 'echo: ready\nweb: not loaded (needs approval)\n' ;;
+  "mcp list-tools") printf 'Tools for %s (1):\n- ping ()\n' "$3" ;;
+  "mcp enable"|"mcp disable") echo "$2 $3" >> .toggles ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[cfg(not(unix))]
+fn fake_cursor_cli(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("fake-cursor-agent")
 }
 
 fn no_disabled_skills() -> HashSet<String> {
@@ -881,7 +912,9 @@ fn lint_disabled() -> HashSet<String> {
 
 /// An adapter with session `s1` open in `cwd` and Cursor's command catalog announced.
 fn adapter_with_session(cwd: &std::path::Path, disabled: fn() -> HashSet<String>) -> CursorAdapter {
-    let mut adapter = CursorAdapter::new(None, false).with_disabled_skills(disabled);
+    let mut adapter = CursorAdapter::new(None, false)
+        .with_disabled_skills(disabled)
+        .with_cursor_program(fake_cursor_cli(cwd));
     adapter.outbound(
         &json!({
             "jsonrpc": "2.0",
@@ -1012,6 +1045,8 @@ fn every_catalog_method_succeeds_on_the_cursor_backend() {
             "x.ai/hooks/action" | "x.ai/plugins/action" | "x.ai/marketplace/action" => {
                 assert_eq!(result["result"]["status"], "success", "{method}: {reply}");
             }
+            "x.ai/mcp/list" => assert!(result["servers"].is_array(), "{reply}"),
+            "x.ai/mcp/toggle" => assert_eq!(result, &json!({})),
             _ => assert_eq!(result["result"]["ok"], true, "{method}: {reply}"),
         }
     }
@@ -1091,6 +1126,67 @@ fn cursor_skills_become_skill_entries_once() {
             ("lint", "cursor://skills/lint", "Lint"),
             ("deploy", "/repo/.cursor/skills/deploy/SKILL.md", "deploy"),
         ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcps_come_from_the_cursor_cli_and_toggle_through_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut adapter = adapter_with_session(dir.path(), no_disabled_skills);
+
+    let listed = catalog::answer_blocking(catalog_request(
+        &mut adapter,
+        3,
+        "_x.ai/mcp/list",
+        &json!({ "sessionId": "s1", "cache": false }),
+    ));
+    let reply: Value = serde_json::from_str(&listed[0]).unwrap();
+    assert_eq!(
+        reply["result"]["servers"],
+        json!([
+            {
+                "name": "echo",
+                "source": "local",
+                "sourceLabel": "Cursor",
+                "session": { "enabled": true, "status": "ready", "tools": [{ "name": "ping" }] },
+            },
+            {
+                "name": "web",
+                "source": "local",
+                "sourceLabel": "Cursor",
+                "session": { "enabled": false, "status": "unavailable", "tools": [] },
+            },
+        ])
+    );
+
+    for (id, enabled) in [(4, true), (5, false)] {
+        let toggled = catalog::answer_blocking(catalog_request(
+            &mut adapter,
+            id,
+            "_x.ai/mcp/toggle",
+            &json!({ "session_id": "s1", "server_name": "web", "enabled": enabled }),
+        ));
+        let reply: Value = serde_json::from_str(&toggled[0]).unwrap();
+        assert!(reply.get("error").is_none(), "{reply}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".toggles")).unwrap(),
+        "enable web\ndisable web\n"
+    );
+
+    let missing = catalog::answer_blocking(catalog_request(
+        &mut adapter,
+        6,
+        "_x.ai/mcp/toggle",
+        &json!({ "session_id": "s1", "enabled": true }),
+    ));
+    let reply: Value = serde_json::from_str(&missing[0]).unwrap();
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("server_name")
     );
 }
 

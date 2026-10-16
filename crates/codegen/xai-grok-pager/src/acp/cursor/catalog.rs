@@ -4,7 +4,7 @@
 //! ([`xai_grok_shell::extensions::catalog`]) for the session's cwd. The grok loaders already read Cursor's own
 //! files (`.cursor/skills`, `hooks.json`, Cursor plugins and local marketplaces). Cursor's `available_commands_update`
 //! catalog is the one list only Cursor knows (team and dashboard commands); its skills are merged into the skills
-//! list and it stays the slash-command catalog.
+//! list and it stays the slash-command catalog. MCP servers are Cursor's alone, so `/mcps` asks the Cursor CLI.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use xai_grok_agent::prompt::skills::SkillInfo;
 use xai_grok_shell::extensions::catalog as shell_catalog;
 
-use super::protocol;
+use super::{mcp, protocol};
 
 const COMMANDS_LIST: &str = "x.ai/commands/list";
 const SKILLS_LIST: &str = "x.ai/skills/list";
@@ -31,15 +31,17 @@ pub(crate) struct CatalogRequest {
     pub session_id: Option<String>,
     /// Every session's latest Cursor command catalog (normalized), keyed by session id.
     pub sessions: Vec<(String, Vec<Value>)>,
+    /// The Cursor CLI, for the methods only Cursor can answer (`agent mcp ...`).
+    pub cursor_program: PathBuf,
 }
 
 /// The bare method name when it is answered here.
 pub(crate) fn catalog_method(method: &str) -> Option<&'static str> {
     let bare = method.strip_prefix('_').unwrap_or(method);
-    if bare == COMMANDS_LIST {
-        return Some(COMMANDS_LIST);
-    }
-    shell_catalog::catalog_method(bare)
+    [COMMANDS_LIST, mcp::MCP_LIST, mcp::MCP_TOGGLE]
+        .into_iter()
+        .find(|m| *m == bare)
+        .or_else(|| shell_catalog::catalog_method(bare))
 }
 
 /// Answer on a dedicated thread: the grok handlers are `!Send` and do blocking disk and git work.
@@ -80,6 +82,19 @@ pub(crate) fn answer_blocking(request: CatalogRequest) -> Vec<String> {
 
 /// The JSON-RPC response for `request`, then any notifications it implies.
 pub(crate) async fn answer(request: CatalogRequest) -> Vec<String> {
+    let cursor_cli = match request.method {
+        mcp::MCP_LIST => Some(mcp::list(&request.cursor_program, &request.cwd).await),
+        mcp::MCP_TOGGLE => {
+            Some(mcp::toggle(&request.cursor_program, &request.cwd, &request.params).await)
+        }
+        _ => None,
+    };
+    if let Some(answered) = cursor_cli {
+        return vec![match answered {
+            Ok(result) => result_line(&request.id, result),
+            Err(message) => error_line(&request.id, -32603, &message),
+        }];
+    }
     let agent_skills = cursor_skills(request_commands(&request));
     if request.method == COMMANDS_LIST {
         let commands = commands_list(&request, &agent_skills).await;
