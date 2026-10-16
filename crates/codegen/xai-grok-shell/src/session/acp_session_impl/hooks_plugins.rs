@@ -908,7 +908,12 @@ impl SessionActor {
         let t_hooks = std::time::Instant::now();
         let new_specs = new_registry_snapshot
             .as_deref()
-            .map(xai_grok_agent::plugins::hooks_adapter::active_plugin_hook_specs)
+            .map(|registry| {
+                xai_grok_agent::plugins::hooks_adapter::active_plugin_hook_specs_filtered(
+                    registry,
+                    self.rebuild_spec.compat.cursor.hooks,
+                )
+            })
             .unwrap_or_default();
         let hooks_reloaded = new_specs.len();
         let current = self.hook_registry.borrow().clone();

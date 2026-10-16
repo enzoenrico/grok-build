@@ -377,6 +377,48 @@ Marketplaces distribute Grok content: skills, commands, agents, hooks, and MCP s
 
 ---
 
+## Cursor plugins
+
+Grok loads the plugins you installed in Cursor and can manage Cursor's local marketplaces, so the Cursor agent CLI, the Cursor IDE, and Grok share one set of plugins.
+
+### What loads
+
+| Source | Where | Notes |
+|--------|-------|-------|
+| Marketplace installs | `~/.cursor/plugins/cache/<marketplace>/<plugin>/<version>/` | Only versions with a `.cache-complete` marker. When Cursor's `cache/.cloud-plugin-manifest.json` is present it names the installs; otherwise Grok takes the newest complete version of each plugin, skipping ones `local-marketplaces.json` marks as not enabled. |
+| Hand-placed plugins | `~/.cursor/plugins/local/<plugin>/` | Directories or symlinks that resolve inside `plugins/local`. Dot-named entries are skipped. |
+
+`CURSOR_CONFIG_DIR` moves the whole tree, as it does for Cursor. Cursor plugins start enabled, because installing them in Cursor already chose them; disable one with `[plugins].disabled` or `Space` in the Plugins tab. Grok reads each plugin's `.cursor-plugin/plugin.json` (falling back to `.claude-plugin/plugin.json`, then `plugin.json`) and loads:
+
+- **Skills** from `skills/` and **commands** from `commands/` (`.md`, `.mdc`, `.markdown`, `.txt`), as `/<plugin>:<name>`.
+- **Rules** from `rules/`: `alwaysApply: true` rules join the instructions Grok sends with every turn. `compat.cursor.rules = false` turns them off.
+- **Hooks** from `hooks/hooks.json` (or the manifest's `hooks` path), run with Cursor's hook protocol from the plugin root. `${CURSOR_PLUGIN_ROOT}` expands to the plugin directory.
+- **MCP servers** from the cache copy's `mcp.json` or `.mcp.json`. For `plugins/local` plugins, Cursor MCP discovery owns `mcp.json`.
+- **Agents** from `agents/`.
+
+`compat.cursor.skills = false` and `compat.cursor.hooks = false` also drop the skills and hooks that come from Cursor plugins.
+
+### Manage Cursor marketplaces from Grok
+
+`grok plugin cursor` reads and writes Cursor's own `~/.cursor/plugins/local-marketplaces.json` and cache layout. A plugin you install here shows up in Cursor, and the other way round:
+
+```bash
+grok plugin cursor marketplace add owner/repo          # or a git URL, --ref <branch|tag|sha>
+grok plugin cursor marketplace list                    # marketplaces and the plugins they offer
+grok plugin cursor install my-plugin --trust           # or my-plugin@marketplace
+grok plugin cursor list                                # installed Cursor plugins Grok loads
+grok plugin cursor update                              # re-index everything and refresh installs
+grok plugin cursor update my-marketplace               # or one marketplace, or one plugin
+grok plugin cursor remove my-plugin                    # uninstall (alias: uninstall, rm)
+grok plugin cursor marketplace remove my-marketplace   # drop it and its cached plugins
+```
+
+`marketplace add` clones the repo to `~/.cursor/plugins/marketplaces/<host>/<owner>/<repo>/<commit>/` and indexes `.cursor-plugin/marketplace.json` (or `.claude-plugin/marketplace.json`; a repo with only a plugin manifest is a one-plugin marketplace). `install` copies the plugin into `~/.cursor/plugins/cache/<marketplace>/<plugin>/<commit>/`, writes the `.cache-complete` marker, and marks it enabled. Plugins hosted in another repo (`source: {"source": "github", "repo": ...}`, `url`, or `git-subdir`) are cloned at their pinned ref. Start a new session (or press `r` in the Plugins tab) to pick up changes.
+
+Marketplaces attached to your Cursor account or team, including the built-in `cursor-public` marketplace, live on Cursor's servers and need Cursor's sign-in. Grok loads what Cursor has already installed from them, but cannot install from them; use the Cursor CLI (`agent`) or IDE for those.
+
+---
+
 ## Troubleshooting
 
 **A plugin you installed isn't showing up.** Plugins are off until enabled. Check `grok plugin list`, then add the plugin's name or ID to `[plugins].enabled`, or press `Space` on it in the Plugins tab. Reload with `r` in the Plugins tab or start a new session.
@@ -423,6 +465,7 @@ Grok discovers plugins from these locations, in priority order. The `.claude/plu
 | `.grok/plugins/` | Project, shared through version control | Requires trust |
 | `~/.grok/plugins/` | User, every project | Trusted automatically |
 | `[plugins].paths` (config) | Custom directories you add | Depends on location |
+| `~/.cursor/plugins/cache/`, `~/.cursor/plugins/local/` | User, plugins installed in Cursor (see [Cursor plugins](#cursor-plugins)) | Trusted automatically |
 
 The `_meta.pluginDirs` field on the `session/new` and `session/load` requests loads plugins for a single session; because the caller supplies the directory, those plugins are trusted automatically and do not persist after the session. `--plugin-dir` is the process-wide equivalent for a dedicated `grok agent … stdio` process, repeatable (`grok agent --no-leader --plugin-dir A --plugin-dir B stdio`), and ignored in leader mode, where the shared leader discovers its own plugins.
 
@@ -435,7 +478,7 @@ Plugin hooks receive two variables beyond the standard hook environment:
 | `GROK_PLUGIN_ROOT` | Absolute path to the plugin's installed directory. |
 | `GROK_PLUGIN_DATA` | Absolute path to the plugin's writable data directory, for state, caches, and logs. |
 
-Grok sets these and overrides any same-named value in the hook's `env` map (the `CLAUDE_PLUGIN_ROOT` and `CLAUDE_PLUGIN_DATA` aliases are set too). See the [Hooks guide](10-hooks.md) for every variable passed to hooks.
+Grok sets these and overrides any same-named value in the hook's `env` map (the `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`, and `CURSOR_PLUGIN_ROOT` aliases are set too). See the [Hooks guide](10-hooks.md) for every variable passed to hooks.
 
 ### Keyboard shortcuts
 

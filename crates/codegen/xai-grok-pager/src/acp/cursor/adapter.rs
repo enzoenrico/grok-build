@@ -8,6 +8,15 @@
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
+use xai_grok_shell::sampling::types::{
+    CONTEXT_WINDOW_META_KEY, CONTEXT_WINDOWS_META_KEY, FAST_MODE_META_KEY, MAX_MODE_META_KEY,
+    MODEL_PARAMETERS_META_KEY, REASONING_EFFORT_META_KEY, REASONING_EFFORTS_META_KEY,
+    SUPPORTS_FAST_MODE_META_KEY, SUPPORTS_MAX_MODE_META_KEY, SUPPORTS_REASONING_EFFORT_META_KEY,
+    format_context_window_param, model_parameters_meta_value, parse_canonical_effort_token,
+    parse_context_window_meta, parse_context_window_token, parse_fast_mode_meta,
+    parse_max_mode_meta, parse_model_parameters_meta, parse_parameterized_model_spec,
+    parse_reasoning_effort_meta,
+};
 
 use super::protocol;
 
@@ -28,6 +37,7 @@ pub(crate) enum Routed {
         agent_id: Option<String>,
         /// Set on the first `&` task when the session cwd has a git remote.
         repo: Option<super::cloud::CloudRepo>,
+        model: Option<String>,
         /// `session/prompt` id to answer when the cloud handoff is done.
         prompt_rpc_id: Option<Value>,
         prompt_id: Option<String>,
@@ -88,6 +98,7 @@ struct CursorSession {
     skills: HashSet<String>,
     cloud_agent_id: Option<String>,
     cwd: Option<String>,
+    model: Option<String>,
 }
 
 impl CursorAdapter {
@@ -175,12 +186,32 @@ impl CursorAdapter {
                 }
             }
             "session/set_model" => {
-                if let Some(model) = msg.pointer_mut("/params/modelId")
-                    && let Some(requested) = model.as_str()
-                    && let Some(resolved) = self.resolve_model(requested)
-                {
-                    self.preferred_model = Some(resolved.clone());
-                    *model = Value::String(resolved);
+                let session_id = msg
+                    .pointer("/params/sessionId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let meta = msg
+                    .pointer("/params/_meta")
+                    .and_then(Value::as_object)
+                    .cloned();
+                let requested = msg
+                    .pointer("/params/modelId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Some(requested) = requested {
+                    if let Some(resolved) =
+                        self.resolve_model_with_meta(&requested, meta.as_ref())
+                    {
+                        self.preferred_model = Some(resolved.clone());
+                        if let Some(session_id) = &session_id {
+                            self.remember_model(session_id, &resolved);
+                        }
+                        if let Some(model) = msg.pointer_mut("/params/modelId") {
+                            *model = Value::String(resolved);
+                        }
+                    } else if let Some(session_id) = &session_id {
+                        self.remember_model(session_id, &requested);
+                    }
                 }
             }
             "session/set_mode" => {
@@ -257,10 +288,16 @@ impl CursorAdapter {
                         out.extend(end.map(Routed::ToClient));
                         return out;
                     }
+                    let model = self
+                        .sessions
+                        .get(&session_id)
+                        .and_then(|session| session.model.clone())
+                        .or_else(|| self.preferred_model.clone());
                     return vec![Routed::Cloud {
                         session_id: session_id.clone(),
                         request,
                         repo: self.cloud_repo(cloud_agent_id.as_deref(), &session_id),
+                        model,
                         agent_id: cloud_agent_id,
                         prompt_rpc_id: id,
                         prompt_id,
@@ -385,11 +422,19 @@ impl CursorAdapter {
                         self.remember_skills(session_id, result.get("availableCommands"));
                     }
                     self.record_models(result);
-                    if let (Some(session_id), Some(requested)) = (session_id, requested_model)
-                        && let Some(set_model) =
-                            self.apply_requested_model(result, &session_id, &requested)
-                    {
-                        out.push(Routed::ToAgent(set_model));
+                    if let Some(session_id) = session_id {
+                        let switched = requested_model.as_deref().and_then(|requested| {
+                            self.apply_requested_model(result, &session_id, requested)
+                        });
+                        if let Some(set_model) = switched {
+                            out.push(Routed::ToAgent(set_model));
+                        } else if let Some(current) = result
+                            .get("models")
+                            .and_then(|m| m.get("currentModelId"))
+                            .and_then(Value::as_str)
+                        {
+                            self.remember_model(&session_id, current);
+                        }
                     }
                 }
             }
@@ -594,27 +639,178 @@ impl CursorAdapter {
             .extend(protocol::skill_names(commands));
     }
 
-    fn record_models(&mut self, result: &Map<String, Value>) {
-        let Some(available) = result
-            .get("models")
-            .and_then(|m| m.get("availableModels"))
+    fn remember_model(&mut self, session_id: &str, model_id: &str) {
+        let trimmed = model_id.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.sessions
+            .entry(session_id.to_owned())
+            .or_default()
+            .model = Some(trimmed.to_owned());
+    }
+
+    fn record_models(&mut self, result: &mut Map<String, Value>) {
+        let config_options = result
+            .get("configOptions")
             .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let (config_windows, config_efforts) = extract_config_option_hints(&config_options);
+
+        let Some(available) = result
+            .get_mut("models")
+            .and_then(|m| m.get_mut("availableModels"))
+            .and_then(Value::as_array_mut)
         else {
             return;
         };
-        let models: Vec<CursorModel> = available
-            .iter()
-            .filter_map(|m| {
-                Some(CursorModel {
-                    id: m.get("modelId")?.as_str()?.to_owned(),
-                    name: m
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                })
-            })
-            .collect();
+
+        #[derive(Default)]
+        struct BaseSummary {
+            windows: Vec<u64>,
+            efforts: Vec<String>,
+            has_fast: bool,
+            has_max: bool,
+        }
+
+        let mut models = Vec::new();
+        let mut by_base: HashMap<String, BaseSummary> = HashMap::new();
+
+        for m in available.iter() {
+            let Some(id) = m.get("modelId").and_then(Value::as_str) else {
+                continue;
+            };
+            let name = m
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            models.push(CursorModel {
+                id: id.to_owned(),
+                name,
+            });
+            if let Some(spec) = parse_parameterized_model_spec(id) {
+                let summary = by_base
+                    .entry(spec.base_model_id.to_ascii_lowercase())
+                    .or_default();
+                if let Some(w) = spec.context_window
+                    && !summary.windows.contains(&w.get())
+                {
+                    summary.windows.push(w.get());
+                }
+                if let Some(eff) = spec.effort {
+                    let s = eff.to_string();
+                    if !summary.efforts.contains(&s) {
+                        summary.efforts.push(s);
+                    }
+                }
+                if spec.fast_mode.is_some() {
+                    summary.has_fast = true;
+                }
+                if spec.max_mode.is_some() {
+                    summary.has_max = true;
+                }
+            }
+        }
+
+        for m in available.iter_mut() {
+            let Some(obj) = m.as_object_mut() else {
+                continue;
+            };
+            let Some(id) = obj.get("modelId").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            let Some(spec) = parse_parameterized_model_spec(&id) else {
+                continue;
+            };
+            let summary = by_base.get(&spec.base_model_id.to_ascii_lowercase());
+            let meta = meta_mut(obj);
+
+            if let Some(cw) = spec.context_window {
+                meta.entry("totalContextTokens")
+                    .or_insert_with(|| json!(cw.get()));
+                meta.entry(CONTEXT_WINDOW_META_KEY)
+                    .or_insert_with(|| json!(cw.get()));
+            }
+
+            let mut windows = summary.map(|s| s.windows.clone()).unwrap_or_default();
+            for &w in &config_windows {
+                if !windows.contains(&w) {
+                    windows.push(w);
+                }
+            }
+            if windows.len() == 1 && spec.context_window.is_some() {
+                let alt = if windows[0] == 1_000_000 {
+                    200_000
+                } else {
+                    1_000_000
+                };
+                windows.push(alt);
+            }
+            if windows.len() > 1 {
+                meta.entry(CONTEXT_WINDOWS_META_KEY)
+                    .or_insert_with(|| json!(windows));
+            }
+
+            let has_efforts = summary.is_some_and(|s| !s.efforts.is_empty())
+                || !config_efforts.is_empty()
+                || spec.effort.is_some()
+                || spec.has_brackets;
+            if has_efforts {
+                meta.entry(SUPPORTS_REASONING_EFFORT_META_KEY)
+                    .or_insert(Value::Bool(true));
+            }
+            if let Some(effort) = spec.effort {
+                meta.entry(REASONING_EFFORT_META_KEY)
+                    .or_insert_with(|| json!(effort.to_string()));
+            }
+            let mut efforts = summary.map(|s| s.efforts.clone()).unwrap_or_default();
+            for eff in &config_efforts {
+                if !efforts.contains(eff) {
+                    efforts.push(eff.clone());
+                }
+            }
+            if efforts.len() > 1 {
+                let effort_objs: Vec<Value> = efforts
+                    .iter()
+                    .map(|e| json!({ "id": e, "value": e, "label": e }))
+                    .collect();
+                meta.entry(REASONING_EFFORTS_META_KEY)
+                    .or_insert_with(|| Value::Array(effort_objs));
+            }
+
+            if spec.fast_mode.is_some()
+                || summary.is_some_and(|s| s.has_fast)
+                || spec.has_brackets
+            {
+                meta.entry(SUPPORTS_FAST_MODE_META_KEY)
+                    .or_insert(Value::Bool(true));
+            }
+            if let Some(fast) = spec.fast_mode {
+                meta.entry(FAST_MODE_META_KEY)
+                    .or_insert(Value::Bool(fast));
+            }
+
+            if spec.max_mode.is_some()
+                || summary.is_some_and(|s| s.has_max)
+                || spec.context_window.is_some()
+                || spec.has_brackets
+            {
+                meta.entry(SUPPORTS_MAX_MODE_META_KEY)
+                    .or_insert(Value::Bool(true));
+            }
+            if let Some(max_mode) = spec.max_mode {
+                meta.entry(MAX_MODE_META_KEY)
+                    .or_insert(Value::Bool(max_mode));
+            }
+
+            if !spec.raw_params.is_empty() {
+                meta.entry(MODEL_PARAMETERS_META_KEY)
+                    .or_insert_with(|| model_parameters_meta_value(&spec.raw_params));
+            }
+        }
+
         if !models.is_empty() {
             self.models = models;
         }
@@ -627,7 +823,8 @@ impl CursorAdapter {
         session_id: &str,
         requested: &str,
     ) -> Option<String> {
-        let resolved = self.resolve_model(requested)?;
+        let resolved = self.resolve_model_with_meta(requested, None)?;
+        self.remember_model(session_id, &resolved);
         let current = result.get_mut("models")?.get_mut("currentModelId")?;
         if current.as_str() == Some(resolved.as_str()) {
             return None;
@@ -662,6 +859,188 @@ impl CursorAdapter {
             })
             .map(|m| m.id.clone())
     }
+
+    /// Resolve a model id and apply any `_meta` or bracket parameter overrides (`context`, `effort`, `fast`, `maxMode`, `modelParameters`).
+    fn resolve_model_with_meta(
+        &self,
+        requested: &str,
+        meta: Option<&Map<String, Value>>,
+    ) -> Option<String> {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            return None;
+        }
+        let has_meta_overrides = meta.is_some_and(|m| {
+            parse_context_window_meta(Some(m)).is_some()
+                || parse_reasoning_effort_meta(Some(m)).is_some()
+                || parse_fast_mode_meta(Some(m)).is_some()
+                || parse_max_mode_meta(Some(m)).is_some()
+                || parse_model_parameters_meta(Some(m)).is_some_and(|p| !p.is_empty())
+        });
+        let spec = parse_parameterized_model_spec(requested)?;
+        if !spec.has_brackets && !has_meta_overrides {
+            return self.resolve_model(requested);
+        }
+
+        let catalog_match = self
+            .models
+            .iter()
+            .find(|m| m.id.eq_ignore_ascii_case(requested))
+            .or_else(|| {
+                self.models.iter().find(|m| {
+                    model_base(&m.id).eq_ignore_ascii_case(&spec.base_model_id)
+                        || m.name.eq_ignore_ascii_case(&spec.base_model_id)
+                })
+            });
+
+        let canonical_base = catalog_match
+            .map(|m| model_base(&m.id).to_owned())
+            .unwrap_or_else(|| spec.base_model_id.clone());
+
+        let mut params: Vec<(String, String)> = catalog_match
+            .and_then(|m| parse_parameterized_model_spec(&m.id))
+            .map(|s| s.raw_params)
+            .unwrap_or_default();
+
+        for (k, v) in &spec.raw_params {
+            upsert_model_param(&mut params, &[k.as_str()], k, v.clone());
+        }
+
+        if let Some(meta) = meta {
+            if let Some(cw) = parse_context_window_meta(Some(meta)) {
+                upsert_model_param(
+                    &mut params,
+                    &["context", "contextWindow", "context_window"],
+                    "context",
+                    format_context_window_param(cw.get()),
+                );
+            }
+            if let Some(effort) = parse_reasoning_effort_meta(Some(meta)) {
+                upsert_model_param(
+                    &mut params,
+                    &[
+                        "effort",
+                        "reasoning",
+                        "reasoningEffort",
+                        "reasoning_effort",
+                        "thinking",
+                    ],
+                    "effort",
+                    effort.to_string(),
+                );
+            }
+            if let Some(fast) = parse_fast_mode_meta(Some(meta)) {
+                upsert_model_param(
+                    &mut params,
+                    &["fast", "fastMode", "fast_mode", "speed"],
+                    "fast",
+                    if fast { "true" } else { "false" }.to_owned(),
+                );
+            }
+            if let Some(max_mode) = parse_max_mode_meta(Some(meta)) {
+                upsert_model_param(
+                    &mut params,
+                    &["maxMode", "max_mode", "max"],
+                    "maxMode",
+                    if max_mode { "true" } else { "false" }.to_owned(),
+                );
+            }
+            if let Some(meta_params) = parse_model_parameters_meta(Some(meta)) {
+                for (k, v) in meta_params {
+                    upsert_model_param(&mut params, &[k.as_str()], &k, v);
+                }
+            }
+        }
+
+        if params.is_empty() {
+            return catalog_match
+                .map(|m| m.id.clone())
+                .or_else(|| Some(canonical_base));
+        }
+
+        // Prefer an exact catalog variant when its parameter set matches.
+        if let Some(existing) = self.models.iter().find(|m| {
+            model_base(&m.id).eq_ignore_ascii_case(&canonical_base)
+                && parse_parameterized_model_spec(&m.id)
+                    .is_some_and(|s| params_match(&s.raw_params, &params))
+        }) {
+            return Some(existing.id.clone());
+        }
+
+        let formatted_params = params
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(format!("{canonical_base}[{formatted_params}]"))
+    }
+}
+
+fn upsert_model_param(
+    params: &mut Vec<(String, String)>,
+    aliases: &[&str],
+    default_key: &str,
+    value: String,
+) {
+    if let Some((_, existing_val)) = params
+        .iter_mut()
+        .find(|(k, _)| aliases.iter().any(|a| k.eq_ignore_ascii_case(a)))
+    {
+        *existing_val = value;
+    } else {
+        params.push((default_key.to_owned(), value));
+    }
+}
+
+fn params_match(a: &[(String, String)], b: &[(String, String)]) -> bool {
+    a.len() == b.len()
+        && a.iter().all(|(ka, va)| {
+            b.iter()
+                .any(|(kb, vb)| ka.eq_ignore_ascii_case(kb) && va.eq_ignore_ascii_case(vb))
+        })
+}
+
+fn extract_config_option_hints(config_options: &[Value]) -> (Vec<u64>, Vec<String>) {
+    let mut windows = Vec::new();
+    let mut efforts = Vec::new();
+    for opt in config_options {
+        let category = opt
+            .get("category")
+            .or_else(|| opt.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let values = opt
+            .get("options")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for val in values {
+            let raw = val
+                .get("value")
+                .or_else(|| val.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if category.contains("context") {
+                if let Some(w) = parse_context_window_token(raw)
+                    && !windows.contains(&w.get())
+                {
+                    windows.push(w.get());
+                }
+            } else if category.contains("thought")
+                || category.contains("effort")
+                || category.contains("reasoning")
+            {
+                if let Some(eff) = parse_canonical_effort_token(raw) {
+                    let s = eff.to_string();
+                    if !efforts.contains(&s) {
+                        efforts.push(s);
+                    }
+                }
+            }
+        }
+    }
+    (windows, efforts)
 }
 
 fn model_base(id: &str) -> &str {

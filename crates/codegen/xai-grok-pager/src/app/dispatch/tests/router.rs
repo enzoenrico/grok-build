@@ -1011,9 +1011,8 @@ fn a_window_pick_sends_only_a_change_to_the_session_selection() {
         let mut app = test_app_with_catalog(selection);
         let effects = dispatch(
             Action::SwitchModel(ModelChoice {
-                model_id: acp::ModelId::new(std::sync::Arc::from(target)),
-                effort: None,
                 context_window_selection: std::num::NonZeroU64::new(picked),
+                ..ModelChoice::new(acp::ModelId::new(std::sync::Arc::from(target)))
             }),
             &mut app,
         );
@@ -1038,9 +1037,8 @@ fn a_redundant_window_pick_is_refused_while_a_model_switch_is_pending() {
     let scrollback_before = agent_ref(&app, AgentId(0)).scrollback.len();
     let effects = dispatch(
         Action::SwitchModel(ModelChoice {
-            model_id: acp::ModelId::new(std::sync::Arc::from("grok-4.8")),
-            effort: None,
             context_window_selection: std::num::NonZeroU64::new(500_000),
+            ..ModelChoice::new(acp::ModelId::new(std::sync::Arc::from("grok-4.8")))
         }),
         &mut app,
     );

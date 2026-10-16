@@ -3364,6 +3364,7 @@ mod tests {
             skill_dirs: vec![],
             command_dirs: vec![],
             agent_dirs: vec![agents_dir],
+            rule_dirs: vec![],
             hooks_path: None,
             mcp_config_path: None,
             lsp_config_path: None,

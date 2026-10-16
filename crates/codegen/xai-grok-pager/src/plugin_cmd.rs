@@ -6,6 +6,7 @@
 //! Business logic lives in `xai_grok_shell::plugin` and lower crates (`xai-grok-agent`, `xai-grok-plugin-marketplace`).
 //! This module is a thin CLI wrapper: parse args, call ops, format output, emit telemetry.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
@@ -157,6 +158,8 @@ pub enum PluginCommand {
     },
     /// Manage marketplace sources
     Marketplace(MarketplaceArgs),
+    /// Manage Cursor plugins and marketplaces (shared with the Cursor CLI and IDE)
+    Cursor(crate::plugin_cursor_cmd::CursorPluginArgs),
 }
 
 #[derive(Debug, clap::Args, Clone)]
@@ -258,6 +261,7 @@ pub async fn run(args: PluginArgs) -> Result<()> {
             dry_run,
         } => cmd_tag(&path, push, force, dry_run),
         PluginCommand::Marketplace(mp) => run_marketplace(mp.command).await,
+        PluginCommand::Cursor(args) => crate::plugin_cursor_cmd::run(args),
     }
 }
 
@@ -811,7 +815,6 @@ async fn run_marketplace(cmd: MarketplaceCommand) -> Result<()> {
 }
 
 fn cursor_marketplace_counts() -> Vec<(String, usize)> {
-    use std::collections::BTreeMap;
     let Some(config_dir) =
         xai_grok_config::mcp_servers::cursor_user_config_dir(xai_dirs::home_dir().as_deref())
     else {

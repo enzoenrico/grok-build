@@ -21,6 +21,7 @@ pub mod effort_levels;
 pub mod exit;
 pub mod expand;
 pub mod export;
+pub mod fast;
 pub mod feedback;
 pub mod find;
 pub mod fork;
@@ -88,6 +89,8 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         // Per turn.
         Arc::new(effort::EffortCommand),
         Arc::new(context_window::ContextWindowCommand),
+        Arc::new(fast::FastCommand),
+        Arc::new(fast::MaxModeCommand),
         Arc::new(model::ModelCommand),
         Arc::new(context::ContextCommand),
         Arc::new(compact::CompactCommand),

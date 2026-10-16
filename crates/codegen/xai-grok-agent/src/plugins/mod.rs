@@ -5,6 +5,8 @@
 //! live under `~/.grok/plugins/`, `.grok/plugins/` (project-level),
 //! or be passed via `--plugin-dir` on the CLI.
 
+pub mod cursor;
+pub mod cursor_marketplace;
 pub mod discovery;
 pub mod git_install;
 pub mod hooks_adapter;

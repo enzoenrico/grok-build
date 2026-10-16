@@ -309,6 +309,15 @@ fn parse_rule(scope_dir: PathBuf, full_path: PathBuf, content: &str) -> ParsedCu
     }
 }
 
+/// Body of a Cursor rule file whose frontmatter sets `alwaysApply: true`, or `None` for glob, agent-requested, and
+/// manual rules.
+pub fn always_apply_rule_body(content: &str) -> Option<String> {
+    let (frontmatter, body) = split_frontmatter(content)?;
+    parse_frontmatter(frontmatter)
+        .filter(|fm| fm.always_apply)
+        .map(|_| body.trim_start().to_owned())
+}
+
 fn parse_frontmatter(yaml: &str) -> Option<CursorRuleFrontmatter> {
     if let Ok(parsed) = serde_yaml::from_str::<CursorRuleFrontmatter>(yaml) {
         return Some(parsed);

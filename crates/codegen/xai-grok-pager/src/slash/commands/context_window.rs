@@ -78,9 +78,11 @@ impl SlashCommand for ContextWindowCommand {
 
         match supported_window(trimmed, &options) {
             Some(window) => CommandResult::Action(Action::SwitchModel(ModelChoice {
-                model_id,
                 effort: ctx.models.reasoning_effort,
                 context_window_selection: Some(window),
+                fast_mode: ctx.models.fast_mode,
+                max_mode: ctx.models.max_mode,
+                ..ModelChoice::new(model_id)
             })),
             None => CommandResult::Error(unknown_window_error(trimmed, &options)),
         }

@@ -2,8 +2,10 @@ use agent_client_protocol as acp;
 use indexmap::IndexMap;
 use xai_grok_shell::sampling::types::{
     ModelNotice, ReasoningEffort, ReasoningEffortOption, parse_canonical_effort_token,
-    parse_context_window_meta, parse_context_windows_meta, parse_model_notice_meta,
-    parse_reasoning_effort_meta, parse_reasoning_efforts_meta, supports_reasoning_effort_meta,
+    parse_context_window_meta, parse_context_windows_meta, parse_fast_mode_meta,
+    parse_max_mode_meta, parse_model_notice_meta, parse_model_parameters_meta,
+    parse_parameterized_model_spec, parse_reasoning_effort_meta, parse_reasoning_efforts_meta,
+    supports_fast_mode_meta, supports_max_mode_meta, supports_reasoning_effort_meta,
 };
 
 use crate::slash::commands::effort_levels::legacy_effort_options;
@@ -56,6 +58,9 @@ pub struct ModelState {
     pub available: IndexMap<acp::ModelId, acp::ModelInfo>,
     pub current: Option<acp::ModelId>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub fast_mode: Option<bool>,
+    pub max_mode: Option<bool>,
+    pub model_parameters: Vec<(String, String)>,
     /// External override for the context window size (tokens).
     /// When set, `get_context_window()` returns this instead of reading from the current model's metadata.
     /// Used for subagent views where SubagentProgress reports the actual window size.
@@ -90,12 +95,23 @@ impl ModelState {
             .or_else(|| self.current_model_name())
     }
 
-    /// `footer_model_name` with the reasoning effort, which binds to the name rather than the flag row.
+    /// `footer_model_name` with the reasoning effort and active fast/max mode badges.
     pub fn footer_label(&self) -> Option<String> {
         let name = self.footer_model_name()?;
-        Some(match self.reasoning_effort {
-            Some(effort) => format!("{name} ({effort})"),
-            None => name,
+        let mut badges = Vec::new();
+        if let Some(effort) = self.reasoning_effort {
+            badges.push(effort.to_string());
+        }
+        if self.fast_mode == Some(true) {
+            badges.push("fast".to_string());
+        }
+        if self.max_mode == Some(true) {
+            badges.push("max".to_string());
+        }
+        Some(if badges.is_empty() {
+            name
+        } else {
+            format!("{name} ({})", badges.join(" · "))
         })
     }
 
@@ -199,7 +215,7 @@ impl ModelState {
         self.available = new_available;
     }
 
-    /// Set the current model and resolve reasoning effort from catalog meta.
+    /// Set the current model and resolve reasoning effort and model parameters from catalog meta.
     pub fn set_current(
         &mut self,
         model_id: acp::ModelId,
@@ -207,11 +223,51 @@ impl ModelState {
     ) {
         self.current = Some(model_id.clone());
         self.served_model_name = None;
-        self.reasoning_effort = effort_override.or_else(|| {
-            self.available
-                .get(&model_id)
-                .and_then(|info| parse_reasoning_effort_meta(info.meta.as_ref()))
-        });
+        let meta = self
+            .available
+            .get(&model_id)
+            .and_then(|info| info.meta.as_ref());
+        let spec = parse_parameterized_model_spec(model_id.0.as_ref());
+        self.reasoning_effort = effort_override
+            .or_else(|| parse_reasoning_effort_meta(meta))
+            .or_else(|| spec.as_ref().and_then(|s| s.effort));
+        self.fast_mode = parse_fast_mode_meta(meta)
+            .or_else(|| spec.as_ref().and_then(|s| s.fast_mode));
+        self.max_mode = parse_max_mode_meta(meta)
+            .or_else(|| spec.as_ref().and_then(|s| s.max_mode));
+        let meta_params = parse_model_parameters_meta(meta);
+        self.model_parameters = meta_params
+            .unwrap_or_else(|| spec.map(|s| s.raw_params).unwrap_or_default());
+    }
+
+    pub fn supports_fast_mode(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|id| self.supports_fast_mode_for(id))
+    }
+
+    pub(crate) fn supports_fast_mode_for(&self, id: &acp::ModelId) -> bool {
+        self.available
+            .get(id)
+            .is_some_and(|info| supports_fast_mode_meta(info.meta.as_ref()))
+            || parse_parameterized_model_spec(id.0.as_ref())
+                .is_some_and(|s| s.fast_mode.is_some() || s.has_brackets)
+    }
+
+    pub fn supports_max_mode(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|id| self.supports_max_mode_for(id))
+    }
+
+    pub(crate) fn supports_max_mode_for(&self, id: &acp::ModelId) -> bool {
+        self.available
+            .get(id)
+            .is_some_and(|info| supports_max_mode_meta(info.meta.as_ref()))
+            || self.context_window_options_for(id).len() > 1
+            || parse_parameterized_model_spec(id.0.as_ref()).is_some_and(|s| {
+                s.max_mode.is_some() || s.context_window.is_some() || s.has_brackets
+            })
     }
 
     /// The reasoning-effort menu for the current model. An unset or unsupported model yields no menu.
@@ -339,8 +395,25 @@ impl ModelState {
 
     /// Resolve a user-supplied name to a `ModelId` via case-insensitive ASCII match against the catalog.
     pub fn resolve_by_name_or_id(&self, query: &str) -> Option<acp::ModelId> {
-        self.available.iter().find_map(|(id, info)| {
+        let query = query.trim();
+        if query.is_empty() {
+            return None;
+        }
+        if let Some(id) = self.available.iter().find_map(|(id, info)| {
             if info.name.eq_ignore_ascii_case(query) || id.0.as_ref().eq_ignore_ascii_case(query) {
+                Some(id.clone())
+            } else {
+                None
+            }
+        }) {
+            return Some(id);
+        }
+        if query.contains('[') {
+            return None;
+        }
+        self.available.iter().find_map(|(id, info)| {
+            let id_base = id.0.as_ref().split('[').next().unwrap_or(id.0.as_ref()).trim();
+            if info.name.eq_ignore_ascii_case(query) || id_base.eq_ignore_ascii_case(query) {
                 Some(id.clone())
             } else {
                 None
@@ -380,19 +453,32 @@ impl From<Option<acp::SessionModelState>> for ModelState {
                 let current_model = models
                     .contains_key(&state.current_model_id)
                     .then_some(state.current_model_id);
-                let reasoning_effort = current_model
+                let current_meta = current_model
                     .as_ref()
                     .and_then(|id| models.get(id))
-                    .and_then(|info| parse_reasoning_effort_meta(info.meta.as_ref()));
-                let context_window_selection = current_model
+                    .and_then(|info| info.meta.as_ref());
+                let current_spec = current_model
                     .as_ref()
-                    .and_then(|id| models.get(id))
-                    .and_then(|info| parse_context_window_meta(info.meta.as_ref()))
+                    .and_then(|id| parse_parameterized_model_spec(id.0.as_ref()));
+                let reasoning_effort = parse_reasoning_effort_meta(current_meta)
+                    .or_else(|| current_spec.as_ref().and_then(|s| s.effort));
+                let context_window_selection = parse_context_window_meta(current_meta)
+                    .or_else(|| current_spec.as_ref().and_then(|s| s.context_window))
                     .map(std::num::NonZeroU64::get);
+                let fast_mode = parse_fast_mode_meta(current_meta)
+                    .or_else(|| current_spec.as_ref().and_then(|s| s.fast_mode));
+                let max_mode = parse_max_mode_meta(current_meta)
+                    .or_else(|| current_spec.as_ref().and_then(|s| s.max_mode));
+                let meta_params = parse_model_parameters_meta(current_meta);
+                let model_parameters = meta_params
+                    .unwrap_or_else(|| current_spec.map(|s| s.raw_params).unwrap_or_default());
                 Self {
                     available: models,
                     current: current_model,
                     reasoning_effort,
+                    fast_mode,
+                    max_mode,
+                    model_parameters,
                     context_window_override: None,
                     context_window_selection,
                     model_changed_during_switch: false,
@@ -483,6 +569,19 @@ mod tests {
         let mut state = sample_models();
         state.reasoning_effort = Some(ReasoningEffort::High);
         assert_eq!(Some("Model A (high)".to_owned()), state.footer_label());
+
+        state.fast_mode = Some(true);
+        assert_eq!(Some("Model A (high · fast)".to_owned()), state.footer_label());
+
+        state.max_mode = Some(true);
+        assert_eq!(
+            Some("Model A (high · fast · max)".to_owned()),
+            state.footer_label()
+        );
+
+        state.reasoning_effort = None;
+        state.max_mode = Some(false);
+        assert_eq!(Some("Model A (fast)".to_owned()), state.footer_label());
 
         state.current = None;
         assert_eq!(None, state.footer_label(), "no name, no effort");

@@ -227,7 +227,7 @@ fn session_end_default_timeout_ms() -> u64 {
     })
 }
 
-fn default_timeout_ms(event: crate::event::HookEventName) -> u64 {
+pub(crate) fn default_timeout_ms(event: crate::event::HookEventName) -> u64 {
     use crate::event::GateKind;
     if event == crate::event::HookEventName::SessionEnd {
         return session_end_default_timeout_ms();
@@ -291,6 +291,9 @@ pub struct HookSpec {
     /// `#[serde(default)]` maps specs serialized before this field existed to `File`.
     #[serde(default)]
     pub layer: HookProvenance,
+    /// Set for hooks loaded from a Cursor-format file; the dispatcher and runner then follow Cursor's protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<crate::cursor::CursorHook>,
 }
 
 pub const RUNNER_ALWAYS_SET_ENV: &[&str] = &[
@@ -299,6 +302,8 @@ pub const RUNNER_ALWAYS_SET_ENV: &[&str] = &[
     "GROK_SESSION_ID",
     "GROK_WORKSPACE_ROOT",
     "CLAUDE_PROJECT_DIR",
+    "CURSOR_PROJECT_DIR",
+    "CURSOR_VERSION",
 ];
 
 pub fn expand_env_skipping_runner_vars(input: &str) -> String {
@@ -540,6 +545,22 @@ pub fn parse_hook_file(content: &str, file_path: &Path) -> (Vec<HookSpec>, Vec<H
         }
     };
 
+    if crate::cursor::is_cursor_document(&top_level) {
+        let working_dir =
+            crate::cursor::working_dir_for(file_path, xai_dirs::home_dir().as_deref());
+        let file_stem = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        return crate::cursor::parse_document(
+            &top_level,
+            file_path,
+            &working_dir,
+            file_stem,
+            HookProvenance::File,
+        );
+    }
+
     let hooks_value = match top_level.get("hooks") {
         Some(v) => v.clone(),
         None => return (specs, errors),
@@ -752,6 +773,7 @@ fn build_one_spec(
         source_dir: ctx.source_dir.to_path_buf(),
         extra_env,
         layer: ctx.provenance,
+        cursor: None,
     })
 }
 

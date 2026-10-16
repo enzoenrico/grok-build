@@ -26,10 +26,11 @@ Grok discovers skills from these directories, in priority order:
 | `~/.cursor/skills/` | User | Lowest | Cursor compatibility (configurable) |
 | `./.cursor/skills/` | Local / Repo | High | Project Cursor skills (when cursor compat skills are enabled) |
 | Installed Cursor plugin `skills/` and `commands/` | User | Lowest | Plugins already installed in Cursor. `compat.cursor.skills = false` drops these too |
+| `~/.codex/skills/`, `./.codex/skills/` | User, Local / Repo | Lowest, High | Cursor reads these too, so the Cursor `skills` cell turns them on |
 
 Grok deduplicates skills by name -- a higher-priority location overrides a lower one. Grok also scans `.agents/skills/` (and `commands/`) at each tier (alongside `.grok/`) and walks every directory between your working directory and the repo root.
 
-Flat `*.md` files under a `commands/` directory become user-invocable slash commands (filename stem = command name), matching Claude Code's legacy custom-command layout.
+Flat `*.md` files under a `commands/` directory become user-invocable slash commands (filename stem = command name), matching Claude Code's legacy custom-command layout. Cursor's custom commands work the same way: `~/.cursor/commands/review.md` and `<project>/.cursor/commands/review.md` become `/review`. Commands inside Cursor plugins also accept `.mdc`, `.markdown`, and `.txt`, as Cursor does.
 
 Skill and command discovery does **not** use `.gitignore`. Paths under known skill roots (`.grok/`, `.agents/`, `.claude/`, `.cursor/`) always load when present on disk — teams often ignore `.claude/**` as local-only config while still expecting `/frontend`-style project commands to work. To hide a skill, use `[skills] ignore` in config (not repo ignore rules).
 

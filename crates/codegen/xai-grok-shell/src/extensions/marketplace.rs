@@ -1,6 +1,8 @@
 //! Marketplace browsing and install endpoints for the pager modal.
 //! Scanning and install logic live in the `xai-grok-plugin-marketplace` crate.
 
+use std::collections::BTreeMap;
+
 use agent_client_protocol as acp;
 use xai_hooks_plugins_types::{
     MarketplaceAction, MarketplaceActionRequest, MarketplaceListResponse, MarketplacePluginEntry,
@@ -123,7 +125,6 @@ fn cursor_managed_outcome(path: &str) -> Option<xai_hooks_plugins_types::ActionO
 
 /// Installed Cursor marketplaces, grouped by slug. Read-only: install and remove stay in Cursor.
 fn cursor_marketplace_scans() -> Vec<MarketplaceScanResult> {
-    use std::collections::BTreeMap;
     let Some(config_dir) =
         xai_grok_config::mcp_servers::cursor_user_config_dir(xai_dirs::home_dir().as_deref())
     else {

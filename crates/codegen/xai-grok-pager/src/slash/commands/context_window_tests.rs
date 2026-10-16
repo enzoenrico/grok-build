@@ -15,6 +15,7 @@ fn supported_window_switches_the_current_model() {
             model_id,
             effort: None,
             context_window_selection,
+            ..
         })) => {
             assert_eq!(acp_fixtures::model_id("grok-4.7"), model_id);
             assert_eq!(std::num::NonZeroU64::new(500_000), context_window_selection);

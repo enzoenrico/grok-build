@@ -1128,6 +1128,7 @@ fn file_registry(
         source_dir: std::path::PathBuf::from("/tmp"),
         extra_env: std::collections::HashMap::new(),
         layer: xai_grok_hooks::config::HookProvenance::File,
+        cursor: None,
     }]);
     registry
 }

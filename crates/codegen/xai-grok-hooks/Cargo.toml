@@ -20,12 +20,14 @@ toml = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 xai-grok-config = { workspace = true }
+xai-dirs = { workspace = true }
 # Child-network restriction on hook command spawns; enforce is feature-unified
 # from the binary crate, matching the other consumers.
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
 xai-grok-tools = { workspace = true }
 
 [dev-dependencies]
+dunce = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }

@@ -213,6 +213,8 @@ mod tests {
             skill_dirs: vec![],
             command_dirs: vec![],
             agent_dirs: vec![],
+            rule_dirs: vec![],
+            dialect: Default::default(),
             hooks_path: None,
             mcp_config_path: None,
             lsp_config_path: None,
@@ -280,6 +282,27 @@ mod tests {
                 git_url: None,
             })
         );
+    }
+
+    #[test]
+    fn cursor_origins_map_to_dto() {
+        let installed = loaded_plugin_to_info(&make_loaded_plugin(AgentOrigin::CursorInstalled {
+            marketplace: "cursor-public".to_string(),
+        }));
+        assert_eq!(
+            installed.origin,
+            Some(PluginOrigin::CursorInstalled {
+                marketplace: "cursor-public".to_string(),
+            })
+        );
+        assert_eq!(
+            installed.marketplace_source.as_deref(),
+            Some("cursor-public")
+        );
+
+        let local = loaded_plugin_to_info(&make_loaded_plugin(AgentOrigin::UserCursor));
+        assert_eq!(local.origin, Some(PluginOrigin::UserCursor));
+        assert_eq!(local.marketplace_source, None);
     }
 
     #[test]

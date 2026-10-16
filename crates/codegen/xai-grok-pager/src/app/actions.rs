@@ -28,13 +28,16 @@ pub enum SwitchModelError {
     /// Any other failure (network, auth, server error, etc.).
     Other(String),
 }
-/// The model, effort, and context window a session switch requests.
+/// The model, effort, context window, and parameter overrides a session switch requests.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelChoice {
     pub model_id: acp::ModelId,
     pub effort: Option<ReasoningEffort>,
     /// `None` keeps the session's context window selection.
     pub context_window_selection: Option<NonZeroU64>,
+    pub fast_mode: Option<bool>,
+    pub max_mode: Option<bool>,
+    pub model_parameters: Vec<(String, String)>,
 }
 impl ModelChoice {
     /// Chooses `model_id` with no effort override and the session's context window.
@@ -43,6 +46,9 @@ impl ModelChoice {
             model_id,
             effort: None,
             context_window_selection: None,
+            fast_mode: None,
+            max_mode: None,
+            model_parameters: Vec::new(),
         }
     }
 }

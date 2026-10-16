@@ -273,7 +273,11 @@ pub(crate) struct CloudRepo {
     pub starting_ref: Option<String>,
 }
 
-pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>) -> String {
+pub(crate) fn create_body(
+    text: &str,
+    repo: Option<&CloudRepo>,
+    model_id: Option<&str>,
+) -> String {
     let mut body = json!({ "prompt": { "text": text } });
     if let Some(repo) = repo {
         let mut entry = json!({ "url": repo.url });
@@ -282,7 +286,48 @@ pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>) -> String {
         }
         body["repos"] = json!([entry]);
     }
+    attach_cloud_model(&mut body, model_id);
     body.to_string()
+}
+
+fn attach_cloud_model(body: &mut Value, model_id: Option<&str>) {
+    let Some(model) = model_id.and_then(cloud_model_from_id) else {
+        return;
+    };
+    body["model"] = model;
+}
+
+pub(crate) fn cloud_model_from_id(raw: &str) -> Option<Value> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let Some((id, rest)) = raw.split_once('[') else {
+        return Some(json!({ "id": raw }));
+    };
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let inside = rest.strip_suffix(']').unwrap_or(rest);
+    let params: Vec<Value> = inside
+        .split(',')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() || value.is_empty() {
+                None
+            } else {
+                Some(json!({ "id": key, "value": value }))
+            }
+        })
+        .collect();
+    if params.is_empty() {
+        Some(json!({ "id": id }))
+    } else {
+        Some(json!({ "id": id, "params": params }))
+    }
 }
 
 pub(crate) fn normalize_git_remote(remote: &str) -> Option<String> {
@@ -373,8 +418,10 @@ fn git_output(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
     }
 }
 
-pub(crate) fn follow_up_body(text: &str) -> String {
-    json!({ "prompt": { "text": text } }).to_string()
+pub(crate) fn follow_up_body(text: &str, model_id: Option<&str>) -> String {
+    let mut body = json!({ "prompt": { "text": text } });
+    attach_cloud_model(&mut body, model_id);
+    body.to_string()
 }
 
 pub(crate) fn parse_cloud_response(body: &str) -> Result<CloudAgent, String> {
@@ -524,13 +571,14 @@ pub(crate) fn dispatch(
     agent_id: Option<&str>,
     text: &str,
     repo: Option<&CloudRepo>,
+    model_id: Option<&str>,
 ) -> Result<CloudAgent, String> {
     let (url, body) = match agent_id {
         Some(id) => (
             format!("{api_base}/v1/agents/{id}/runs"),
-            follow_up_body(text),
+            follow_up_body(text, model_id),
         ),
-        None => (format!("{api_base}/v1/agents"), create_body(text, repo)),
+        None => (format!("{api_base}/v1/agents"), create_body(text, repo, model_id)),
     };
     let raw = match request("POST", &url, auth, Some(&body)) {
         Ok(raw) => raw,
@@ -841,7 +889,7 @@ mod tests {
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module", None).unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "refactor the auth module", None, None).unwrap();
         assert_eq!(created.id, "bc-1");
         assert_eq!(
             created.url.as_deref(),
@@ -849,7 +897,7 @@ mod tests {
         );
         assert_eq!(created.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(created.result.as_deref(), Some("Refactored auth."));
-        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None).unwrap();
+        let follow = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None).unwrap();
         assert_eq!(follow.id, "bc-1");
         assert_eq!(follow.run_status.as_deref(), Some("FINISHED"));
         assert_eq!(follow.result.as_deref(), Some("Added the tests."));
@@ -954,7 +1002,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme", None).unwrap();
+        let created = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), None, "update the readme", None, None).unwrap();
         assert_eq!(created.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(created.result, None);
         assert!(!run_is_terminal(created.run_status.as_deref()));
@@ -1103,7 +1151,7 @@ data: {}
             }
         });
         let base = format!("http://{addr}");
-        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None).unwrap();
+        let agent = dispatch(&base, &CloudAuth::Basic("test-key".to_owned()), Some("bc-1"), "add tests", None, None).unwrap();
         assert_eq!(agent.id, "bc-1");
         assert_eq!(agent.run_status.as_deref(), Some("RUNNING"));
         assert_eq!(
@@ -1196,6 +1244,7 @@ data: {}
             None,
             "refactor the auth module",
             None,
+            None,
         )
         .unwrap();
         assert_eq!(created.id, "bc-1");
@@ -1248,7 +1297,9 @@ data: {}
             let n = sock.read(&mut buf).unwrap();
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
             let ok = req.contains("https://github.com/acme/payments")
-                && req.contains("\"startingRef\":\"feature\"");
+                && req.contains("\"startingRef\":\"feature\"")
+                && req.contains("\"id\":\"grok-4.7\"")
+                && req.contains("\"value\":\"256k\"");
             let body = if ok {
                 r#"{"agent":{"id":"bc-1","url":"https://cursor.com/agents/bc-1"},"run":{"id":"run-1","status":"FINISHED","result":"on the repo"}}"#
             } else {
@@ -1268,9 +1319,29 @@ data: {}
             None,
             "refactor the auth module",
             Some(&repo),
+            Some("grok-4.7[context=256k,fast=true]"),
         )
         .unwrap();
         assert_eq!(created.result.as_deref(), Some("on the repo"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_model_ids_turn_into_cloud_model_params() {
+        assert_eq!(
+            cloud_model_from_id("grok-4.7[context=256k,fast=true]"),
+            Some(json!({
+                "id": "grok-4.7",
+                "params": [
+                    { "id": "context", "value": "256k" },
+                    { "id": "fast", "value": "true" }
+                ]
+            }))
+        );
+        assert_eq!(
+            cloud_model_from_id("claude-opus-5-5"),
+            Some(json!({ "id": "claude-opus-5-5" }))
+        );
+        assert_eq!(cloud_model_from_id("  "), None);
     }
 }
