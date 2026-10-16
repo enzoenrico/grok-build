@@ -271,6 +271,20 @@ pub struct AgentArgs {
         overrides_with = "reasoning_effort"
     )]
     pub reasoning_effort: Option<String>,
+    /// Context window size for models with selectable context windows (e.g. `256k`, `1m`)
+    #[clap(
+        long = "context-window",
+        visible_alias = "context",
+        value_name = "SIZE",
+        overrides_with = "context_window"
+    )]
+    pub context_window: Option<String>,
+    /// Enable fast mode for models that support it
+    #[clap(long = "fast", conflicts_with = "no_fast")]
+    pub fast: bool,
+    /// Disable fast mode for models that support it
+    #[clap(long = "no-fast", conflicts_with = "fast")]
+    pub no_fast: bool,
     /// Auto-approve all tool executions
     #[arg(long = "always-approve", alias = "yolo")]
     pub yolo: bool,
@@ -520,6 +534,20 @@ pub struct PagerArgs {
         overrides_with = "reasoning_effort"
     )]
     pub reasoning_effort: Option<String>,
+    /// Context window size for models with selectable context windows (e.g. `256k`, `1m`)
+    #[clap(
+        long = "context-window",
+        visible_alias = "context",
+        value_name = "SIZE",
+        overrides_with = "context_window"
+    )]
+    pub context_window: Option<String>,
+    /// Enable fast mode for models that support it
+    #[clap(long = "fast", conflicts_with = "no_fast")]
+    pub fast: bool,
+    /// Disable fast mode for models that support it
+    #[clap(long = "no-fast", conflicts_with = "fast")]
+    pub no_fast: bool,
     /// Extra rules to append to the system prompt.
     #[clap(long = "rules", alias = "append-system-prompt")]
     pub rules: Option<String>,
@@ -808,6 +836,17 @@ fn strip_cur_dir(path: PathBuf) -> PathBuf {
         .collect()
 }
 impl PagerArgs {
+    /// Explicit `--fast` (`Some(true)`) or `--no-fast` (`Some(false)`) override from CLI flags.
+    pub fn fast_mode_override(&self) -> Option<bool> {
+        if self.fast {
+            Some(true)
+        } else if self.no_fast {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     pub fn memory_enabled_override(&self) -> Option<bool> {
         if self.experimental_memory {
             Some(true)
@@ -1483,5 +1522,21 @@ mod tests {
             panic!("expected agent subcommand");
         };
         assert_eq!(agent.reasoning_effort.as_deref(), Some("max"));
+    }
+    #[test]
+    fn context_window_and_fast_flags_parse() {
+        let args = PagerArgs::try_parse_from(["grok", "--context-window", "1m", "--fast"])
+            .expect("--context-window and --fast parse");
+        assert_eq!(args.context_window.as_deref(), Some("1m"));
+        assert_eq!(args.fast_mode_override(), Some(true));
+
+        let alias = PagerArgs::try_parse_from(["grok", "--context", "256k", "--no-fast"])
+            .expect("--context and --no-fast parse");
+        assert_eq!(alias.context_window.as_deref(), Some("256k"));
+        assert_eq!(alias.fast_mode_override(), Some(false));
+
+        let err = PagerArgs::try_parse_from(["grok", "--fast", "--no-fast"])
+            .expect_err("--fast and --no-fast must conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

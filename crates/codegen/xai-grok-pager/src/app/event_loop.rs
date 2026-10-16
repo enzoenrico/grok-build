@@ -1171,6 +1171,8 @@ pub(crate) async fn run(
         .as_deref()
         .map(agent_client_protocol::ModelId::new);
     app.cli_effort_token = args.reasoning_effort.clone();
+    app.cli_context_window_token = args.context_window.clone();
+    app.cli_fast_mode = args.fast_mode_override();
     app.auth_use_oauth = args.oauth;
     app.show_resolved_model = remote_settings
         .as_ref()

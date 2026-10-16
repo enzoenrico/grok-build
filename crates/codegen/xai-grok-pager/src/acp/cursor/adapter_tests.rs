@@ -359,6 +359,7 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
         prompt_rpc_id,
         prompt_id,
         repo,
+        model,
     } = &sent[0]
     else {
         panic!("expected a cloud handoff: {sent:?}");
@@ -369,6 +370,7 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
     assert_eq!(prompt_rpc_id.as_ref().and_then(Value::as_u64), Some(4));
     assert_eq!(prompt_id, &None);
     assert!(repo.is_none());
+    assert!(model.is_none());
 
     adapter.note_cloud_agent("s1", "bc-123");
     let local = adapter.outbound(
@@ -739,3 +741,74 @@ fn cloud_create_uses_the_session_git_remote() {
     assert!(repo.is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cloud_create_sends_the_session_model_and_follows_switches() {
+    let mut adapter = CursorAdapter::new(None, false);
+    let _ = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    let _ = adapter.inbound(&session_new_response(1));
+    let sent = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& fix the build"}]}}"#,
+    );
+    let Routed::Cloud { model, .. } = &sent[0] else {
+        panic!("expected a cloud create: {sent:?}");
+    };
+    assert_eq!(model.as_deref(), Some("claude-opus-5-5[context=300k]"));
+
+    let _ = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"sessionId":"s1","modelId":"grok-4.7"}}"#,
+    );
+    let sent = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& try again"}]}}"#,
+    );
+    let Routed::Cloud { model, .. } = &sent[0] else {
+        panic!("expected a cloud create: {sent:?}");
+    };
+    assert_eq!(model.as_deref(), Some("grok-4.7[context=256k,fast=true]"));
+}
+
+#[test]
+fn cursor_models_enrich_meta_and_apply_parameter_overrides() {
+    let mut adapter = CursorAdapter::new(None, false);
+    let _ = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    let out = adapter.inbound(&session_new_response(1));
+    let resp = parse(&out[0]);
+    let available = resp["result"]["models"]["availableModels"]
+        .as_array()
+        .expect("availableModels array");
+    assert_eq!(available[0]["_meta"]["totalContextTokens"], 300_000);
+    assert_eq!(available[0]["_meta"]["contextWindow"], 300_000);
+    assert_eq!(
+        available[0]["_meta"]["contextWindows"],
+        json!([300_000, 1_000_000])
+    );
+    assert_eq!(available[0]["_meta"]["supportsReasoningEffort"], true);
+    assert_eq!(available[1]["_meta"]["totalContextTokens"], 256_000);
+    assert_eq!(available[1]["_meta"]["fastMode"], true);
+    assert_eq!(available[1]["_meta"]["supportsFastMode"], true);
+    assert_eq!(
+        available[1]["_meta"]["modelParameters"],
+        json!({"context": "256k", "fast": "true"})
+    );
+
+    let set_fast_off = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":2,"method":"session/set_model","params":{"sessionId":"s1","modelId":"grok-4.7[context=256k,fast=true]","_meta":{"fastMode":false,"reasoningEffort":"high","contextWindow":1000000}}}"#,
+    );
+    assert_eq!(
+        parse(&set_fast_off[0])["params"]["modelId"],
+        "grok-4.7[context=1m,fast=false,effort=high]"
+    );
+
+    let set_bracketed = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"sessionId":"s1","modelId":"claude-opus-5-5[context=1m,effort=xhigh,maxMode=true]"}}"#,
+    );
+    assert_eq!(
+        parse(&set_bracketed[0])["params"]["modelId"],
+        "claude-opus-5-5[context=1m,effort=xhigh,maxMode=true]"
+    );
+}
+

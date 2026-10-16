@@ -44,7 +44,9 @@ use agent::AgentId;
 use crate::unified_log as ulog;
 use xai_grok_shell::sampling::error::http_status_from_error;
 use xai_grok_shell::sampling::types::{
-    CONTEXT_WINDOW_META_KEY, context_window_meta_value,
+    CONTEXT_WINDOW_META_KEY, FAST_MODE_META_KEY, MAX_MODE_META_KEY, MODEL_PARAMETERS_META_KEY,
+    context_window_meta_value, fast_mode_meta_value, max_mode_meta_value,
+    model_parameters_meta_value,
 };
 use xai_grok_shell::session::{ExtMethodResult, SessionInfoResponse};
 /// The shell's `x.ai/feedback/upload-trace` params. `intent` is omitted (not null) when absent, so a legacy upload's request stays byte-identical to the pre-intent shape.
@@ -1943,6 +1945,27 @@ pub(crate) fn execute(
                             .insert(
                                 CONTEXT_WINDOW_META_KEY.to_owned(),
                                 context_window_meta_value(window),
+                            );
+                    }
+                    if let Some(fast) = choice.fast_mode {
+                        meta.get_or_insert_default()
+                            .insert(
+                                FAST_MODE_META_KEY.to_owned(),
+                                fast_mode_meta_value(fast),
+                            );
+                    }
+                    if let Some(max_mode) = choice.max_mode {
+                        meta.get_or_insert_default()
+                            .insert(
+                                MAX_MODE_META_KEY.to_owned(),
+                                max_mode_meta_value(max_mode),
+                            );
+                    }
+                    if !choice.model_parameters.is_empty() {
+                        meta.get_or_insert_default()
+                            .insert(
+                                MODEL_PARAMETERS_META_KEY.to_owned(),
+                                model_parameters_meta_value(&choice.model_parameters),
                             );
                     }
                     let req = acp::SetSessionModelRequest::new(

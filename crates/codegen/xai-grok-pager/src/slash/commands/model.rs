@@ -2,7 +2,9 @@
 //! A trailing space after the picked model re-opens the dropdown into a window sub-menu when the model offers several, then the effort sub-menu.
 
 use agent_client_protocol as acp;
-use xai_grok_shell::sampling::types::{ReasoningEffortOption, supports_reasoning_effort_meta};
+use xai_grok_shell::sampling::types::{
+    ReasoningEffortOption, parse_parameterized_model_spec, supports_reasoning_effort_meta,
+};
 
 use crate::acp::model_state::ModelState;
 use crate::app::actions::{Action, ModelChoice};
@@ -76,17 +78,57 @@ impl SlashCommand for ModelCommand {
             return CommandResult::Action(Action::SetDefaultModel(id));
         }
 
-        // A trailing window or effort after the model is a session switch
+        if let Some(spec) = parse_parameterized_model_spec(trimmed)
+            && spec.has_brackets
+            && let Some(id) = ctx.models.resolve_by_name_or_id(&spec.base_model_id)
+        {
+            let windows = ctx.models.context_window_options_for(&id);
+            if let Some(w) = spec.context_window
+                && windows.len() > 1
+                && !windows.contains(&w.get())
+            {
+                return CommandResult::Error(unknown_window_error(
+                    &format_window(w.get()),
+                    &windows,
+                ));
+            }
+            let effort = match spec.effort {
+                Some(eff) => match ctx.models.resolve_effort_for_model(&id, &eff.to_string()) {
+                    Ok(resolved) => Some(resolved),
+                    Err(_) if ctx.models.supports_fast_mode_for(&id) => Some(eff),
+                    Err(err) => return CommandResult::Error(err.message()),
+                },
+                None => ctx
+                    .models
+                    .reasoning_effort
+                    .filter(|_| ctx.models.current.as_ref() == Some(&id)),
+            };
+            return CommandResult::Action(Action::SwitchModel(ModelChoice {
+                model_id: id,
+                effort,
+                context_window_selection: spec.context_window,
+                fast_mode: spec.fast_mode,
+                max_mode: spec.max_mode,
+                model_parameters: spec.raw_params,
+            }));
+        }
+
+        // A trailing window, effort, or fast/max token after the model is a session switch
         if let Some((id, rest)) = split_model_rest(ctx.models, trimmed) {
             let windows = ctx.models.context_window_options_for(&id);
-            let (window, effort_token) = match split_window_effort(rest, &windows) {
-                Ok(split) => split,
-                Err(message) => return CommandResult::Error(message),
+            let (rest, fast_mode, max_mode) = strip_trailing_mode_tokens(rest);
+            let (window, effort_token) = if rest.is_empty() {
+                (None, "")
+            } else {
+                match split_window_effort(rest, &windows) {
+                    Ok(split) => split,
+                    Err(message) => return CommandResult::Error(message),
+                }
             };
 
-            // A window alone keeps the current model's effort, like `/context-window`
-            if let Some(window) = window
-                && effort_token.is_empty()
+            // Window / fast / max without an effort token keeps the current model's effort
+            if effort_token.is_empty()
+                && (window.is_some() || fast_mode.is_some() || max_mode.is_some())
             {
                 let effort = ctx
                     .models
@@ -95,7 +137,10 @@ impl SlashCommand for ModelCommand {
                 return CommandResult::Action(Action::SwitchModel(ModelChoice {
                     model_id: id,
                     effort,
-                    context_window_selection: Some(window),
+                    context_window_selection: window,
+                    fast_mode,
+                    max_mode,
+                    model_parameters: Vec::new(),
                 }));
             }
             return match ctx.models.resolve_effort_for_model(&id, effort_token) {
@@ -103,6 +148,9 @@ impl SlashCommand for ModelCommand {
                     model_id: id,
                     effort: Some(effort),
                     context_window_selection: window,
+                    fast_mode,
+                    max_mode,
+                    model_parameters: Vec::new(),
                 })),
                 Err(err) => CommandResult::Error(err.message()),
             };
@@ -265,6 +313,43 @@ fn split_model_rest<'a>(models: &'a ModelState, args: &'a str) -> Option<(acp::M
     } else {
         Some((id.clone(), rest))
     }
+}
+
+fn strip_trailing_mode_tokens(mut rest: &str) -> (&str, Option<bool>, Option<bool>) {
+    let mut fast_mode = None;
+    let mut max_mode = None;
+    loop {
+        let trimmed = rest.trim_end();
+        let (head, token) = match trimmed.rsplit_once(char::is_whitespace) {
+            Some((h, t)) => (h.trim_end(), t),
+            None => ("", trimmed),
+        };
+        if token.is_empty() {
+            break;
+        }
+        let lower = token.to_ascii_lowercase();
+        match lower.as_str() {
+            "fast" | "fast=true" | "fast=on" | "speed=fast" => {
+                fast_mode = Some(true);
+                rest = head;
+            }
+            "no-fast" | "nofast" | "slow" | "fast=false" | "fast=off" | "speed=normal"
+            | "speed=default" => {
+                fast_mode = Some(false);
+                rest = head;
+            }
+            "max-mode" | "maxmode" | "max=true" | "max=on" | "maxmode=true" => {
+                max_mode = Some(true);
+                rest = head;
+            }
+            "no-max-mode" | "no-max" | "max=false" | "max=off" | "maxmode=false" => {
+                max_mode = Some(false);
+                rest = head;
+            }
+            _ => break,
+        }
+    }
+    (rest.trim(), fast_mode, max_mode)
 }
 
 /// A window is always the first token, and the remaining words are the effort.
@@ -563,6 +648,7 @@ mod tests {
                 model_id,
                 effort,
                 context_window_selection,
+                ..
             })) => {
                 assert_eq!(model_id.0.as_ref(), "grok-4.7");
                 assert_eq!(
@@ -579,6 +665,7 @@ mod tests {
                 model_id,
                 effort,
                 context_window_selection,
+                ..
             })) => {
                 assert_eq!(model_id.0.as_ref(), "grok-4.7");
                 assert_eq!(effort, Some(ReasoningEffort::High));
@@ -934,6 +1021,36 @@ mod tests {
                 assert_eq!(resolved_id, id);
             }
             other => panic!("expected Action::SetDefaultModel(<id>), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_parses_bracketed_parameters_and_fast_mode_tokens() {
+        let mut state = ModelState::default();
+        let (id, info) = model_with_windows_and_reasoning("grok-4.7", "Grok 4.7");
+        state.available.insert(id, info);
+        let mut ctx = dummy_exec_ctx(&state);
+
+        match ModelCommand.run(&mut ctx, "grok-4.7[context=500k,effort=high,fast=false,maxMode=true]") {
+            CommandResult::Action(Action::SwitchModel(choice)) => {
+                assert_eq!(choice.model_id.0.as_ref(), "grok-4.7");
+                assert_eq!(choice.effort, Some(ReasoningEffort::High));
+                assert_eq!(choice.context_window_selection, NonZeroU64::new(500_000));
+                assert_eq!(choice.fast_mode, Some(false));
+                assert_eq!(choice.max_mode, Some(true));
+                assert_eq!(choice.model_parameters.len(), 4);
+            }
+            other => panic!("expected parameterized SwitchModel, got {other:?}"),
+        }
+
+        match ModelCommand.run(&mut ctx, "Grok 4.7 500k high fast") {
+            CommandResult::Action(Action::SwitchModel(choice)) => {
+                assert_eq!(choice.model_id.0.as_ref(), "grok-4.7");
+                assert_eq!(choice.effort, Some(ReasoningEffort::High));
+                assert_eq!(choice.context_window_selection, NonZeroU64::new(500_000));
+                assert_eq!(choice.fast_mode, Some(true));
+            }
+            other => panic!("expected SwitchModel with fast_mode, got {other:?}"),
         }
     }
 }

@@ -1099,6 +1099,238 @@ pub fn context_window_meta_value(window: NonZeroU64) -> Value {
     Value::Number(window.get().into())
 }
 
+/// The `session/set_model` and `ModelInfo` `_meta` key for fast mode (`true` / `false`).
+pub const FAST_MODE_META_KEY: &str = "fastMode";
+/// The model `meta` key indicating whether the model supports toggling fast mode.
+pub const SUPPORTS_FAST_MODE_META_KEY: &str = "supportsFastMode";
+/// The `session/set_model` and `ModelInfo` `_meta` key for max mode (`true` / `false`).
+pub const MAX_MODE_META_KEY: &str = "maxMode";
+/// The model `meta` key indicating whether the model supports toggling max mode.
+pub const SUPPORTS_MAX_MODE_META_KEY: &str = "supportsMaxMode";
+/// The `session/set_model` and `ModelInfo` `_meta` key for arbitrary model parameters (`{"param": "value"}`).
+pub const MODEL_PARAMETERS_META_KEY: &str = "modelParameters";
+
+pub fn supports_fast_mode_meta(meta: Option<&serde_json::Map<String, Value>>) -> bool {
+    meta.and_then(|m| m.get(SUPPORTS_FAST_MODE_META_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub fn parse_fast_mode_meta(meta: Option<&serde_json::Map<String, Value>>) -> Option<bool> {
+    let raw = meta?.get(FAST_MODE_META_KEY)?;
+    match raw {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => parse_bool_or_speed_token(s),
+        _ => {
+            tracing::warn!(value = %raw, "meta.fastMode: expected boolean, ignoring");
+            None
+        }
+    }
+}
+
+pub fn fast_mode_meta_value(fast: bool) -> Value {
+    Value::Bool(fast)
+}
+
+pub fn supports_max_mode_meta(meta: Option<&serde_json::Map<String, Value>>) -> bool {
+    meta.and_then(|m| m.get(SUPPORTS_MAX_MODE_META_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub fn parse_max_mode_meta(meta: Option<&serde_json::Map<String, Value>>) -> Option<bool> {
+    let raw = meta?.get(MAX_MODE_META_KEY)?;
+    match raw {
+        Value::Bool(b) => Some(*b),
+        Value::String(s) => parse_bool_token(s),
+        _ => {
+            tracing::warn!(value = %raw, "meta.maxMode: expected boolean, ignoring");
+            None
+        }
+    }
+}
+
+pub fn max_mode_meta_value(max_mode: bool) -> Value {
+    Value::Bool(max_mode)
+}
+
+pub fn parse_model_parameters_meta(
+    meta: Option<&serde_json::Map<String, Value>>,
+) -> Option<Vec<(String, String)>> {
+    let raw = meta?.get(MODEL_PARAMETERS_META_KEY)?;
+    let obj = raw.as_object()?;
+    let params: Vec<(String, String)> = obj
+        .iter()
+        .filter_map(|(k, v)| {
+            let val = match v {
+                Value::String(s) => s.clone(),
+                Value::Bool(b) => b.to_string(),
+                Value::Number(n) => n.to_string(),
+                _ => return None,
+            };
+            Some((k.clone(), val))
+        })
+        .collect();
+    (!params.is_empty()).then_some(params)
+}
+
+pub fn model_parameters_meta_value(params: &[(String, String)]) -> Value {
+    let mut map = serde_json::Map::new();
+    for (k, v) in params {
+        map.insert(k.clone(), Value::String(v.clone()));
+    }
+    Value::Object(map)
+}
+
+/// Parse a boolean token (`true`/`false`/`on`/`off`/`1`/`0`/`yes`/`no`).
+pub fn parse_bool_token(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "1" | "yes" | "enabled" => Some(true),
+        "false" | "off" | "0" | "no" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse a boolean or speed token (`fast` -> `true`, `default`/`normal`/`standard`/`slow` -> `false`, plus booleans).
+pub fn parse_bool_or_speed_token(raw: &str) -> Option<bool> {
+    if let Some(b) = parse_bool_token(raw) {
+        return Some(b);
+    }
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "fast" | "turbo" => Some(true),
+        "default" | "normal" | "standard" | "slow" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse a context window token such as `"256k"`, `"1m"`, `"1.5m"`, `"200000"`, or `"1_000_000"`.
+pub fn parse_context_window_token(raw: &str) -> Option<NonZeroU64> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| *c != '_' && *c != ',' && !c.is_whitespace())
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let lower = cleaned.to_ascii_lowercase();
+    let tokens = if let Some(num) = lower.strip_suffix('m') {
+        let val: f64 = num.parse().ok()?;
+        if !val.is_finite() || val <= 0.0 {
+            return None;
+        }
+        (val * 1_000_000.0).round() as u64
+    } else if let Some(num) = lower.strip_suffix('k') {
+        let val: f64 = num.parse().ok()?;
+        if !val.is_finite() || val <= 0.0 {
+            return None;
+        }
+        (val * 1_000.0).round() as u64
+    } else {
+        lower.parse::<u64>().ok()?
+    };
+    NonZeroU64::new(tokens)
+}
+
+/// Format a token count in Cursor parameter notation (`1_000_000` -> `"1m"`, `256_000` -> `"256k"`).
+pub fn format_context_window_param(tokens: u64) -> String {
+    if tokens >= 1_000_000 && tokens.is_multiple_of(1_000_000) {
+        format!("{}m", tokens / 1_000_000)
+    } else if tokens >= 1_000_000 && tokens.is_multiple_of(100_000) {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 && tokens.is_multiple_of(1_000) {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Parsed model specifier supporting Cursor's bracket syntax: `base[context=1m,effort=high,fast=true]`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParameterizedModelSpec {
+    pub base_model_id: String,
+    pub has_brackets: bool,
+    pub effort: Option<ReasoningEffort>,
+    pub context_window: Option<NonZeroU64>,
+    pub fast_mode: Option<bool>,
+    pub max_mode: Option<bool>,
+    pub raw_params: Vec<(String, String)>,
+}
+
+/// Parse a model specifier that may include bracketed parameters (`model[context=256k,effort=high,fast=true]`).
+pub fn parse_parameterized_model_spec(raw: &str) -> Option<ParameterizedModelSpec> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let Some((base, rest)) = raw.split_once('[') else {
+        return Some(ParameterizedModelSpec {
+            base_model_id: raw.to_owned(),
+            has_brackets: false,
+            ..Default::default()
+        });
+    };
+    let base = base.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let inner = rest.strip_suffix(']').unwrap_or(rest);
+    let mut spec = ParameterizedModelSpec {
+        base_model_id: base.to_owned(),
+        has_brackets: true,
+        ..Default::default()
+    };
+    for part in inner.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (key, value) = match part.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => (part, "true"),
+        };
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        match key.to_ascii_lowercase().as_str() {
+            "effort" | "reasoning" | "reasoning_effort" | "reasoningeffort" | "thought_level"
+            | "thoughtlevel" => {
+                if let Ok(eff) = value.parse::<ReasoningEffort>() {
+                    spec.effort = Some(eff);
+                }
+            }
+            "thinking" => {
+                if let Ok(eff) = value.parse::<ReasoningEffort>() {
+                    spec.effort = Some(eff);
+                }
+            }
+            "context" | "context_window" | "contextwindow" | "window" | "cw" => {
+                if let Some(w) = parse_context_window_token(value) {
+                    spec.context_window = Some(w);
+                }
+            }
+            "fast" | "fast_mode" | "fastmode" => {
+                if let Some(b) = parse_bool_or_speed_token(value) {
+                    spec.fast_mode = Some(b);
+                }
+            }
+            "speed" => {
+                if let Some(b) = parse_bool_or_speed_token(value) {
+                    spec.fast_mode = Some(b);
+                }
+            }
+            "maxmode" | "max_mode" | "max" => {
+                if let Some(b) = parse_bool_token(value) {
+                    spec.max_mode = Some(b);
+                }
+            }
+            _ => {}
+        }
+        spec.raw_params.push((key.to_owned(), value.to_owned()));
+    }
+    Some(spec)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiBackend {
@@ -1693,5 +1925,30 @@ mod tests {
         let inner: &dyn TraceContext = &*cloned_trace;
         let downcast = inner.as_any().downcast_ref::<TestTrace>().unwrap();
         assert_eq!(downcast.0, "trace-data");
+    }
+
+    #[test]
+    fn test_parse_parameterized_model_spec_and_context_tokens() {
+        let spec = parse_parameterized_model_spec(
+            "claude-opus-4-8[context=1m,effort=high,fast=false,maxMode=true]",
+        )
+        .unwrap();
+        assert_eq!(spec.base_model_id, "claude-opus-4-8");
+        assert!(spec.has_brackets);
+        assert_eq!(spec.context_window, NonZeroU64::new(1_000_000));
+        assert_eq!(spec.effort, Some(ReasoningEffort::High));
+        assert_eq!(spec.fast_mode, Some(false));
+        assert_eq!(spec.max_mode, Some(true));
+        assert_eq!(spec.raw_params.len(), 4);
+
+        let speed_spec =
+            parse_parameterized_model_spec("grok-4.7[context=256k,speed=fast]").unwrap();
+        assert_eq!(speed_spec.base_model_id, "grok-4.7");
+        assert_eq!(speed_spec.context_window, NonZeroU64::new(256_000));
+        assert_eq!(speed_spec.fast_mode, Some(true));
+
+        assert_eq!(format_context_window_param(1_000_000), "1m");
+        assert_eq!(format_context_window_param(256_000), "256k");
+        assert_eq!(format_context_window_param(1_500_000), "1.5m");
     }
 }
