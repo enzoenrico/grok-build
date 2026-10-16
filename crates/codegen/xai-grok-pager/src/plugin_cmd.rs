@@ -155,6 +155,8 @@ pub enum PluginCommand {
     },
     /// Manage marketplace sources
     Marketplace(MarketplaceArgs),
+    /// Manage Cursor plugins and marketplaces (shared with the Cursor CLI and IDE)
+    Cursor(crate::plugin_cursor_cmd::CursorPluginArgs),
 }
 
 #[derive(Debug, clap::Args, Clone)]
@@ -256,6 +258,7 @@ pub async fn run(args: PluginArgs) -> Result<()> {
             dry_run,
         } => cmd_tag(&path, push, force, dry_run),
         PluginCommand::Marketplace(mp) => run_marketplace(mp.command).await,
+        PluginCommand::Cursor(args) => crate::plugin_cursor_cmd::run(args),
     }
 }
 
