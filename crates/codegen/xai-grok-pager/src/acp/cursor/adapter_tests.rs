@@ -41,7 +41,7 @@ fn session_new_response(id: u64) -> String {
 fn grok_extension_requests_are_answered_locally() {
     let mut adapter = CursorAdapter::new(None, false);
     let out =
-        adapter.outbound(r#"{"jsonrpc":"2.0","id":7,"method":"_x.ai/session/list","params":{}}"#);
+        adapter.outbound(r#"{"jsonrpc":"2.0","id":7,"method":"_x.ai/queue/clear","params":{}}"#);
     assert_eq!(out.len(), 1);
     let Routed::ToClient(line) = &out[0] else {
         panic!("extension request must not reach cursor: {out:?}");
@@ -1111,4 +1111,132 @@ fn other_grok_extensions_stay_unsupported() {
             "{method}"
         );
     }
+}
+
+/// An adapter whose Cursor login already went through, so requests reach Cursor directly.
+fn authenticated_adapter() -> CursorAdapter {
+    let mut adapter = CursorAdapter::new(None, false);
+    adapter.outbound(r#"{"jsonrpc":"2.0","id":1,"method":"authenticate","params":{}}"#);
+    adapter.inbound(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+    adapter
+}
+
+fn session_list(adapter: &mut CursorAdapter, id: u64, params: Value) -> Vec<Routed> {
+    adapter.outbound(
+        &json!({ "jsonrpc": "2.0", "id": id, "method": "_x.ai/session/list", "params": params })
+            .to_string(),
+    )
+}
+
+#[test]
+fn session_list_reads_cursors_chats_as_picker_rows() {
+    let mut adapter = authenticated_adapter();
+    let out = session_list(
+        &mut adapter,
+        7,
+        json!({ "cwd": "/repo", "limit": 2, "headless": false, "query": "Auth" }),
+    );
+    let forwarded = parse(&out[0]);
+    assert_eq!(forwarded["method"], "session/list");
+    assert_eq!(forwarded["params"], json!({ "cwd": "/repo" }));
+
+    let reply = adapter.inbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": forwarded["id"],
+            "result": { "sessions": [
+                { "sessionId": "c1", "cwd": "/repo", "title": "Fix auth", "updatedAt": "2026-10-16T09:00:00Z" },
+                { "sessionId": "c2", "cwd": "/repo", "title": "Docs" },
+                { "sessionId": "c3", "cwd": "/repo", "title": "auth tests", "updatedAt": "2026-10-15T09:00:00Z" },
+                { "sessionId": "c4", "cwd": "/repo", "title": "More auth" },
+            ] },
+        })
+        .to_string(),
+    );
+    let Routed::ToClient(line) = &reply[0] else {
+        panic!("the list must answer the pager: {reply:?}");
+    };
+    let resp: Value = serde_json::from_str(line).unwrap();
+    assert_eq!(resp["id"], 7);
+    assert_eq!(
+        resp["result"]["sessions"],
+        json!([
+            { "sessionId": "c1", "summary": "Fix auth", "source": "local", "cwd": "/repo", "updatedAt": "2026-10-16T09:00:00Z" },
+            { "sessionId": "c3", "summary": "auth tests", "source": "local", "cwd": "/repo", "updatedAt": "2026-10-15T09:00:00Z" },
+        ])
+    );
+}
+
+#[test]
+fn session_list_without_an_absolute_cwd_lists_every_chat() {
+    let mut adapter = authenticated_adapter();
+    let out = session_list(&mut adapter, 7, json!({ "cwd": "." }));
+    let forwarded = parse(&out[0]);
+    assert_eq!(forwarded["params"], json!({}));
+    let reply = adapter.inbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": forwarded["id"],
+            "result": { "sessions": [{ "sessionId": "c1", "title": "  " }] },
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        parse(&reply[0])["result"]["sessions"],
+        json!([{ "sessionId": "c1", "summary": "Cursor chat", "source": "local" }])
+    );
+}
+
+#[test]
+fn a_failed_cursor_session_list_is_an_empty_list() {
+    let mut adapter = authenticated_adapter();
+    let forwarded = parse(&session_list(&mut adapter, 7, json!({ "cwd": "/repo" }))[0]);
+    let reply = adapter.inbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": forwarded["id"],
+            "error": { "code": -32000, "message": "Authentication required" },
+        })
+        .to_string(),
+    );
+    let resp = parse(&reply[0]);
+    assert_eq!(resp["id"], 7);
+    assert_eq!(resp["result"]["sessions"], json!([]));
+}
+
+#[test]
+fn session_list_waits_for_cursor_login() {
+    let mut adapter = CursorAdapter::new(None, false);
+    let first = session_list(&mut adapter, 7, json!({ "cwd": "/repo" }));
+    assert_eq!(first.len(), 1);
+    assert_eq!(parse(&first[0])["method"], "authenticate");
+    let released =
+        adapter.inbound(r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","result":{}}"#);
+    assert_eq!(parse(&released[0])["method"], "session/list");
+
+    let mut logged_out = CursorAdapter::new(None, false);
+    session_list(&mut logged_out, 8, json!({ "cwd": "/repo" }));
+    let failed = logged_out.inbound(
+        r#"{"jsonrpc":"2.0","id":"grok-cursor-bridge-auth","error":{"code":-32000,"message":"Authentication required"}}"#,
+    );
+    let resp = parse(&failed[0]);
+    assert_eq!(resp["id"], 8);
+    assert_eq!(resp["result"]["sessions"], json!([]));
+
+    let mut stalled = CursorAdapter::new(None, false);
+    session_list(&mut stalled, 9, json!({ "cwd": "/repo" }));
+    let notices = stalled.auth_timed_out();
+    let resp: Value = serde_json::from_str(&notices[0]).unwrap();
+    assert_eq!(resp["id"], 9);
+    assert_eq!(resp["result"]["sessions"], json!([]));
+}
+
+#[test]
+fn session_list_notifications_are_dropped() {
+    let mut adapter = authenticated_adapter();
+    assert!(
+        adapter
+            .outbound(r#"{"jsonrpc":"2.0","method":"_x.ai/session/list","params":{}}"#)
+            .is_empty()
+    );
 }

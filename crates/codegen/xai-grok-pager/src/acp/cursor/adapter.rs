@@ -97,6 +97,15 @@ pub(crate) struct CursorAdapter {
     held_for_auth: Vec<String>,
     /// Reads `[skills].disabled`; tests swap in a fixed set.
     disabled_skills: Option<fn() -> HashSet<String>>,
+    /// `x.ai/session/list` requests forwarded to Cursor as ACP `session/list`, keyed by the internal id.
+    session_lists: HashMap<String, SessionListRequest>,
+}
+
+#[derive(Debug)]
+struct SessionListRequest {
+    client_id: Value,
+    query: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -141,6 +150,13 @@ impl CursorAdapter {
             };
             let request = self.catalog_request(id, catalog_method, msg.get("params"));
             return vec![Routed::Catalog(Box::new(request))];
+        }
+
+        if method.strip_prefix('_').unwrap_or(&method) == "x.ai/session/list" {
+            let Some(id) = id else {
+                return Vec::new();
+            };
+            return self.list_cursor_sessions(id, msg.get("params"));
         }
 
         if is_grok_extension(&method) {
@@ -389,6 +405,9 @@ impl CursorAdapter {
         if self.auth_request_id.as_ref() == Some(&id_key(&id)) {
             return self.finish_cursor_auth(&msg);
         }
+        if let Some(reply) = self.session_list_reply(&id, Some(&msg)) {
+            return vec![Routed::ToClient(reply)];
+        }
         if id
             .as_str()
             .is_some_and(|s| s.starts_with(INTERNAL_ID_PREFIX))
@@ -559,6 +578,10 @@ impl CursorAdapter {
                 let Some(held_id) = held_msg.get("id") else {
                     continue;
                 };
+                if let Some(reply) = self.session_list_reply(held_id, None) {
+                    out.push(Routed::ToClient(reply));
+                    continue;
+                }
                 self.pending.remove(&id_key(held_id));
                 out.push(Routed::ToClient(error_response(
                     held_id,
@@ -602,6 +625,10 @@ impl CursorAdapter {
             let Some(held_id) = held_msg.get("id") else {
                 continue;
             };
+            if let Some(reply) = self.session_list_reply(held_id, None) {
+                out.push(reply);
+                continue;
+            }
             self.pending.remove(&id_key(held_id));
             out.push(error_response(
                 held_id,
@@ -658,6 +685,101 @@ impl CursorAdapter {
         if !disabled.is_empty() {
             *commands = Value::Array(catalog::visible_commands(list, &disabled));
         }
+    }
+
+    /// Forward the picker's `x.ai/session/list` as Cursor's ACP `session/list`, which needs an absolute `cwd`.
+    /// Held behind `cursor_login`, since Cursor rejects the list until `authenticate` succeeds.
+    fn list_cursor_sessions(&mut self, client_id: Value, params: Option<&Value>) -> Vec<Routed> {
+        self.next_internal_id += 1;
+        let internal_id = format!("{INTERNAL_ID_PREFIX}session-list-{}", self.next_internal_id);
+        let cwd = params
+            .and_then(|p| p.get("cwd"))
+            .and_then(Value::as_str)
+            .filter(|cwd| std::path::Path::new(cwd).is_absolute());
+        let mut list_params = Map::new();
+        if let Some(cwd) = cwd {
+            list_params.insert("cwd".to_owned(), Value::String(cwd.to_owned()));
+        }
+        self.session_lists.insert(
+            id_key(&Value::String(internal_id.clone())),
+            SessionListRequest {
+                client_id,
+                query: params
+                    .and_then(|p| p.get("query"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|q| !q.is_empty())
+                    .map(str::to_lowercase),
+                limit: params
+                    .and_then(|p| p.get("limit"))
+                    .and_then(Value::as_u64)
+                    .and_then(|limit| usize::try_from(limit).ok()),
+            },
+        );
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": internal_id,
+            "method": "session/list",
+            "params": list_params,
+        })
+        .to_string();
+        if !self.cursor_authenticated {
+            self.held_for_auth.push(line);
+            return self.start_cursor_auth();
+        }
+        vec![Routed::ToAgent(line)]
+    }
+
+    /// The pager's answer to a forwarded session list: Cursor's sessions as picker rows, or none when Cursor
+    /// failed (logged out, for example) so the picker shows an empty list instead of an error.
+    fn session_list_reply(
+        &mut self,
+        internal_id: &Value,
+        response: Option<&Value>,
+    ) -> Option<String> {
+        let request = self.session_lists.remove(&id_key(internal_id))?;
+        if let Some(error) = response.and_then(|r| r.get("error")) {
+            tracing::warn!(%error, "cursor backend: session/list failed");
+        }
+        let sessions: Vec<Value> = response
+            .and_then(|r| r.pointer("/result/sessions"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|session| {
+                let session_id = session.get("sessionId").and_then(Value::as_str)?;
+                let title = session
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("Cursor chat");
+                if let Some(query) = &request.query
+                    && !title.to_lowercase().contains(query)
+                {
+                    return None;
+                }
+                let mut row = Map::new();
+                row.insert("sessionId".to_owned(), Value::String(session_id.to_owned()));
+                row.insert("summary".to_owned(), Value::String(title.to_owned()));
+                row.insert("source".to_owned(), Value::String("local".to_owned()));
+                for key in ["cwd", "updatedAt"] {
+                    if let Some(value) = session.get(key).filter(|v| v.is_string()) {
+                        row.insert(key.to_owned(), value.clone());
+                    }
+                }
+                Some(Value::Object(row))
+            })
+            .take(request.limit.unwrap_or(usize::MAX))
+            .collect();
+        Some(
+            json!({
+                "jsonrpc": "2.0",
+                "id": request.client_id,
+                "result": { "sessions": sessions },
+            })
+            .to_string(),
+        )
     }
 
     /// The catalog request for `method`, resolved against the session it names (or the only session).
