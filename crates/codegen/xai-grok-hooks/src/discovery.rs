@@ -414,14 +414,13 @@ fn cursor_enterprise_hooks_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("GROK_CURSOR_ENTERPRISE_HOOKS") {
         return (!path.is_empty()).then(|| PathBuf::from(path));
     }
-    let path = if cfg!(target_os = "macos") {
+    Some(if cfg!(target_os = "macos") {
         PathBuf::from("/Library/Application Support/Cursor/hooks.json")
     } else if cfg!(windows) {
         PathBuf::from(r"C:\ProgramData\Cursor\hooks.json")
     } else {
         PathBuf::from("/etc/cursor/hooks.json")
-    };
-    path.is_file().then_some(path)
+    })
 }
 
 /// Config-layer specs go first, so first-wins dedup prefers them over a byte-identical file hook.
@@ -604,6 +603,24 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(gates, expected, "gate events changed");
+    }
+
+    #[test]
+    fn cursor_enterprise_hooks_file_is_global_when_cursor_hooks_are_on() {
+        let Some(enterprise) = cursor_enterprise_hooks_path() else {
+            return;
+        };
+        let is_enterprise = |source: &HookSourceConfig| matches!(source, HookSourceConfig::SettingsFile(path) if path == &enterprise);
+        let on = discover_hook_source_paths(untrusted_without_git_root());
+        assert!(on.global.iter().any(is_enterprise));
+        let off = discover_hook_source_paths(DiscoveryOptions {
+            compat: CompatHooks {
+                cursor: false,
+                claude: true,
+            },
+            ..untrusted_without_git_root()
+        });
+        assert!(!off.global.iter().any(is_enterprise));
     }
 
     #[test]
