@@ -295,12 +295,165 @@ const MAX_CURSOR_PROJECT_WALK: usize = 32;
 const MAX_CURSOR_PLUGINS: usize = 64;
 
 /// `CURSOR_CONFIG_DIR` when set, otherwise `<home>/.cursor`.
-fn cursor_user_config_dir(home: Option<&Path>) -> Option<PathBuf> {
+pub fn cursor_user_config_dir(home: Option<&Path>) -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CURSOR_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir));
     }
     home.map(|home| home.join(".cursor"))
         .or_else(|| xai_dirs::home_dir().map(|home| home.join(".cursor")))
+}
+
+/// One Cursor plugin installed under `plugins/cache`, as named by `.cloud-plugin-manifest.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorInstalledPlugin {
+    pub name: String,
+    /// Marketplace slug. Absent installs are still usable; callers can label them `cursor`.
+    pub marketplace: Option<String>,
+    pub root: PathBuf,
+    pub description: Option<String>,
+    pub skill_count: usize,
+    pub command_count: usize,
+    pub has_hooks: bool,
+    pub has_agents: bool,
+    pub has_mcp: bool,
+}
+
+/// Plugins recorded in Cursor's cloud plugin manifest whose cache directory exists.
+pub fn cursor_installed_plugins(config_dir: &Path) -> Vec<CursorInstalledPlugin> {
+    let manifest_path = config_dir
+        .join("plugins")
+        .join("cache")
+        .join(".cloud-plugin-manifest.json");
+    let Ok(text) = std::fs::read_to_string(&manifest_path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(plugins) = value.get("plugins").and_then(|entry| entry.as_array()) else {
+        return Vec::new();
+    };
+    let mut installed = Vec::new();
+    for plugin in plugins.iter().take(MAX_CURSOR_PLUGINS) {
+        let Some(installed_plugin) = cursor_installed_plugin(config_dir, plugin) else {
+            continue;
+        };
+        installed.push(installed_plugin);
+    }
+    installed
+}
+
+fn cursor_installed_plugin(
+    config_dir: &Path,
+    plugin: &serde_json::Value,
+) -> Option<CursorInstalledPlugin> {
+    let name = plugin.get("name").and_then(|value| value.as_str())?;
+    if name.is_empty() || !cursor_path_segment_ok(name) {
+        return None;
+    }
+    let root = cursor_cache_plugin_root(config_dir, plugin)?;
+    let capabilities = plugin.get("declaredCapabilityPaths");
+    let skill_count = capability_len(capabilities, "skill");
+    let command_count = capability_len(capabilities, "command");
+    let has_agents = capability_len(capabilities, "subagent") > 0 || root.join("agents").is_dir();
+    let has_hooks = root.join("hooks").join("hooks.json").is_file();
+    let has_mcp = root.join("mcp.json").is_file() || root.join(".mcp.json").is_file();
+    let marketplace = plugin
+        .get("marketplaceSlug")
+        .and_then(|value| value.as_str())
+        .filter(|slug| cursor_path_segment_ok(slug))
+        .map(str::to_string);
+    Some(CursorInstalledPlugin {
+        name: name.to_string(),
+        marketplace,
+        description: cursor_plugin_description(&root),
+        root,
+        skill_count,
+        command_count,
+        has_hooks,
+        has_agents,
+        has_mcp,
+    })
+}
+
+fn capability_len(capabilities: Option<&serde_json::Value>, key: &str) -> usize {
+    capabilities
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.as_array())
+        .map(|entries| entries.len())
+        .unwrap_or(0)
+}
+
+fn cursor_plugin_description(root: &Path) -> Option<String> {
+    let path = root.join(".cursor-plugin").join("plugin.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("description")
+        .and_then(|entry| entry.as_str())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn cursor_path_segment_ok(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.contains("..")
+        && !segment.contains('/')
+        && !segment.contains('\\')
+}
+
+fn cursor_cache_plugin_root(config_dir: &Path, plugin: &serde_json::Value) -> Option<PathBuf> {
+    let slug = plugin
+        .get("marketplaceSlug")
+        .and_then(|value| value.as_str())?;
+    let id = plugin.get("pluginId").and_then(|value| value.as_str())?;
+    if !cursor_path_segment_ok(slug) || !cursor_path_segment_ok(id) {
+        return None;
+    }
+    let base = config_dir.join("plugins").join("cache").join(slug).join(id);
+    let mut refs = Vec::new();
+    if let Some(sha) = plugin
+        .get("resolvedCommitSha")
+        .and_then(|value| value.as_str())
+        .filter(|sha| cursor_path_segment_ok(sha))
+    {
+        refs.push(sha.to_string());
+    }
+    if let Some(git_ref) = plugin
+        .get("gitRef")
+        .and_then(|value| value.as_str())
+        .filter(|git_ref| cursor_path_segment_ok(git_ref))
+    {
+        refs.push(git_ref.to_string());
+    }
+    if let Some(tag) = plugin
+        .get("releaseTag")
+        .and_then(|value| value.as_str())
+        .filter(|tag| cursor_path_segment_ok(tag))
+    {
+        refs.push(format!("release_{tag}"));
+        refs.push(tag.to_string());
+    }
+    refs.into_iter()
+        .map(|git_ref| base.join(git_ref))
+        .find(|path| path.is_dir())
+}
+
+/// Direct children of `plugins/local`, capped and sorted.
+pub fn cursor_local_plugin_dirs(config_dir: &Path) -> Vec<PathBuf> {
+    let root = config_dir.join("plugins").join("local");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.truncate(MAX_CURSOR_PLUGINS);
+    dirs
 }
 
 /// Directories from `cwd` up through the git root or `$HOME`, whichever comes first.
@@ -359,23 +512,36 @@ fn cursor_mcp_files(cwd: &Path, config_dir: Option<&Path>) -> Vec<CursorMcpFile>
         });
     }
     let plugins_root = config_dir.join("plugins").join("local");
-    let Ok(entries) = std::fs::read_dir(&plugins_root) else {
-        return files;
-    };
-    let mut plugin_dirs: Vec<_> = entries.filter_map(Result::ok).collect();
-    plugin_dirs.sort_by_key(|entry| entry.file_name());
-    for entry in plugin_dirs.into_iter().take(MAX_CURSOR_PLUGINS) {
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
+    if let Ok(entries) = std::fs::read_dir(&plugins_root) {
+        let mut plugin_dirs: Vec<_> = entries.filter_map(Result::ok).collect();
+        plugin_dirs.sort_by_key(|entry| entry.file_name());
+        for entry in plugin_dirs.into_iter().take(MAX_CURSOR_PLUGINS) {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let path = entry.path().join("mcp.json");
+            if !path.is_file() {
+                continue;
+            }
+            let plugin_name = entry.file_name().to_string_lossy().into_owned();
+            files.push(CursorMcpFile {
+                source: McpServerSource::Plugin {
+                    plugin_name,
+                    path: path.clone(),
+                    scope: super::McpServerScope::User,
+                },
+                path,
+            });
         }
-        let path = entry.path().join("mcp.json");
+    }
+    for plugin in cursor_installed_plugins(config_dir) {
+        let path = plugin.root.join("mcp.json");
         if !path.is_file() {
             continue;
         }
-        let plugin_name = entry.file_name().to_string_lossy().into_owned();
         files.push(CursorMcpFile {
             source: McpServerSource::Plugin {
-                plugin_name,
+                plugin_name: plugin.name,
                 path: path.clone(),
                 scope: super::McpServerScope::User,
             },

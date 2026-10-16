@@ -115,13 +115,46 @@ pub fn with_plugin_hooks(
     base: Option<Arc<HookRegistry>>,
     source: PluginHookSource<'_>,
 ) -> Option<Arc<HookRegistry>> {
+    with_plugin_hooks_filtered(base, source, true)
+}
+
+/// Like [`with_plugin_hooks`], but drops hooks from Cursor-installed plugins when `include_cursor` is false.
+/// `compat.cursor.hooks = false` uses that so the hooks cell covers plugin hooks as well as `hooks.json`.
+pub fn with_plugin_hooks_filtered(
+    base: Option<Arc<HookRegistry>>,
+    source: PluginHookSource<'_>,
+    include_cursor: bool,
+) -> Option<Arc<HookRegistry>> {
     match source {
         PluginHookSource::Registry(plugins) => replace_plugin_hooks(
             base,
-            plugins.map(active_plugin_hook_specs).unwrap_or_default(),
+            plugins
+                .map(|registry| active_plugin_hook_specs_filtered(registry, include_cursor))
+                .unwrap_or_default(),
         ),
         PluginHookSource::Parent => base,
     }
+}
+
+fn active_plugin_hook_specs_filtered(
+    registry: &PluginRegistry,
+    include_cursor: bool,
+) -> Vec<HookSpec> {
+    registry
+        .active_plugins()
+        .into_iter()
+        .filter(|plugin| include_cursor || !is_cursor_plugin_origin(&plugin.origin))
+        .flat_map(|plugin| plugin.hook_specs.iter().cloned())
+        .collect()
+}
+
+fn is_cursor_plugin_origin(origin: &super::discovery::PluginOrigin) -> bool {
+    matches!(
+        origin,
+        super::discovery::PluginOrigin::ProjectCursor
+            | super::discovery::PluginOrigin::UserCursor
+            | super::discovery::PluginOrigin::CursorInstalled { .. }
+    )
 }
 
 /// Returns `base` with its plugin-layer hooks replaced by `specs`, or `None` when no hook remains.

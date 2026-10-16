@@ -187,14 +187,16 @@ impl IndexEntry {
 }
 
 /// Attempt to load the marketplace index from the given root directory.
-/// `.grok-plugin/marketplace.json` (preferred xAI convention); `.grok-plugin/plugin.json`; `.claude-plugin/marketplace.json` (alternate layout compatibility); `.claude-plugin/plugin.json`.
+/// `.grok-plugin/marketplace.json` (preferred xAI convention); `.grok-plugin/plugin.json`; `.cursor-plugin/marketplace.json`; `.claude-plugin/marketplace.json` (alternate layout compatibility); `.claude-plugin/plugin.json`.
 /// Returns `Err` if a file exists but can't be parsed.
 pub fn load_index(marketplace_root: &Path) -> Result<Option<MarketplaceIndex>, String> {
     let grok_dir = marketplace_root.join(".grok-plugin");
+    let cursor_dir = marketplace_root.join(".cursor-plugin");
     let claude_dir = marketplace_root.join(".claude-plugin");
     let candidates = [
         grok_dir.join("marketplace.json"),
         grok_dir.join("plugin.json"),
+        cursor_dir.join("marketplace.json"),
         claude_dir.join("marketplace.json"),
         claude_dir.join("plugin.json"),
     ];
@@ -309,6 +311,27 @@ mod tests {
             .unwrap();
         }
         assert_eq!(load_index(dir.path()).unwrap().unwrap().name, "grok");
+    }
+
+    #[test]
+    fn load_index_reads_cursor_marketplace_with_string_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor_dir = dir.path().join(".cursor-plugin");
+        std::fs::create_dir_all(&cursor_dir).unwrap();
+        std::fs::write(
+            cursor_dir.join("marketplace.json"),
+            r#"{
+                "name": "cursor-market",
+                "plugins": [{ "name": "demo", "source": "./plugins/demo" }]
+            }"#,
+        )
+        .unwrap();
+        let index = load_index(dir.path()).unwrap().unwrap();
+        assert_eq!(index.name, "cursor-market");
+        assert_eq!(
+            nth(&index.plugins, 0).resolved_path().as_deref(),
+            Some("plugins/demo")
+        );
     }
 
     #[test]

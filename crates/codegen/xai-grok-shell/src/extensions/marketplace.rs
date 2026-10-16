@@ -93,6 +93,7 @@ async fn handle_list() -> ExtResult {
         );
         results.push(scan);
     }
+    results.extend(cursor_marketplace_scans());
 
     xai_grok_telemetry::unified_log::info(
         "marketplace handle_list: complete",
@@ -106,12 +107,84 @@ async fn handle_list() -> ExtResult {
     super::to_ext_response(Ok(response))
 }
 
+fn cursor_managed_message() -> String {
+    "Cursor manages this marketplace. Change installs in Cursor; grok loads the plugins that are already installed there.".to_string()
+}
+
+fn cursor_managed_outcome(path: &str) -> Option<xai_hooks_plugins_types::ActionOutcome> {
+    path.starts_with("cursor://")
+        .then(|| xai_hooks_plugins_types::ActionOutcome {
+            status: xai_hooks_plugins_types::OutcomeStatus::Unsupported,
+            message: cursor_managed_message(),
+            requires_reload: false,
+            requires_restart: false,
+        })
+}
+
+/// Installed Cursor marketplaces, grouped by slug. Read-only: install and remove stay in Cursor.
+fn cursor_marketplace_scans() -> Vec<MarketplaceScanResult> {
+    use std::collections::BTreeMap;
+    let Some(config_dir) =
+        xai_grok_config::mcp_servers::cursor_user_config_dir(xai_dirs::home_dir().as_deref())
+    else {
+        return Vec::new();
+    };
+    let mut groups: BTreeMap<String, Vec<MarketplacePluginEntry>> = BTreeMap::new();
+    for plugin in xai_grok_config::mcp_servers::cursor_installed_plugins(&config_dir) {
+        let slug = plugin
+            .marketplace
+            .clone()
+            .unwrap_or_else(|| "cursor".to_string());
+        groups
+            .entry(slug)
+            .or_default()
+            .push(MarketplacePluginEntry {
+                name: plugin.name,
+                version: None,
+                description: plugin.description,
+                category: None,
+                author: None,
+                tags: Vec::new(),
+                keywords: Vec::new(),
+                domains: Vec::new(),
+                homepage: None,
+                relative_path: plugin.root.display().to_string(),
+                skill_count: plugin.skill_count,
+                has_hooks: plugin.has_hooks,
+                has_agents: plugin.has_agents,
+                has_mcp: plugin.has_mcp,
+                install_status: "installed".to_string(),
+                installed_version: None,
+                components: None,
+                remote_url: None,
+                remote_ref: None,
+                remote_sha: None,
+                remote_subdir: None,
+            });
+    }
+    groups
+        .into_iter()
+        .map(|(name, plugins)| MarketplaceScanResult {
+            source_name: name.clone(),
+            source_kind: "cursor".to_string(),
+            source_url_or_path: format!("cursor://{name}"),
+            plugins,
+            error: None,
+        })
+        .collect()
+}
+
 async fn handle_action(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     let req: MarketplaceActionRequest = super::parse_params(args)?;
     let sid = acp::SessionId::new(req.session_id);
 
     let outcome = match req.action {
         MarketplaceAction::Refresh { source_url_or_path } => {
+            if let Some(path) = source_url_or_path.as_deref()
+                && let Some(outcome) = cursor_managed_outcome(path)
+            {
+                return super::to_ext_response(Ok(outcome));
+            }
             // Force re-sync git caches (local sources are re-scanned on next
             // list) on the blocking pool (LocalSet invariant: plugin/acquire.rs).
             let sources = load_filtered_marketplace_sources();
@@ -131,18 +204,40 @@ async fn handle_action(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         MarketplaceAction::Install {
             source_url_or_path,
             plugin_relative_path,
-        } => handle_install(agent, &sid, &source_url_or_path, &plugin_relative_path).await,
+        } => {
+            if let Some(outcome) = cursor_managed_outcome(&source_url_or_path) {
+                outcome
+            } else {
+                handle_install(agent, &sid, &source_url_or_path, &plugin_relative_path).await
+            }
+        }
         MarketplaceAction::Update {
             source_url_or_path,
             plugin_relative_path,
-        } => handle_update(agent, &sid, &source_url_or_path, &plugin_relative_path).await,
+        } => {
+            if let Some(outcome) = cursor_managed_outcome(&source_url_or_path) {
+                outcome
+            } else {
+                handle_update(agent, &sid, &source_url_or_path, &plugin_relative_path).await
+            }
+        }
         MarketplaceAction::Uninstall {
             source_url_or_path,
             plugin_relative_path,
-        } => handle_uninstall(agent, &sid, &source_url_or_path, &plugin_relative_path).await,
+        } => {
+            if let Some(outcome) = cursor_managed_outcome(&source_url_or_path) {
+                outcome
+            } else {
+                handle_uninstall(agent, &sid, &source_url_or_path, &plugin_relative_path).await
+            }
+        }
         MarketplaceAction::AddSource { url } => handle_add_source(&url).await,
         MarketplaceAction::RemoveSource { source_url_or_path } => {
-            handle_remove_source(&source_url_or_path).await
+            if let Some(outcome) = cursor_managed_outcome(&source_url_or_path) {
+                outcome
+            } else {
+                handle_remove_source(&source_url_or_path).await
+            }
         }
     };
 

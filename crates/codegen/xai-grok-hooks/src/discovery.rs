@@ -314,6 +314,21 @@ impl HookSourcePaths {
     }
 }
 
+fn cursor_enterprise_hooks_path() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        std::path::PathBuf::from("/Library/Application Support/Cursor/hooks.json")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::path::PathBuf::from(r"C:\ProgramData\Cursor\hooks.json")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::path::PathBuf::from("/etc/cursor/hooks.json")
+    }
+}
+
 fn classify_grok_hook_source(path: PathBuf) -> HookSourceConfig {
     if path.is_dir() {
         HookSourceConfig::Directory(path)
@@ -365,6 +380,12 @@ pub fn discover_hook_source_paths(options: DiscoveryOptions<'_>) -> HookSourcePa
                 Vec::new()
             }
         };
+
+    if include_cursor {
+        global.push(HookSourceConfig::SettingsFile(
+            cursor_enterprise_hooks_path(),
+        ));
+    }
 
     if let Some(h) = options.home {
         if include_claude {
@@ -583,6 +604,27 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(gates, expected, "gate events changed");
+    }
+
+    #[test]
+    fn cursor_enterprise_hooks_file_is_global_when_cursor_hooks_are_on() {
+        let on = discover_hook_source_paths(untrusted_without_git_root());
+        let enterprise = cursor_enterprise_hooks_path();
+        assert!(on.global.iter().any(|source| matches!(
+            source,
+            HookSourceConfig::SettingsFile(path) if path == &enterprise
+        )));
+        let off = discover_hook_source_paths(DiscoveryOptions {
+            compat: CompatHooks {
+                cursor: false,
+                claude: true,
+            },
+            ..untrusted_without_git_root()
+        });
+        assert!(off.global.iter().all(|source| !matches!(
+            source,
+            HookSourceConfig::SettingsFile(path) if path == &enterprise
+        )));
     }
 
     #[test]

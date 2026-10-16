@@ -748,11 +748,12 @@ impl SessionActor {
         *self.hook_load_errors.borrow_mut() = errors.iter().map(|e| e.to_string()).collect();
         // Clone the Arc out of the RefCell so the borrow is dropped immediately.
         let plugin_registry_snapshot = self.plugin_registry.borrow().clone();
-        let registry = xai_grok_agent::plugins::hooks_adapter::with_plugin_hooks(
+        let registry = xai_grok_agent::plugins::hooks_adapter::with_plugin_hooks_filtered(
             (!registry.is_empty()).then(|| Arc::new(registry)),
             xai_grok_agent::plugins::hooks_adapter::PluginHookSource::Registry(
                 plugin_registry_snapshot.as_deref(),
             ),
+            self.rebuild_spec.compat.cursor.hooks,
         );
         let hook_count = registry.as_ref().map_or(0, |registry| registry.len());
         *self.hook_registry.borrow_mut() = registry;

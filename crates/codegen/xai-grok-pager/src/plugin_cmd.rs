@@ -61,6 +61,7 @@ struct MarketplaceSourceEntry {
 enum MarketplaceSourceDetail {
     Git { url: String, branch: Option<String> },
     Local { path: PathBuf },
+    Cursor { marketplace: String, plugins: usize },
 }
 
 impl MarketplaceSourceDetail {
@@ -68,6 +69,7 @@ impl MarketplaceSourceDetail {
         match self {
             Self::Git { .. } => "git",
             Self::Local { .. } => "local",
+            Self::Cursor { .. } => "cursor",
         }
     }
 }
@@ -808,12 +810,28 @@ async fn run_marketplace(cmd: MarketplaceCommand) -> Result<()> {
     }
 }
 
+fn cursor_marketplace_counts() -> Vec<(String, usize)> {
+    use std::collections::BTreeMap;
+    let Some(config_dir) =
+        xai_grok_config::mcp_servers::cursor_user_config_dir(xai_dirs::home_dir().as_deref())
+    else {
+        return Vec::new();
+    };
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for plugin in xai_grok_config::mcp_servers::cursor_installed_plugins(&config_dir) {
+        let name = plugin.marketplace.unwrap_or_else(|| "cursor".to_string());
+        *counts.entry(name).or_default() += 1;
+    }
+    counts.into_iter().collect()
+}
+
 fn marketplace_list(
     sources: &[xai_grok_plugin_marketplace::MarketplaceSource],
     json: bool,
 ) -> Result<()> {
+    let cursor = cursor_marketplace_counts();
     if json {
-        let entries: Vec<MarketplaceSourceEntry> = sources
+        let mut entries: Vec<MarketplaceSourceEntry> = sources
             .iter()
             .map(|s| {
                 let detail = match &s.kind {
@@ -832,8 +850,19 @@ fn marketplace_list(
                 }
             })
             .collect();
+        for (name, plugins) in cursor {
+            let detail = MarketplaceSourceDetail::Cursor {
+                marketplace: name.clone(),
+                plugins,
+            };
+            entries.push(MarketplaceSourceEntry {
+                name,
+                kind: detail.kind().to_string(),
+                source: detail,
+            });
+        }
         println!("{}", serde_json::to_string_pretty(&entries)?);
-    } else if sources.is_empty() {
+    } else if sources.is_empty() && cursor.is_empty() {
         println!(
             "No marketplace sources configured.\n\
              Run `grok plugin marketplace add --help` to get started."
@@ -841,6 +870,12 @@ fn marketplace_list(
     } else {
         for s in sources {
             println!("  {}: {}", s.name, s.identity());
+        }
+        if !cursor.is_empty() {
+            println!("Cursor marketplaces (installed in Cursor, read-only here):");
+            for (name, plugins) in cursor {
+                println!("  {name}: {plugins} plugin(s)");
+            }
         }
     }
     Ok(())

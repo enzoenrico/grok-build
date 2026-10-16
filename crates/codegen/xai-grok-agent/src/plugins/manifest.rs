@@ -1,7 +1,8 @@
 //! The canonical manifest location is `plugin.json` at the plugin root.
 //! Fallback locations (checked in order when the root manifest is absent):
 //! 1. `.grok-plugin/plugin.json`
-//! 2. `.claude-plugin/plugin.json`
+//! 2. `.cursor-plugin/plugin.json`
+//! 3. `.claude-plugin/plugin.json`
 //!
 //! If no manifest is found, the plugin can still function via convention-based discovery (skills/, agents/, .mcp.json, hooks/hooks.json).
 //! The plugin name is then derived from the directory name.
@@ -184,10 +185,10 @@ impl PluginManifest {
 
     pub fn mcp_config_path(&self, plugin_root: &Path) -> Option<PathBuf> {
         if matches!(self.mcp_servers, Some(PathOrInline::Inline(_))) {
-            let default = plugin_root.join(".mcp.json");
-            return default.is_file().then_some(default);
+            return existing_mcp_file(plugin_root);
         }
         resolve_component_path(&self.mcp_servers, plugin_root, ".mcp.json", "MCP config")
+            .or_else(|| existing_mcp_file(plugin_root))
     }
 
     /// The runtime parses and executes inline hooks via `parse_plugin_hooks_from_value()`.
@@ -237,6 +238,16 @@ impl PluginManifest {
     }
 }
 
+/// Cursor plugins ship `mcp.json`. Grok and Claude plugins ship `.mcp.json`. Prefer the dotted name when both exist.
+fn existing_mcp_file(plugin_root: &Path) -> Option<PathBuf> {
+    let dotted = plugin_root.join(".mcp.json");
+    if dotted.is_file() {
+        return Some(dotted);
+    }
+    let plain = plugin_root.join("mcp.json");
+    plain.is_file().then_some(plain)
+}
+
 fn resolve_dirs(
     field: &Option<PathOrPaths>,
     plugin_root: &Path,
@@ -261,6 +272,7 @@ fn resolve_dirs(
 const MANIFEST_PATHS: &[&str] = &[
     "plugin.json",
     ".grok-plugin/plugin.json",
+    ".cursor-plugin/plugin.json",
     ".claude-plugin/plugin.json",
 ];
 

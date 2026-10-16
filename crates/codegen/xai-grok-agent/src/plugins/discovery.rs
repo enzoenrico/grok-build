@@ -3,9 +3,9 @@
 //! Discovers plugins from multiple sources in priority order:
 //! 1. CLI `--plugin-dir` paths (scope: `CliOverride`)
 //! 2. `.grok/plugins/*/` (scope: `Project`, walked from cwd to worktree root)
-//! 3. `.claude/plugins/*/` (scope: `Project`, compat)
+//! 3. `.claude/plugins/*/` and `.cursor/plugins/*/` (scope: `Project`, compat)
 //! 4. `~/.grok/plugins/*/` (scope: `User`)
-//! 5. `~/.claude/plugins/*/` (scope: `User`, compat)
+//! 5. `~/.claude/plugins/*/` and Cursor's installed plugins (scope: `User`, compat)
 //!    `~/.grok/installed-plugins/*/` (scope: `User`, marketplace installs)
 //!    Installed plugins from `~/.claude/plugins/installed_plugins.json` (scope: `User`)
 //! 6. Paths from `[plugins].paths` in config (scope: `ConfigPath`)
@@ -84,6 +84,15 @@ pub enum PluginOrigin {
     UserGrok,
     /// `~/.claude/plugins/`.
     UserClaude,
+    /// Project `.cursor/plugins/`.
+    ProjectCursor,
+    /// `~/.cursor/plugins/local/`.
+    UserCursor,
+    /// A plugin installed from a Cursor marketplace (`~/.cursor/plugins/cache`).
+    CursorInstalled {
+        /// Marketplace slug from Cursor's plugin manifest (`cursor-public`, for example).
+        marketplace: String,
+    },
     /// A compat marketplace clone (project `extraKnownMarketplaces` or user `known_marketplaces.json`).
     ClaudeMarketplace {
         /// Marketplace name from the settings/registry entry.
@@ -193,7 +202,17 @@ impl DiscoveryConfig {
                 tracing::debug!(plugin = %name, id = %dp.id.0, "plugin already in enabled/disabled list");
                 continue;
             }
-            if matches!(dp.scope, PluginScope::CliOverride | PluginScope::ConfigPath) {
+            // Cursor installs were already chosen in Cursor, so they start enabled.
+            // `grok plugin disable` still wins: a name already in either list is left alone.
+            let cursor_install = matches!(
+                dp.origin,
+                PluginOrigin::ProjectCursor
+                    | PluginOrigin::UserCursor
+                    | PluginOrigin::CursorInstalled { .. }
+            );
+            if matches!(dp.scope, PluginScope::CliOverride | PluginScope::ConfigPath)
+                || cursor_install
+            {
                 tracing::debug!(plugin = %name, scope = ?dp.scope, "auto-adding to enabled list");
                 self.enabled.push(name.clone());
             } else {
@@ -222,14 +241,14 @@ fn user_plugin_dirs(home: Option<&Path>, grok: Option<&Path>) -> Vec<(PathBuf, P
 
 /// Origin for a project plugins parent dir: `.claude/plugins` vs `.grok/plugins`.
 fn project_plugins_dir_origin(plugins_dir: &Path) -> PluginOrigin {
-    let is_claude = plugins_dir
+    match plugins_dir
         .parent()
-        .and_then(|p| p.file_name())
-        .is_some_and(|n| n == ".claude");
-    if is_claude {
-        PluginOrigin::ProjectClaude
-    } else {
-        PluginOrigin::ProjectGrok
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+    {
+        Some(".claude") => PluginOrigin::ProjectClaude,
+        Some(".cursor") => PluginOrigin::ProjectCursor,
+        _ => PluginOrigin::ProjectGrok,
     }
 }
 
@@ -247,7 +266,10 @@ pub fn project_plugin_dirs(cwd: Option<&Path>) -> (Vec<PathBuf>, Option<PathBuf>
 /// Existing project plugin parent dirs (`.grok/plugins`, `.claude/plugins`) under each dir of a precomputed [`crate::repo::RepoDirChain`].
 /// The folder-trust gate reuses its one shared chain here so detection and discovery can never drift.
 pub fn project_plugin_dirs_in(chain_dirs: &[PathBuf]) -> Vec<PathBuf> {
-    crate::repo::existing_subdirs_along(chain_dirs, &[".grok/plugins", ".claude/plugins"])
+    crate::repo::existing_subdirs_along(
+        chain_dirs,
+        &[".grok/plugins", ".claude/plugins", ".cursor/plugins"],
+    )
 }
 
 /// `cwd` is used to find the git worktree root for project-scope plugins.
@@ -286,15 +308,27 @@ pub fn discover_plugins(
         let (project_dirs, git_root) = project_plugin_dirs(Some(cwd));
         for plugins_dir in project_dirs {
             let origin = project_plugins_dir_origin(&plugins_dir);
-            scan_plugin_dir(
-                &plugins_dir,
-                PluginScope::Project,
-                origin,
-                trust_store,
-                project_trusted,
-                &mut seen_paths,
-                &mut candidates,
-            );
+            if origin == PluginOrigin::ProjectCursor {
+                scan_cursor_plugin_parent(
+                    &plugins_dir,
+                    PluginScope::Project,
+                    origin,
+                    trust_store,
+                    project_trusted,
+                    &mut seen_paths,
+                    &mut candidates,
+                );
+            } else {
+                scan_plugin_dir(
+                    &plugins_dir,
+                    PluginScope::Project,
+                    origin,
+                    trust_store,
+                    project_trusted,
+                    &mut seen_paths,
+                    &mut candidates,
+                );
+            }
         }
 
         // 3b. Marketplace plugins (extraKnownMarketplaces in .claude/settings.json).
@@ -402,6 +436,19 @@ pub fn discover_plugins(
         }
     }
 
+    // 5d. Cursor plugins: marketplace cache from `.cloud-plugin-manifest.json`, then `plugins/local`.
+    if let Some(config_dir) =
+        xai_grok_config::mcp_servers::cursor_user_config_dir(xai_dirs::home_dir().as_deref())
+    {
+        collect_cursor_user_plugins(
+            &config_dir,
+            trust_store,
+            project_trusted,
+            &mut seen_paths,
+            &mut candidates,
+        );
+    }
+
     // 6. Config-path plugins
     for dir in &config.config_paths {
         if dir.is_dir() {
@@ -460,6 +507,99 @@ pub fn discover_plugins(
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────
+
+/// Cursor's project plugin dir mixes real plugins with `local/` and `cache/` containers.
+/// Those two names are scanned one level down; every other child is a plugin root.
+fn scan_cursor_plugin_parent(
+    plugins_dir: &Path,
+    scope: PluginScope,
+    origin: PluginOrigin,
+    trust_store: &TrustStore,
+    project_trusted: bool,
+    seen_paths: &mut HashSet<PathBuf>,
+    candidates: &mut Vec<DiscoveredPlugin>,
+) {
+    let Ok(entries) = std::fs::read_dir(plugins_dir) else {
+        return;
+    };
+    let mut subdirs: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    subdirs.sort();
+    for subdir in subdirs {
+        let name = subdir.file_name().and_then(|name| name.to_str());
+        if matches!(name, Some("local" | "cache")) {
+            scan_plugin_dir(
+                &subdir,
+                scope,
+                origin.clone(),
+                trust_store,
+                project_trusted,
+                seen_paths,
+                candidates,
+            );
+        } else {
+            collect_plugin(
+                &subdir,
+                scope,
+                origin.clone(),
+                trust_store,
+                project_trusted,
+                seen_paths,
+                candidates,
+            );
+        }
+    }
+}
+
+/// Marketplace installs from Cursor's cache manifest, then `plugins/local/<name>`.
+fn collect_cursor_user_plugins(
+    config_dir: &Path,
+    trust_store: &TrustStore,
+    project_trusted: bool,
+    seen_paths: &mut HashSet<PathBuf>,
+    candidates: &mut Vec<DiscoveredPlugin>,
+) {
+    for installed in xai_grok_config::mcp_servers::cursor_installed_plugins(config_dir) {
+        let marketplace = installed
+            .marketplace
+            .unwrap_or_else(|| "cursor".to_string());
+        let before = candidates.len();
+        collect_plugin(
+            &installed.root,
+            PluginScope::User,
+            PluginOrigin::CursorInstalled {
+                marketplace: marketplace.clone(),
+            },
+            trust_store,
+            project_trusted,
+            seen_paths,
+            candidates,
+        );
+        if candidates.len() > before {
+            let Some(plugin) = candidates.last_mut() else {
+                continue;
+            };
+            if plugin.manifest.name != installed.name {
+                plugin.id = PluginId::new(plugin.scope, &plugin.canonical_root, &installed.name);
+                plugin.manifest.name = installed.name;
+            }
+        }
+    }
+    for dir in xai_grok_config::mcp_servers::cursor_local_plugin_dirs(config_dir) {
+        collect_plugin(
+            &dir,
+            PluginScope::User,
+            PluginOrigin::UserCursor,
+            trust_store,
+            project_trusted,
+            seen_paths,
+            candidates,
+        );
+    }
+}
 
 /// Scan a plugins parent directory (e.g. `~/.grok/plugins/`) and collect
 /// each subdirectory as a plugin candidate.
@@ -618,7 +758,8 @@ fn collect_plugin(
             let has_skills =
                 plugin_root.join("skills").is_dir() || plugin_root.join("commands").is_dir();
             let has_agents = plugin_root.join("agents").is_dir();
-            let has_mcp = plugin_root.join(".mcp.json").is_file();
+            let has_mcp =
+                plugin_root.join(".mcp.json").is_file() || plugin_root.join("mcp.json").is_file();
             let has_lsp = plugin_root.join(".lsp.json").is_file();
             let has_hooks = plugin_root.join("hooks").join("hooks.json").is_file();
 
@@ -953,6 +1094,10 @@ mod tests {
         assert_eq!(
             project_plugins_dir_origin(Path::new("/repo/.claude/plugins")),
             PluginOrigin::ProjectClaude
+        );
+        assert_eq!(
+            project_plugins_dir_origin(Path::new("/repo/.cursor/plugins")),
+            PluginOrigin::ProjectCursor
         );
     }
 
@@ -1860,5 +2005,102 @@ mod tests {
             read_claude_installed_plugins(&json_path, Some(&project)).len(),
             1
         );
+    }
+
+    #[test]
+    fn cursor_cache_and_local_plugins_are_user_scoped_and_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_name = format!("cursor-cache-{}", std::process::id());
+        let local_name = format!("cursor-local-{}", std::process::id());
+        let cache_root = tmp.path().join("plugins/cache/acme/plug/abc123");
+        std::fs::create_dir_all(cache_root.join("skills/demo")).unwrap();
+        std::fs::create_dir_all(cache_root.join(".cursor-plugin")).unwrap();
+        std::fs::write(
+            cache_root.join(".cursor-plugin/plugin.json"),
+            format!(r#"{{"name":"{cache_name}","description":"cached"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            cache_root.join("skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\n\nbody\n",
+        )
+        .unwrap();
+        let local_root = tmp.path().join("plugins/local").join(&local_name);
+        std::fs::create_dir_all(local_root.join("skills/demo")).unwrap();
+        std::fs::create_dir_all(local_root.join(".cursor-plugin")).unwrap();
+        std::fs::write(
+            local_root.join(".cursor-plugin/plugin.json"),
+            format!(r#"{{"name":"{local_name}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            local_root.join("skills/demo/SKILL.md"),
+            "---\nname: demo\ndescription: d\n---\n\nbody\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("plugins/cache")).unwrap();
+        std::fs::write(
+            tmp.path().join("plugins/cache/.cloud-plugin-manifest.json"),
+            serde_json::json!({
+                "plugins": [{
+                    "name": cache_name,
+                    "marketplaceSlug": "acme",
+                    "pluginId": "plug",
+                    "resolvedCommitSha": "abc123",
+                    "declaredCapabilityPaths": { "skill": ["skills/demo"] }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let trust = TrustStore::load_from(tmp.path().join("trust"));
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+        collect_cursor_user_plugins(tmp.path(), &trust, true, &mut seen, &mut candidates);
+        let cached = candidates
+            .iter()
+            .find(|plugin| plugin.manifest.name == cache_name)
+            .expect("cached cursor plugin");
+        assert!(matches!(
+            &cached.origin,
+            PluginOrigin::CursorInstalled { marketplace } if marketplace == "acme"
+        ));
+        assert_eq!(cached.scope, PluginScope::User);
+        assert!(!cached.skill_dirs.is_empty());
+        let local = candidates
+            .iter()
+            .find(|plugin| plugin.manifest.name == local_name)
+            .expect("local cursor plugin");
+        assert_eq!(local.origin, PluginOrigin::UserCursor);
+
+        let mut config = DiscoveryConfig::default();
+        config.populate_plugin_lists(&candidates);
+        assert!(config.enabled.iter().any(|name| name == &cache_name));
+        assert!(config.enabled.iter().any(|name| name == &local_name));
+    }
+
+    #[test]
+    fn discover_project_cursor_plugin_records_cursor_origin() {
+        let name = format!("proj-cursor-tool-{}", std::process::id());
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join(".cursor").join("plugins").join(&name);
+        std::fs::create_dir_all(plugin_dir.join("skills")).unwrap();
+        std::fs::create_dir_all(plugin_dir.join(".cursor-plugin")).unwrap();
+        std::fs::write(
+            plugin_dir.join(".cursor-plugin/plugin.json"),
+            format!(r#"{{"name": "{name}"}}"#),
+        )
+        .unwrap();
+
+        let trust = TrustStore::load_from(tmp.path().join("trust"));
+        let config = DiscoveryConfig::default();
+        let discovered = discover_plugins(Some(tmp.path()), &config, &trust, true);
+        let plugin = discovered
+            .iter()
+            .find(|plugin| plugin.manifest.name == name)
+            .expect("project cursor plugin discovered");
+        assert_eq!(plugin.scope, PluginScope::Project);
+        assert_eq!(plugin.origin, PluginOrigin::ProjectCursor);
     }
 }

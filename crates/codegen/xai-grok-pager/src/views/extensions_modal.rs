@@ -368,11 +368,22 @@ pub fn plugin_group(plugin: &xai_hooks_plugins_types::PluginInfo) -> PluginGroup
         Some(PluginOrigin::ProjectClaude) => {
             PluginGroup::new(1, "origin:project-claude", "Project (Claude)")
         }
+        Some(PluginOrigin::ProjectCursor) => {
+            PluginGroup::new(1, "origin:project-cursor", "Project (Cursor)")
+        }
         Some(PluginOrigin::UserGrok) => PluginGroup::new(2, "origin:user", "User"),
         Some(PluginOrigin::UserClaude)
         | Some(PluginOrigin::ClaudeInstalled { marketplace: None }) => {
             PluginGroup::new(3, "origin:user-claude", "User (Claude)")
         }
+        Some(PluginOrigin::UserCursor) => {
+            PluginGroup::new(3, "origin:user-cursor", "User (Cursor)")
+        }
+        Some(PluginOrigin::CursorInstalled { marketplace }) => PluginGroup {
+            rank: 4,
+            key: format!("cursor-mp:{marketplace}"),
+            label: marketplace.clone(),
+        },
         Some(PluginOrigin::ClaudeMarketplace { marketplace })
         | Some(PluginOrigin::ClaudeInstalled {
             marketplace: Some(marketplace),
@@ -7080,6 +7091,12 @@ mod tests {
                 "origin:project-claude",
                 "Project (Claude)",
             ),
+            (
+                PluginOrigin::ProjectCursor,
+                1,
+                "origin:project-cursor",
+                "Project (Cursor)",
+            ),
             (PluginOrigin::UserGrok, 2, "origin:user", "User"),
             (
                 PluginOrigin::UserClaude,
@@ -7092,6 +7109,20 @@ mod tests {
                 3,
                 "origin:user-claude",
                 "User (Claude)",
+            ),
+            (
+                PluginOrigin::UserCursor,
+                3,
+                "origin:user-cursor",
+                "User (Cursor)",
+            ),
+            (
+                PluginOrigin::CursorInstalled {
+                    marketplace: "cursor-public".into(),
+                },
+                4,
+                "cursor-mp:cursor-public",
+                "cursor-public",
             ),
             (
                 PluginOrigin::ClaudeMarketplace {

@@ -115,7 +115,11 @@ pub async fn list_skills_with_plugins(
     let mut skills = filter_skills(skills, &config.ignore);
     skills.sort_by_key(|s| s.scope);
 
-    let mut merged = merge_skills_with_plugins(skills, collect_plugin_skills(plugins));
+    let mut plugin_skills = collect_plugin_skills(plugins);
+    if !compat.cursor.skills {
+        plugin_skills.retain(|skill| !cursor_plugin_skill_path(&skill.path));
+    }
+    let mut merged = merge_skills_with_plugins(skills, plugin_skills);
 
     // Mark disabled skills
     // Disabled skills remain in the list (unlike `ignore` which hides them) but are excluded from the system prompt and skill tool invocation
@@ -521,6 +525,10 @@ fn stamp_plugin_fields(skills: &mut [SkillInfo], plugin: &crate::plugins::Loaded
             path: PathBuf::from(&skill.path),
         });
     }
+}
+
+fn cursor_plugin_skill_path(path: &str) -> bool {
+    path.contains("/.cursor/plugins/") || path.contains("\\.cursor\\plugins\\")
 }
 
 /// Collect skills from enabled, trusted plugins.

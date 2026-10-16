@@ -182,7 +182,7 @@ my-org-plugins/
       .mcp.json           # MCP servers this plugin adds
 ```
 
-Grok reads the index from `.grok-plugin/marketplace.json`. It also accepts `.grok-plugin/plugin.json` and the `.claude-plugin/` equivalents.
+Grok reads the index from `.grok-plugin/marketplace.json`. It also accepts `.grok-plugin/plugin.json`, `.cursor-plugin/marketplace.json`, and the `.claude-plugin/` equivalents. Plugins already installed in Cursor appear in the Plugins tab and stay enabled until you disable them. Their marketplace groups are listed as `cursor://<slug>` and cannot be installed, updated, or removed from grok.
 
 ### Write the index
 

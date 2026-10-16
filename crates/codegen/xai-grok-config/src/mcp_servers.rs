@@ -32,7 +32,8 @@ pub use config_toml::{
     parse_mcp_servers_from_toml,
 };
 pub use json_config::{
-    CursorMcpListing, cursor_mcp_connection_status, cursor_mcp_connection_statuses,
+    CursorInstalledPlugin, CursorMcpListing, cursor_installed_plugins, cursor_local_plugin_dirs,
+    cursor_mcp_connection_status, cursor_mcp_connection_statuses, cursor_user_config_dir,
     list_cursor_mcp_for_display, load_claude_json_mcp_servers_as_configs,
     load_claude_json_mcp_servers_as_configs_unfiltered, load_cursor_mcp_servers_as_configs,
     load_mcp_json_file, load_mcp_json_servers, load_mcp_json_servers_as_configs,

@@ -1,3 +1,4 @@
+use super::super::McpServerSource;
 use super::*;
 
 #[test]
@@ -305,4 +306,105 @@ fn connection_status_checks_stdio_on_path_and_tcp() {
         ..missing
     };
     assert_eq!(cursor_mcp_connection_status(&down), "unavailable");
+}
+
+#[test]
+fn cursor_installed_plugins_resolve_sha_and_release_tag_dirs() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let sha_root = config_dir
+        .path()
+        .join("plugins/cache/acme/plugin-sha/abc123");
+    let tag_root = config_dir
+        .path()
+        .join("plugins/cache/acme/plugin-tag/release_v0.1.4");
+    std::fs::create_dir_all(sha_root.join(".cursor-plugin")).unwrap();
+    std::fs::create_dir_all(tag_root.join("skills/demo")).unwrap();
+    std::fs::create_dir_all(tag_root.join(".cursor-plugin")).unwrap();
+    std::fs::write(
+        sha_root.join(".cursor-plugin/plugin.json"),
+        r#"{"name":"sha-plugin","description":"from sha"}"#,
+    )
+    .unwrap();
+    std::fs::write(sha_root.join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(
+        tag_root.join(".cursor-plugin/plugin.json"),
+        r#"{"name":"tag-plugin","description":"from tag"}"#,
+    )
+    .unwrap();
+    let manifest = serde_json::json!({
+        "plugins": [
+            {
+                "name": "sha-plugin",
+                "marketplaceSlug": "acme",
+                "pluginId": "plugin-sha",
+                "resolvedCommitSha": "abc123",
+                "declaredCapabilityPaths": { "skill": ["skills/demo"], "command": ["commands/go.md"] }
+            },
+            {
+                "name": "tag-plugin",
+                "marketplaceSlug": "acme",
+                "pluginId": "plugin-tag",
+                "releaseTag": "v0.1.4",
+                "declaredCapabilityPaths": { "skill": ["skills/demo"], "subagent": ["agents/helper.md"] }
+            },
+            { "name": "../escape", "marketplaceSlug": "acme", "pluginId": "nope" }
+        ]
+    });
+    std::fs::create_dir_all(config_dir.path().join("plugins/cache")).unwrap();
+    std::fs::write(
+        config_dir
+            .path()
+            .join("plugins/cache/.cloud-plugin-manifest.json"),
+        serde_json::to_string(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let installed = cursor_installed_plugins(config_dir.path());
+    let sha = installed
+        .iter()
+        .find(|plugin| plugin.name == "sha-plugin")
+        .expect("sha plugin");
+    assert_eq!(sha.root, sha_root);
+    assert_eq!(sha.marketplace.as_deref(), Some("acme"));
+    assert_eq!(sha.description.as_deref(), Some("from sha"));
+    assert_eq!(sha.skill_count, 1);
+    assert_eq!(sha.command_count, 1);
+    assert!(sha.has_mcp);
+    let tag = installed
+        .iter()
+        .find(|plugin| plugin.name == "tag-plugin")
+        .expect("tag plugin");
+    assert_eq!(tag.root, tag_root);
+    assert!(tag.has_agents);
+    assert!(
+        !installed
+            .iter()
+            .any(|plugin| plugin.name.contains("escape"))
+    );
+
+    let local = config_dir.path().join("plugins/local/desk");
+    std::fs::create_dir_all(&local).unwrap();
+    let locals = cursor_local_plugin_dirs(config_dir.path());
+    assert_eq!(locals, vec![local]);
+
+    let files = cursor_mcp_files(config_dir.path(), Some(config_dir.path()));
+    assert!(files.iter().any(|file| matches!(
+        &file.source,
+        McpServerSource::Plugin { plugin_name, .. } if plugin_name == "sha-plugin"
+    )));
+}
+
+#[test]
+fn cursor_installed_plugins_missing_manifest_is_empty() {
+    let config_dir = tempfile::tempdir().unwrap();
+    assert!(cursor_installed_plugins(config_dir.path()).is_empty());
+    std::fs::create_dir_all(config_dir.path().join("plugins/cache")).unwrap();
+    std::fs::write(
+        config_dir
+            .path()
+            .join("plugins/cache/.cloud-plugin-manifest.json"),
+        "not json",
+    )
+    .unwrap();
+    assert!(cursor_installed_plugins(config_dir.path()).is_empty());
 }

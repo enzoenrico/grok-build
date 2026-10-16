@@ -66,6 +66,7 @@ Hooks are discovered from several places (all are merged):
 | Global | `~/.grok/hooks/*.json` | Always | Personal hooks |
 | Global | `~/.claude/settings.json` (and `settings.local.json`) | Always | Claude Code compatibility (configurable) |
 | Global | `~/.cursor/hooks.json` | Always | Cursor compatibility (configurable) |
+| Global | `/etc/cursor/hooks.json` on Linux, `/Library/Application Support/Cursor/hooks.json` on macOS, `C:\ProgramData\Cursor\hooks.json` on Windows | Always | Cursor enterprise hooks (configurable) |
 | Project | `<project>/.grok/hooks/*.json` | Requires trust | Per-repo automation |
 | Project | `<project>/.claude/settings.json` (and `settings.local.json`) | Requires trust | Claude compatibility (configurable) |
 | Project | `<project>/.cursor/hooks.json` | Requires trust | Cursor compatibility (configurable) |
@@ -114,7 +115,7 @@ After a block, prompts already queued behind the blocked one do not auto-run: th
 
 ### Cursor Hook Compatibility
 
-Grok accepts Cursor's camelCase hook event names, so `~/.cursor/hooks.json` loads unchanged:
+Grok accepts Cursor's camelCase hook event names, so `~/.cursor/hooks.json` loads unchanged. Flat entries (`{ "command": "./script.sh", "matcher": "Shell" }`) are accepted next to grok's matcher groups. An empty matcher or `"*"` matches every call. `compat.cursor.hooks = false` also skips hooks bundled in Cursor-installed plugins.
 
 | Cursor event | Maps to |
 |---|---|

@@ -79,6 +79,11 @@ fn origin_to_dto(origin: &xai_grok_agent::plugins::PluginOrigin) -> PluginOrigin
         AgentOrigin::ProjectClaude => PluginOrigin::ProjectClaude,
         AgentOrigin::UserGrok => PluginOrigin::UserGrok,
         AgentOrigin::UserClaude => PluginOrigin::UserClaude,
+        AgentOrigin::ProjectCursor => PluginOrigin::ProjectCursor,
+        AgentOrigin::UserCursor => PluginOrigin::UserCursor,
+        AgentOrigin::CursorInstalled { marketplace } => PluginOrigin::CursorInstalled {
+            marketplace: marketplace.clone(),
+        },
         AgentOrigin::ClaudeMarketplace { marketplace } => PluginOrigin::ClaudeMarketplace {
             marketplace: marketplace.clone(),
         },
@@ -99,6 +104,7 @@ fn origin_to_dto(origin: &xai_grok_agent::plugins::PluginOrigin) -> PluginOrigin
 /// Derive the legacy `marketplace_source` label kept for older pagers: the marketplace display name, or `git: owner/repo` for a direct git install.
 fn marketplace_source_label(origin: &PluginOrigin) -> Option<String> {
     match origin {
+        PluginOrigin::CursorInstalled { marketplace } => Some(marketplace.clone()),
         PluginOrigin::MarketplaceInstall {
             source_name: Some(name),
             ..
