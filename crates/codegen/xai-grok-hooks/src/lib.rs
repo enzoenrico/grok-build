@@ -39,6 +39,7 @@
 #![deny(clippy::indexing_slicing)]
 
 pub mod config;
+pub mod cursor;
 pub mod discovery;
 pub mod dispatcher;
 mod env_expand;

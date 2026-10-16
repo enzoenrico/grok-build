@@ -2280,9 +2280,22 @@ mod tests {
             source_dir: std::path::PathBuf::from("/home/u/.grok/hooks"),
             extra_env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
             layer: xai_grok_hooks::config::HookProvenance::File,
+            cursor: None,
+        };
+        let cursor_spec = xai_grok_hooks::config::HookSpec {
+            name: "hooks:before_shell_execution[0].hooks[0]".to_string(),
+            configured_matcher: None,
+            cursor: Some(xai_grok_hooks::cursor::CursorHook {
+                event: xai_grok_hooks::cursor::CursorEvent::BeforeShellExecution,
+                matcher: Some("^git ".to_string()),
+                fail_closed: true,
+                loop_limit: None,
+                working_dir: std::path::PathBuf::from("/repo"),
+            }),
+            ..spec.clone()
         };
         let mut registry = xai_grok_hooks::discovery::HookRegistry::default();
-        registry.append_specs(vec![spec]);
+        registry.append_specs(vec![spec, cursor_spec]);
         let wire = hook_registry_to_wire(&registry).expect("heavy → wire");
         assert_eq!(
             serde_json::to_value(&registry).unwrap(),
@@ -2365,6 +2378,7 @@ mod tests {
                 source_dir,
                 extra_env,
                 layer,
+                cursor,
             } = spec;
             let event = serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
             HookSpecWire {
@@ -2381,6 +2395,7 @@ mod tests {
                 source_dir,
                 extra_env,
                 layer: layer.as_ref().to_string(),
+                cursor: cursor.map(|c| serde_json::to_value(c).unwrap()),
             }
         }
         let spec = HookSpec {
@@ -2398,6 +2413,7 @@ mod tests {
             source_dir: std::path::PathBuf::from("/home/u/.grok/hooks"),
             extra_env: std::collections::HashMap::from([("FOO".to_string(), "bar".to_string())]),
             layer: xai_grok_hooks::config::HookProvenance::Managed,
+            cursor: None,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),

@@ -26,6 +26,7 @@ fn hook_run_span(spec: &HookSpec, event: HookEventName) -> tracing::Span {
 
 fn eligible_or_record_skip(
     spec: &HookSpec,
+    envelope: Option<&HookEventEnvelope>,
     match_value: Option<&str>,
     results: &mut Vec<HookRunResult>,
     disabled: &DisabledHooks,
@@ -37,7 +38,19 @@ fn eligible_or_record_skip(
         });
         return false;
     }
-    crate::matcher::matcher_allows(spec.matcher.as_ref(), match_value)
+    spec_applies(spec, envelope, match_value)
+}
+
+/// Cursor-dialect hooks carry their own tool filter and matcher target; the rest use the grok matcher.
+fn spec_applies(
+    spec: &HookSpec,
+    envelope: Option<&HookEventEnvelope>,
+    match_value: Option<&str>,
+) -> bool {
+    match (&spec.cursor, envelope) {
+        (Some(cursor), Some(envelope)) => cursor.applies(envelope),
+        _ => crate::matcher::matcher_allows(spec.matcher.as_ref(), match_value),
+    }
 }
 
 /// How many hooks dispatching `envelope` would run, so the caller can announce the batch before awaiting it.
@@ -52,7 +65,7 @@ pub fn runnable_count(
         .hooks_for_canonical(envelope.hook_event_name)
         .into_iter()
         .filter(|spec| !ctx.disabled().blocks(spec))
-        .filter(|spec| crate::matcher::matcher_allows(spec.matcher.as_ref(), match_value))
+        .filter(|spec| spec_applies(spec, Some(envelope), match_value))
         .count()
 }
 
@@ -122,6 +135,7 @@ async fn dispatch_sequential_gate(
         for spec in hooks {
             if !eligible_or_record_skip(
                 spec,
+                Some(envelope),
                 match_value.as_deref(),
                 &mut run_results,
                 ctx.disabled(),
@@ -494,6 +508,7 @@ pub async fn dispatch_stop(
         for spec in hooks {
             if !eligible_or_record_skip(
                 spec,
+                Some(envelope),
                 match_value.as_deref(),
                 &mut out.results,
                 ctx.disabled(),
@@ -752,6 +767,7 @@ pub async fn dispatch_post_tool_use(
         for spec in hooks {
             if !eligible_or_record_skip(
                 spec,
+                Some(envelope),
                 match_value.as_deref(),
                 &mut out.results,
                 ctx.disabled(),
@@ -861,6 +877,7 @@ pub async fn dispatch_post_tool_use_failure(
         for spec in hooks {
             if !eligible_or_record_skip(
                 spec,
+                Some(envelope),
                 match_value.as_deref(),
                 &mut out.results,
                 ctx.disabled(),
@@ -959,8 +976,13 @@ pub async fn dispatch_non_blocking(
         let mut results = Vec::with_capacity(hooks.len());
 
         for spec in hooks {
-            if !eligible_or_record_skip(spec, match_value.as_deref(), &mut results, ctx.disabled())
-            {
+            if !eligible_or_record_skip(
+                spec,
+                Some(envelope),
+                match_value.as_deref(),
+                &mut results,
+                ctx.disabled(),
+            ) {
                 continue;
             }
 
@@ -1150,6 +1172,7 @@ mod tests {
             source_dir: PathBuf::from("/tmp"),
             extra_env: HashMap::new(),
             layer: crate::config::HookProvenance::File,
+            cursor: None,
         }
     }
 
@@ -2437,14 +2460,14 @@ mod tests {
         );
         managed.layer = crate::config::HookProvenance::Requirements;
         assert!(
-            eligible_or_record_skip(&managed, None, &mut results, &disabled),
+            eligible_or_record_skip(&managed, None, None, &mut results, &disabled),
             "managed-policy hook must remain eligible despite a disabled-hooks entry"
         );
         assert!(results.is_empty());
 
         let user = make_command_spec("global/user-hook", None, true, "echo ok");
         assert!(
-            !eligible_or_record_skip(&user, None, &mut results, &disabled),
+            !eligible_or_record_skip(&user, None, None, &mut results, &disabled),
             "a user hook with the same disabled-hooks treatment must be filtered"
         );
         assert!(matches!(
