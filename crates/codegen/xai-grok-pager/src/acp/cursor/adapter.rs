@@ -6,6 +6,7 @@
 //! one line at a time so neither side needs to know about the other.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
 use xai_grok_shell::sampling::types::{
@@ -18,6 +19,7 @@ use xai_grok_shell::sampling::types::{
     parse_reasoning_effort_meta,
 };
 
+use super::catalog::{self, CatalogRequest};
 use super::protocol;
 
 const INTERNAL_ID_PREFIX: &str = "grok-cursor-bridge-";
@@ -42,6 +44,8 @@ pub(crate) enum Routed {
         prompt_rpc_id: Option<Value>,
         prompt_id: Option<String>,
     },
+    /// Answer a skills/hooks/plugins/marketplace/workflows/commands request locally; Cursor has none of them.
+    Catalog(Box<CatalogRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,11 +95,15 @@ pub(crate) struct CursorAdapter {
     auth_request_id: Option<String>,
     /// `session/new` and `session/load` lines waiting for that authenticate call.
     held_for_auth: Vec<String>,
+    /// Reads `[skills].disabled`; tests swap in a fixed set.
+    disabled_skills: Option<fn() -> HashSet<String>>,
 }
 
 #[derive(Debug, Default)]
 struct CursorSession {
     skills: HashSet<String>,
+    /// Cursor's latest `availableCommands`, normalized and before disabled skills are hidden.
+    commands: Vec<Value>,
     cloud_agent_id: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
@@ -126,6 +134,14 @@ impl CursorAdapter {
             }
             return vec![Routed::ToAgent(msg.to_string())];
         };
+
+        if let Some(catalog_method) = catalog::catalog_method(&method) {
+            let Some(id) = id else {
+                return Vec::new();
+            };
+            let request = self.catalog_request(id, catalog_method, msg.get("params"));
+            return vec![Routed::Catalog(Box::new(request))];
+        }
 
         if is_grok_extension(&method) {
             return match id {
@@ -194,8 +210,7 @@ impl CursorAdapter {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 if let Some(requested) = requested {
-                    if let Some(resolved) =
-                        self.resolve_model_with_meta(&requested, meta.as_ref())
+                    if let Some(resolved) = self.resolve_model_with_meta(&requested, meta.as_ref())
                     {
                         self.preferred_model = Some(resolved.clone());
                         if let Some(session_id) = &session_id {
@@ -320,8 +335,7 @@ impl CursorAdapter {
             }
             _ => {}
         }
-        if matches!(method.as_str(), "session/new" | "session/load") && !self.cursor_authenticated
-        {
+        if matches!(method.as_str(), "session/new" | "session/load") && !self.cursor_authenticated {
             self.held_for_auth.push(msg.to_string());
             return self.start_cursor_auth();
         }
@@ -345,10 +359,9 @@ impl CursorAdapter {
                 }
                 return vec![Routed::ToClient(msg.to_string())];
             }
-            if let Some(translated) = protocol::translate_cursor_inbound(
-                &msg,
-                self.inbound_session_id(&msg).as_deref(),
-            ) {
+            if let Some(translated) =
+                protocol::translate_cursor_inbound(&msg, self.inbound_session_id(&msg).as_deref())
+            {
                 if let (Some(id), Some(pending)) = (msg.get("id"), translated.pending) {
                     self.bridge_wait.insert(id_key(id), pending);
                 }
@@ -416,7 +429,7 @@ impl CursorAdapter {
                     rewrite_modes(result);
                     protocol::absorb_cursor_skills(result);
                     if let Some(session_id) = &session_id {
-                        self.remember_skills(session_id, result.get("availableCommands"));
+                        self.remember_commands(session_id, result.get_mut("availableCommands"));
                     }
                     self.record_models(result);
                     if let Some(session_id) = session_id {
@@ -508,7 +521,7 @@ impl CursorAdapter {
         {
             protocol::normalize_commands(update.get_mut("availableCommands"));
             if let Some(session_id) = session_id {
-                self.remember_skills(&session_id, update.get("availableCommands"));
+                self.remember_commands(&session_id, update.get_mut("availableCommands"));
             }
         }
     }
@@ -600,10 +613,7 @@ impl CursorAdapter {
     }
 
     fn inbound_session_id(&self, msg: &Value) -> Option<String> {
-        if let Some(session_id) = msg
-            .pointer("/params/sessionId")
-            .and_then(Value::as_str)
-        {
+        if let Some(session_id) = msg.pointer("/params/sessionId").and_then(Value::as_str) {
             return Some(session_id.to_owned());
         }
         if self.sessions.len() == 1 {
@@ -631,12 +641,70 @@ impl CursorAdapter {
         super::cloud::repo_from_cwd(std::path::Path::new(cwd))
     }
 
-    fn remember_skills(&mut self, session_id: &str, commands: Option<&Value>) {
-        self.sessions
-            .entry(session_id.to_owned())
-            .or_default()
-            .skills
-            .extend(protocol::skill_names(commands));
+    /// Record Cursor's catalog for the session, then hide disabled skills from the copy the pager sees.
+    fn remember_commands(&mut self, session_id: &str, commands: Option<&mut Value>) {
+        let Some(commands) = commands else {
+            return;
+        };
+        let session = self.sessions.entry(session_id.to_owned()).or_default();
+        session.skills.extend(protocol::skill_names(Some(commands)));
+        let Some(list) = commands.as_array() else {
+            return;
+        };
+        session.commands = list.clone();
+        let disabled =
+            self.disabled_skills
+                .unwrap_or(xai_grok_shell::extensions::catalog::disabled_skills)();
+        if !disabled.is_empty() {
+            *commands = Value::Array(catalog::visible_commands(list, &disabled));
+        }
+    }
+
+    /// The catalog request for `method`, resolved against the session it names (or the only session).
+    fn catalog_request(
+        &self,
+        id: Value,
+        method: &'static str,
+        params: Option<&Value>,
+    ) -> CatalogRequest {
+        let params = params.cloned().unwrap_or_else(|| json!({}));
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| self.sessions.contains_key(*id))
+            .map(str::to_owned)
+            .or_else(|| {
+                (self.sessions.len() == 1)
+                    .then(|| self.sessions.keys().next().cloned())
+                    .flatten()
+            });
+        let cwd = session_id
+            .as_deref()
+            .and_then(|id| self.sessions.get(id))
+            .and_then(|session| session.cwd.clone())
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let mut sessions: Vec<(String, Vec<Value>)> = self
+            .sessions
+            .iter()
+            .map(|(id, session)| (id.clone(), session.commands.clone()))
+            .collect();
+        sessions.sort_by(|a, b| a.0.cmp(&b.0));
+        CatalogRequest {
+            id,
+            method,
+            params,
+            cwd,
+            session_id,
+            sessions,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_disabled_skills(mut self, disabled: fn() -> HashSet<String>) -> Self {
+        self.disabled_skills = Some(disabled);
+        self
     }
 
     fn remember_model(&mut self, session_id: &str, model_id: &str) {
@@ -718,7 +786,11 @@ impl CursorAdapter {
             let Some(obj) = m.as_object_mut() else {
                 continue;
             };
-            let Some(id) = obj.get("modelId").and_then(Value::as_str).map(str::to_owned) else {
+            let Some(id) = obj
+                .get("modelId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
                 continue;
             };
             let Some(spec) = parse_parameterized_model_spec(&id) else {
@@ -780,16 +852,13 @@ impl CursorAdapter {
                     .or_insert_with(|| Value::Array(effort_objs));
             }
 
-            if spec.fast_mode.is_some()
-                || summary.is_some_and(|s| s.has_fast)
-                || spec.has_brackets
+            if spec.fast_mode.is_some() || summary.is_some_and(|s| s.has_fast) || spec.has_brackets
             {
                 meta.entry(SUPPORTS_FAST_MODE_META_KEY)
                     .or_insert(Value::Bool(true));
             }
             if let Some(fast) = spec.fast_mode {
-                meta.entry(FAST_MODE_META_KEY)
-                    .or_insert(Value::Bool(fast));
+                meta.entry(FAST_MODE_META_KEY).or_insert(Value::Bool(fast));
             }
 
             if spec.max_mode.is_some()

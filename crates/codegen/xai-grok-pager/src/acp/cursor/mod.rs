@@ -4,6 +4,7 @@
 //! `--backend cursor`, `GROK_BACKEND=cursor`, or `[cli] backend = "cursor"` in `config.toml`.
 
 mod adapter;
+mod catalog;
 mod cloud;
 pub(crate) mod protocol;
 mod startup;
@@ -17,8 +18,8 @@ fn cloud_handoff_notice(
     repo: Option<&cloud::CloudRepo>,
     model_id: Option<&str>,
 ) -> (String, Option<cloud::CloudAgent>) {
-    let base = std::env::var("CURSOR_CLOUD_API")
-        .unwrap_or_else(|_| "https://api.cursor.com".to_owned());
+    let base =
+        std::env::var("CURSOR_CLOUD_API").unwrap_or_else(|_| "https://api.cursor.com".to_owned());
     let outcome = match cloud::resolve_cloud_auth() {
         Err(err) => Err(err),
         Ok(auth) => match request {
@@ -46,7 +47,10 @@ fn cloud_handoff_notice(
             let url = agent.url.clone().unwrap_or_default();
             let status = agent.run_status.clone().unwrap_or_default();
             let reply = agent.result.clone().unwrap_or_default();
-            let mut text = format!("Cloud agent {} {url}\nRun status {status}.\n{reply}", agent.id);
+            let mut text = format!(
+                "Cloud agent {} {url}\nRun status {status}.\n{reply}",
+                agent.id
+            );
             if let Some(pr) = &agent.pr_url {
                 text.push('\n');
                 text.push_str(pr);
@@ -150,7 +154,10 @@ fn resolve_cursor_program(configured: &std::path::Path) -> std::path::PathBuf {
     if configured != std::path::Path::new(DEFAULT_CURSOR_AGENT_BIN) {
         return configured.to_path_buf();
     }
-    let name = pick_default_cursor_bin(bin_on_path(DEFAULT_CURSOR_AGENT_BIN), bin_on_path(AGENT_BIN_FALLBACK));
+    let name = pick_default_cursor_bin(
+        bin_on_path(DEFAULT_CURSOR_AGENT_BIN),
+        bin_on_path(AGENT_BIN_FALLBACK),
+    );
     std::path::PathBuf::from(name)
 }
 
@@ -378,6 +385,9 @@ impl CursorIo {
                         }
                         Routed::ToClient(line) => {
                             let _ = to_client_tx.send(line);
+                        }
+                        Routed::Catalog(request) => {
+                            catalog::spawn(*request, to_client_tx.clone());
                         }
                         Routed::Cloud {
                             session_id,
