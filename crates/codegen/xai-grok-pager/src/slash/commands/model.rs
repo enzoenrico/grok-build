@@ -93,7 +93,7 @@ impl SlashCommand for ModelCommand {
                 ));
             }
             let effort = match spec.effort {
-                Some(eff) => match ctx.models.resolve_effort_for_model(&id, eff.as_str()) {
+                Some(eff) => match ctx.models.resolve_effort_for_model(&id, &eff.to_string()) {
                     Ok(resolved) => Some(resolved),
                     Err(_) if ctx.models.supports_fast_mode_for(&id) => Some(eff),
                     Err(err) => return CommandResult::Error(err.message()),

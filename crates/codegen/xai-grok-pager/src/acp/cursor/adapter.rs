@@ -700,7 +700,7 @@ impl CursorAdapter {
                     summary.windows.push(w.get());
                 }
                 if let Some(eff) = spec.effort {
-                    let s = eff.as_str().to_owned();
+                    let s = eff.to_string();
                     if !summary.efforts.contains(&s) {
                         summary.efforts.push(s);
                     }
@@ -763,7 +763,7 @@ impl CursorAdapter {
             }
             if let Some(effort) = spec.effort {
                 meta.entry(REASONING_EFFORT_META_KEY)
-                    .or_insert_with(|| json!(effort.as_str()));
+                    .or_insert_with(|| json!(effort.to_string()));
             }
             let mut efforts = summary.map(|s| s.efforts.clone()).unwrap_or_default();
             for eff in &config_efforts {
@@ -875,7 +875,7 @@ impl CursorAdapter {
                 || parse_reasoning_effort_meta(Some(m)).is_some()
                 || parse_fast_mode_meta(Some(m)).is_some()
                 || parse_max_mode_meta(Some(m)).is_some()
-                || !parse_model_parameters_meta(Some(m)).is_empty()
+                || parse_model_parameters_meta(Some(m)).is_some_and(|p| !p.is_empty())
         });
         let spec = parse_parameterized_model_spec(requested)?;
         if !spec.has_brackets && !has_meta_overrides {
@@ -926,7 +926,7 @@ impl CursorAdapter {
                         "thinking",
                     ],
                     "effort",
-                    effort.as_str().to_owned(),
+                    effort.to_string(),
                 );
             }
             if let Some(fast) = parse_fast_mode_meta(Some(meta)) {
@@ -945,8 +945,10 @@ impl CursorAdapter {
                     if max_mode { "true" } else { "false" }.to_owned(),
                 );
             }
-            for (k, v) in parse_model_parameters_meta(Some(meta)) {
-                upsert_model_param(&mut params, &[k.as_str()], &k, v);
+            if let Some(meta_params) = parse_model_parameters_meta(Some(meta)) {
+                for (k, v) in meta_params {
+                    upsert_model_param(&mut params, &[k.as_str()], &k, v);
+                }
             }
         }
 
@@ -1030,7 +1032,7 @@ fn extract_config_option_hints(config_options: &[Value]) -> (Vec<u64>, Vec<Strin
                 || category.contains("reasoning")
             {
                 if let Some(eff) = parse_canonical_effort_token(raw) {
-                    let s = eff.as_str().to_owned();
+                    let s = eff.to_string();
                     if !efforts.contains(&s) {
                         efforts.push(s);
                     }

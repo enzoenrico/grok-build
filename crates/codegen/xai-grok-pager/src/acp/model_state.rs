@@ -236,11 +236,8 @@ impl ModelState {
         self.max_mode = parse_max_mode_meta(meta)
             .or_else(|| spec.as_ref().and_then(|s| s.max_mode));
         let meta_params = parse_model_parameters_meta(meta);
-        self.model_parameters = if !meta_params.is_empty() {
-            meta_params
-        } else {
-            spec.map(|s| s.raw_params).unwrap_or_default()
-        };
+        self.model_parameters = meta_params
+            .unwrap_or_else(|| spec.map(|s| s.raw_params).unwrap_or_default());
     }
 
     pub fn supports_fast_mode(&self) -> bool {
@@ -473,11 +470,8 @@ impl From<Option<acp::SessionModelState>> for ModelState {
                 let max_mode = parse_max_mode_meta(current_meta)
                     .or_else(|| current_spec.as_ref().and_then(|s| s.max_mode));
                 let meta_params = parse_model_parameters_meta(current_meta);
-                let model_parameters = if !meta_params.is_empty() {
-                    meta_params
-                } else {
-                    current_spec.map(|s| s.raw_params).unwrap_or_default()
-                };
+                let model_parameters = meta_params
+                    .unwrap_or_else(|| current_spec.map(|s| s.raw_params).unwrap_or_default());
                 Self {
                     available: models,
                     current: current_model,

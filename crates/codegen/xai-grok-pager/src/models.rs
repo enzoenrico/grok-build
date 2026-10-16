@@ -71,7 +71,7 @@ fn format_model_capabilities(meta: Option<&acp::Meta>) -> String {
     if let Some(windows) = parse_context_windows_meta(Some(meta))
         && !windows.is_empty()
     {
-        let formatted: Vec<String> = windows.into_iter().map(format_window).collect();
+        let formatted: Vec<String> = windows.into_iter().map(|w| format_window(w.get())).collect();
         parts.push(format!("context: {}", formatted.join("/")));
     } else if let Some(total) = meta.get("totalContextTokens").and_then(|v| v.as_u64())
         && total > 0
@@ -117,8 +117,8 @@ mod tests {
         meta.insert(
             "reasoningEfforts".into(),
             serde_json::json!([
-                {"id": "low", "effort": "low", "label": "Low", "description": "Fast"},
-                {"id": "high", "effort": "high", "label": "High", "description": "Deep"}
+                {"id": "low", "value": "low", "label": "Low", "description": "Fast"},
+                {"id": "high", "value": "high", "label": "High", "description": "Deep"}
             ]),
         );
         meta.insert("supportsFastMode".into(), serde_json::Value::Bool(true));

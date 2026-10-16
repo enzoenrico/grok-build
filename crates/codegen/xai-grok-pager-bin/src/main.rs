@@ -2462,6 +2462,7 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
         }
         let memory_enabled_override = args.memory_enabled_override();
         let memory_flush = args.memory_flush;
+        let fast_mode = args.fast_mode_override();
         return xai_grok_pager::headless::run_single_turn(
             headless_prompt,
             args.verbatim,
@@ -2494,7 +2495,7 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                 permission_mode_flag: args.permission_mode_flag.clone(),
                 reasoning_effort: args.reasoning_effort.clone(),
                 context_window: args.context_window.clone(),
-                fast_mode: args.fast_mode_override(),
+                fast_mode,
                 wait_for_background: !args.no_wait_for_background,
                 background_wait_timeout: std::time::Duration::from_secs(
                     args.background_wait_timeout_secs,
