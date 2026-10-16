@@ -992,6 +992,7 @@ mod tests {
             source_dir: std::env::temp_dir(),
             extra_env,
             layer: crate::config::HookProvenance::File,
+            cursor: None,
         }
     }
 

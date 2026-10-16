@@ -387,8 +387,9 @@ fn cursor_installed_plugins_resolve_sha_and_release_tag_dirs() {
     let locals = cursor_local_plugin_dirs(config_dir.path());
     assert_eq!(locals, vec![local]);
 
+    // The plugin registry loads a cache install's `mcp.json`; listing it here too would start its servers twice.
     let files = cursor_mcp_files(config_dir.path(), Some(config_dir.path()));
-    assert!(files.iter().any(|file| matches!(
+    assert!(!files.iter().any(|file| matches!(
         &file.source,
         McpServerSource::Plugin { plugin_name, .. } if plugin_name == "sha-plugin"
     )));

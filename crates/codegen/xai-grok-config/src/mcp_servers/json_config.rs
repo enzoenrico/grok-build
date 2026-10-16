@@ -254,7 +254,8 @@ pub(crate) fn load_cursor_mcp_servers(
     })
 }
 
-/// Nearest project `.cursor/mcp.json` comes first, then the user file, then plugin `mcp.json`.
+/// Nearest project `.cursor/mcp.json` comes first, then the user file, then `plugins/local/*/mcp.json`.
+/// Marketplace installs in `plugins/cache` load their MCP servers through the plugin registry instead.
 /// Callers keep the server from the first file when two files define the same name.
 pub(crate) fn cursor_resolutions(
     cwd: &Path,
@@ -485,7 +486,7 @@ struct CursorMcpFile {
     source: McpServerSource,
 }
 
-/// Project files nearest the cwd, then the user `mcp.json`, then each plugin `mcp.json`.
+/// Project files nearest the cwd, then the user `mcp.json`, then each `plugins/local/*/mcp.json`.
 fn cursor_mcp_files(cwd: &Path, config_dir: Option<&Path>) -> Vec<CursorMcpFile> {
     let user_mcp = config_dir.map(|dir| dir.join("mcp.json"));
     let mut files = Vec::new();
@@ -533,20 +534,6 @@ fn cursor_mcp_files(cwd: &Path, config_dir: Option<&Path>) -> Vec<CursorMcpFile>
                 path,
             });
         }
-    }
-    for plugin in cursor_installed_plugins(config_dir) {
-        let path = plugin.root.join("mcp.json");
-        if !path.is_file() {
-            continue;
-        }
-        files.push(CursorMcpFile {
-            source: McpServerSource::Plugin {
-                plugin_name: plugin.name,
-                path: path.clone(),
-                scope: super::McpServerScope::User,
-            },
-            path,
-        });
     }
     files
 }

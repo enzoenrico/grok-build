@@ -15,7 +15,8 @@ pub use xai_grok_tools::types::compat::CompatConfig;
 
 use xai_grok_tools::implementations::skills::discovery::{
     COMMAND_SUBDIR, SKILL_SUBDIRS, find_command_paths, find_skill_md_paths, find_skill_paths,
-    is_valid_skill_name, normalize_skill_name, parse_skill_files, scan_md_files, walk_for_skill_md,
+    is_valid_skill_name, normalize_skill_name, parse_skill_files, scan_files_with_extensions,
+    walk_for_skill_md,
 };
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -117,7 +118,19 @@ pub async fn list_skills_with_plugins(
 
     let mut plugin_skills = collect_plugin_skills(plugins);
     if !compat.cursor.skills {
-        plugin_skills.retain(|skill| !cursor_plugin_skill_path(&skill.path));
+        let cursor_plugins: HashSet<&str> = plugins
+            .map(|registry| registry.active_plugins())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|plugin| plugin.origin.is_cursor())
+            .map(|plugin| plugin.name.as_str())
+            .collect();
+        plugin_skills.retain(|skill| {
+            !skill
+                .plugin_name
+                .as_deref()
+                .is_some_and(|name| cursor_plugins.contains(name))
+        });
     }
     let mut merged = merge_skills_with_plugins(skills, plugin_skills);
 
@@ -181,7 +194,7 @@ fn collect_skill_config_dirs_from_sources(
     };
 
     // Vendor dirs (`.claude`/`.cursor`) are gated by the resolved compat config; `.grok` and `.agents` are always present
-    // When all cells are on, this list equals the historical `[".grok", ".agents", ".claude", ".cursor"]`
+    // When all cells are on, this list is the historical `[".grok", ".agents", ".claude", ".cursor"]` plus Cursor's `.codex`
     let config_dir_names = compat.skill_config_dirs();
 
     if let Some(project_sources) = project_sources {
@@ -202,6 +215,7 @@ fn collect_skill_config_dirs_from_sources(
         }
         if compat.cursor.skills {
             try_add(home.join(".cursor"));
+            try_add(home.join(".codex"));
         }
     }
 
@@ -527,10 +541,6 @@ fn stamp_plugin_fields(skills: &mut [SkillInfo], plugin: &crate::plugins::Loaded
     }
 }
 
-fn cursor_plugin_skill_path(path: &str) -> bool {
-    path.contains("/.cursor/plugins/") || path.contains("\\.cursor\\plugins\\")
-}
-
 /// Collect skills from enabled, trusted plugins.
 pub fn collect_plugin_skills(registry: Option<&crate::plugins::PluginRegistry>) -> Vec<SkillInfo> {
     let Some(registry) = registry else {
@@ -552,7 +562,7 @@ pub fn collect_plugin_skills(registry: Option<&crate::plugins::PluginRegistry>) 
         }
         for cmd_dir in &plugin.command_dirs {
             paths.extend(
-                scan_md_files(cmd_dir)
+                scan_files_with_extensions(cmd_dir, plugin.dialect.command_extensions())
                     .into_iter()
                     .map(|p| (p, SkillScope::Repo)),
             );
@@ -1532,6 +1542,8 @@ mod tests {
             skill_dirs: vec![],
             command_dirs: vec![],
             agent_dirs: vec![],
+            rule_dirs: vec![],
+            dialect: Default::default(),
             hooks_path: None,
             mcp_config_path: None,
             lsp_config_path: None,
@@ -1610,6 +1622,8 @@ mod tests {
                 hooks: None,
                 mcp_servers: None,
                 lsp_servers: None,
+                rules: None,
+                dialect: Default::default(),
             },
             id: PluginId::new(scope, root, name),
             root: root.to_path_buf(),
@@ -1620,12 +1634,105 @@ mod tests {
             skill_dirs,
             command_dirs: vec![],
             agent_dirs: vec![],
+            rule_dirs: vec![],
             hooks_path: None,
             mcp_config_path: None,
             lsp_config_path: None,
             conflict: None,
         };
         crate::plugins::PluginRegistry::from_discovered(vec![dp], &[], &[name.to_string()])
+    }
+
+    fn cursor_command_plugin(
+        root: &Path,
+        dialect: crate::plugins::manifest::ManifestDialect,
+    ) -> crate::plugins::PluginRegistry {
+        use crate::plugins::discovery::{DiscoveredPlugin, PluginId};
+        use crate::plugins::manifest::PluginManifest;
+
+        let commands = root.join("commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(commands.join("review.txt"), "Review the staged diff.\n").unwrap();
+        std::fs::write(commands.join("ship.mdc"), "Ship it.\n").unwrap();
+        std::fs::write(commands.join("ignored.json"), "{}").unwrap();
+        let dp = DiscoveredPlugin {
+            manifest: PluginManifest {
+                name: "tools".into(),
+                dialect,
+                ..Default::default()
+            },
+            id: PluginId::new(PluginScope::User, root, "tools"),
+            root: root.to_path_buf(),
+            canonical_root: root.to_path_buf(),
+            scope: PluginScope::User,
+            origin: crate::plugins::PluginOrigin::UserCursor,
+            trusted: true,
+            skill_dirs: vec![],
+            command_dirs: vec![commands],
+            agent_dirs: vec![],
+            rule_dirs: vec![],
+            hooks_path: None,
+            mcp_config_path: None,
+            lsp_config_path: None,
+            conflict: None,
+        };
+        crate::plugins::PluginRegistry::from_discovered(vec![dp], &[], &["tools".into()])
+    }
+
+    #[test]
+    fn collect_plugin_skills_reads_cursor_plugin_commands_with_cursor_extensions() {
+        use crate::plugins::manifest::ManifestDialect;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cursor = collect_plugin_skills(Some(&cursor_command_plugin(
+            tmp.path(),
+            ManifestDialect::Cursor,
+        )));
+        let mut names: Vec<&str> = cursor.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["review", "ship"]);
+
+        let grok = collect_plugin_skills(Some(&cursor_command_plugin(
+            tmp.path(),
+            ManifestDialect::Grok,
+        )));
+        assert!(grok.is_empty(), "grok plugins keep .md-only commands");
+    }
+
+    #[tokio::test]
+    async fn cursor_skills_cell_off_drops_cursor_plugin_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = cursor_command_plugin(
+            tmp.path(),
+            crate::plugins::manifest::ManifestDialect::Cursor,
+        );
+        let has_review = |skills: &[SkillInfo]| {
+            skills
+                .iter()
+                .any(|s| s.plugin_name.as_deref() == Some("tools") && s.name == "review")
+        };
+
+        let on = list_skills_with_plugins(
+            None,
+            &SkillsConfig::default(),
+            Some(&registry),
+            CompatConfig::default(),
+            /*project_trusted*/ false,
+        )
+        .await;
+        let mut compat = CompatConfig::default();
+        compat.cursor.skills = false;
+        let off = list_skills_with_plugins(
+            None,
+            &SkillsConfig::default(),
+            Some(&registry),
+            compat,
+            /*project_trusted*/ false,
+        )
+        .await;
+
+        assert!(has_review(&on));
+        assert!(!has_review(&off));
     }
 
     #[test]
@@ -1733,7 +1840,7 @@ mod tests {
 
     #[tokio::test]
     async fn untrusted_project_skills_are_omitted() {
-        for config_dir in [".grok", ".agents", ".claude", ".cursor"] {
+        for config_dir in [".grok", ".agents", ".claude", ".cursor", ".codex"] {
             let tmp = tempfile::tempdir().unwrap();
             let repo = tmp.path().join("repo");
             let config_root = repo.join(config_dir);
@@ -2367,6 +2474,8 @@ mod tests {
             skill_dirs: vec![],
             command_dirs: vec![],
             agent_dirs: vec![],
+            rule_dirs: vec![],
+            dialect: Default::default(),
             hooks_path: None,
             mcp_config_path: None,
             lsp_config_path: None,
@@ -2483,7 +2592,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         // Not a git repo, so it falls to the cwd-only branch (no upward walk)
-        for name in [".grok", ".agents", ".claude", ".cursor"] {
+        for name in [".grok", ".agents", ".claude", ".cursor", ".codex"] {
             fs::create_dir_all(cwd.join(name)).unwrap();
         }
 
@@ -2494,13 +2603,17 @@ mod tests {
             collect_skill_config_dirs(Some(cwd), None, tmp.path(), &[], CompatConfig::default());
         assert!(ends_with(&all, ".claude"), "claude missing: {all:?}");
         assert!(ends_with(&all, ".cursor"), "cursor missing: {all:?}");
+        assert!(
+            ends_with(&all, ".codex"),
+            "codex (read by Cursor) missing: {all:?}"
+        );
 
         // With cursor.skills off, .cursor is dropped and .claude kept
         let mut compat = CompatConfig::default();
         compat.cursor.skills = false;
         let dirs = collect_skill_config_dirs(Some(cwd), None, tmp.path(), &[], compat);
         assert!(
-            !ends_with(&dirs, ".cursor"),
+            !ends_with(&dirs, ".cursor") && !ends_with(&dirs, ".codex"),
             "cursor must be gated off: {dirs:?}"
         );
         assert!(ends_with(&dirs, ".claude"), "claude must remain: {dirs:?}");
