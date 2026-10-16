@@ -136,6 +136,33 @@ async fn agent_skills_list_once_alongside_discovered_skills() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn recorded_prompts_come_back_from_prompt_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_string_lossy().into_owned();
+    record_prompt(&cwd, "cursor-a", Some("p-1"), "first");
+    record_prompt(&cwd, "cursor-b", None, "other session");
+    record_prompt(&cwd, "cursor-a", Some("task-completed-t1"), "a wake turn");
+    record_prompt(&cwd, "cursor-a", Some("p-2"), "  ");
+    record_prompt(&cwd, "cursor-a", Some("p-3"), "second");
+
+    let history = |params: Value| {
+        let cwd = dir.path().to_path_buf();
+        async move {
+            let response = handle("_x.ai/prompt_history", &params, &cwd, &[])
+                .await
+                .unwrap();
+            serde_json::from_str::<Value>(response.0.get()).unwrap()["prompts"].clone()
+        }
+    };
+    let scoped = history(json!({ "cwd": cwd, "filter_session_id": "cursor-a" })).await;
+    let everything = history(json!({ "cwd": cwd })).await;
+    let _ = std::fs::remove_dir_all(crate::util::grok_home::sessions_cwd_dir(&cwd));
+
+    assert_eq!(json!(["second", "first"]), scoped);
+    assert_eq!(json!(["second", "other session", "first"]), everything);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn an_unknown_method_is_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let error = handle("x.ai/queue/clear", &json!({}), dir.path(), &[])

@@ -47,6 +47,13 @@ pub(crate) enum Routed {
     /// Answer a skills/hooks/plugins/marketplace/workflows/commands/MCP request off the ACP connection; Cursor's ACP has
     /// none of them.
     Catalog(Box<CatalogRequest>),
+    /// Add a prompt the user sent to the session cwd's prompt history (`x.ai/prompt_history`).
+    RecordPrompt {
+        cwd: String,
+        session_id: String,
+        prompt_id: Option<String>,
+        prompt: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +280,7 @@ impl CursorAdapter {
                     .as_deref()
                     .and_then(|id| self.sessions.get(id))
                     .and_then(|session| session.cloud_agent_id.clone());
+                let record = self.prompt_record(session_id.as_deref(), &msg);
                 let mut cloud_handoff = false;
                 let mut cloud_task = None;
                 if let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) {
@@ -322,7 +330,7 @@ impl CursorAdapter {
                         .get(&session_id)
                         .and_then(|session| session.model.clone())
                         .or_else(|| self.preferred_model.clone());
-                    return vec![Routed::Cloud {
+                    let cloud = Routed::Cloud {
                         session_id: session_id.clone(),
                         request,
                         repo: self.cloud_repo(cloud_agent_id.as_deref(), &session_id),
@@ -330,7 +338,8 @@ impl CursorAdapter {
                         agent_id: cloud_agent_id,
                         prompt_rpc_id: id,
                         prompt_id,
-                    }];
+                    };
+                    return std::iter::once(cloud).chain(record).collect();
                 }
                 let prompt_id = msg
                     .pointer("/params/_meta/promptId")
@@ -351,6 +360,9 @@ impl CursorAdapter {
                         );
                     }
                 }
+                return std::iter::once(Routed::ToAgent(msg.to_string()))
+                    .chain(record)
+                    .collect();
             }
             _ => {}
         }
@@ -688,6 +700,34 @@ impl CursorAdapter {
         if !disabled.is_empty() {
             *commands = Value::Array(catalog::visible_commands(list, &disabled));
         }
+    }
+
+    /// The prompt-history entry for a `session/prompt`, read before skill hoisting rewrites it: its text blocks,
+    /// trimmed and joined the way the grok session records them.
+    fn prompt_record(&self, session_id: Option<&str>, msg: &Value) -> Option<Routed> {
+        let session_id = session_id?;
+        let cwd = self.sessions.get(session_id)?.cwd.clone()?;
+        let prompt = msg
+            .pointer("/params/prompt")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if prompt.is_empty() {
+            return None;
+        }
+        Some(Routed::RecordPrompt {
+            cwd,
+            session_id: session_id.to_owned(),
+            prompt_id: msg
+                .pointer("/params/_meta/promptId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            prompt,
+        })
     }
 
     /// Forward the picker's `x.ai/session/list` as Cursor's ACP `session/list`, which needs an absolute `cwd`.

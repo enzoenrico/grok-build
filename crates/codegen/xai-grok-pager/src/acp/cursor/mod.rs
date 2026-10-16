@@ -390,6 +390,21 @@ impl CursorIo {
                         Routed::Catalog(request) => {
                             catalog::spawn(*request, to_client_tx.clone());
                         }
+                        Routed::RecordPrompt {
+                            cwd,
+                            session_id,
+                            prompt_id,
+                            prompt,
+                        } => {
+                            tokio::task::spawn_blocking(move || {
+                                xai_grok_shell::extensions::catalog::record_prompt(
+                                    &cwd,
+                                    &session_id,
+                                    prompt_id.as_deref(),
+                                    &prompt,
+                                );
+                            });
+                        }
                         Routed::Cloud {
                             session_id,
                             request,

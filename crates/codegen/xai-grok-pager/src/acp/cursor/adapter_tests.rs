@@ -9,6 +9,9 @@ fn parse(routed: &Routed) -> Value {
         Routed::Catalog(request) => {
             panic!("expected a JSON line, got a catalog request: {request:?}")
         }
+        Routed::RecordPrompt { prompt, .. } => {
+            panic!("expected a JSON line, got a prompt-history entry: {prompt:?}")
+        }
     }
 }
 
@@ -1187,6 +1190,72 @@ fn mcps_come_from_the_cursor_cli_and_toggle_through_it() {
             .as_str()
             .unwrap()
             .contains("server_name")
+    );
+}
+
+#[test]
+fn prompts_are_recorded_and_prompt_history_reads_them_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_string_lossy().into_owned();
+    let mut adapter = adapter_with_session(dir.path(), no_disabled_skills);
+
+    let sent = adapter.outbound(
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": "s1",
+                "_meta": { "promptId": "p-1" },
+                "prompt": [{ "type": "text", "text": " fix the flaky test " }, { "type": "image", "data": "" }],
+            },
+        })
+        .to_string(),
+    );
+    assert_eq!(parse(&sent[0])["method"], "session/prompt");
+    let Some(Routed::RecordPrompt {
+        cwd: recorded_cwd,
+        session_id,
+        prompt_id,
+        prompt,
+    }) = sent.get(1)
+    else {
+        panic!("the prompt must be recorded: {sent:?}");
+    };
+    assert_eq!(
+        (
+            recorded_cwd.as_str(),
+            session_id.as_str(),
+            prompt_id.as_deref(),
+            prompt.as_str()
+        ),
+        (cwd.as_str(), "s1", Some("p-1"), "fix the flaky test")
+    );
+
+    xai_grok_shell::extensions::catalog::record_prompt(
+        recorded_cwd,
+        session_id,
+        prompt_id.as_deref(),
+        prompt,
+    );
+    let request = catalog_request(
+        &mut adapter,
+        4,
+        "_x.ai/prompt_history",
+        &json!({ "cwd": cwd, "filter_session_id": "s1" }),
+    );
+    let lines = catalog::answer_blocking(request);
+    let _ = std::fs::remove_dir_all(xai_grok_config::sessions_cwd_dir(&cwd));
+    let reply: Value = serde_json::from_str(&lines[0]).unwrap();
+    assert_eq!(reply["result"]["prompts"], json!(["fix the flaky test"]));
+
+    let unknown_session = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":"s9","prompt":[{"type":"text","text":"hi"}]}}"#,
+    );
+    assert_eq!(
+        unknown_session.len(),
+        1,
+        "no cwd, nothing to record: {unknown_session:?}"
     );
 }
 

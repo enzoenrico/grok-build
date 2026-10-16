@@ -1,5 +1,5 @@
-//! The pager's catalog methods (skills, workflows, hooks, plugins, marketplace) answered for a working directory
-//! instead of a live grok session, for ACP backends with no grok session behind them (`--backend cursor`).
+//! The pager's catalog methods (skills, workflows, hooks, plugins, marketplace, prompt history) answered for a working
+//! directory instead of a live grok session, for ACP backends with no grok session behind them (`--backend cursor`).
 //!
 //! Every method runs the loader or action the session path runs; only the host differs: the registries are
 //! rebuilt from disk for `cwd` on each request instead of being read from a session actor.
@@ -43,6 +43,7 @@ pub const METHODS: &[&str] = &[
     "x.ai/plugins/notify-updates",
     "x.ai/marketplace/list",
     "x.ai/marketplace/action",
+    "x.ai/prompt_history",
 ];
 
 /// The method name without the ACP `_` extension prefix, when [`handle`] answers it.
@@ -62,6 +63,11 @@ pub async fn handle(
     let Some(method) = catalog_method(method) else {
         return Err(acp::Error::method_not_found());
     };
+    if method == "x.ai/prompt_history" {
+        let args =
+            acp::ExtRequest::new(method, Arc::from(serde_json::value::to_raw_value(params)?));
+        return super::prompt_history::handle_prompt_history(&args).await;
+    }
     let host = CwdHost::load(cwd).await;
     let raw = params.to_string();
     match method {
@@ -143,6 +149,30 @@ fn with_absolute_cwd(params: &serde_json::Value, cwd: &Path) -> serde_json::Valu
         serde_json::Value::String(anchored.to_string_lossy().into_owned()),
     );
     serde_json::Value::Object(params)
+}
+
+/// Append a prompt the user sent to another backend's session to `cwd`'s prompt history, the file
+/// `x.ai/prompt_history` reads, so up-arrow and Ctrl+R recall it the way they recall grok prompts.
+/// Synthetic prompts (by `prompt_id` prefix) are skipped, as the grok session skips them.
+pub fn record_prompt(cwd: &str, session_id: &str, prompt_id: Option<&str>, prompt: &str) {
+    let human = prompt_id.is_none_or(|id| {
+        crate::session::PromptOrigin::from_prompt_id(id)
+            .policy()
+            .analytics
+            .is_human_prompt()
+    });
+    if !human || prompt.trim().is_empty() {
+        return;
+    }
+    let entry = crate::session::prompt_history::PromptEntry {
+        timestamp: chrono::Utc::now(),
+        session_id: session_id.to_owned(),
+        prompt: prompt.to_owned(),
+        is_bash: false,
+    };
+    if let Err(error) = crate::session::prompt_history::append_prompt(cwd, &entry) {
+        tracing::warn!(%error, "catalog: could not record the prompt in prompt history");
+    }
 }
 
 /// `[skills].disabled` from the effective config: the skills a backend's slash menu should hide.
