@@ -194,7 +194,7 @@ fn collect_skill_config_dirs_from_sources(
     };
 
     // Vendor dirs (`.claude`/`.cursor`) are gated by the resolved compat config; `.grok` and `.agents` are always present
-    // When all cells are on, this list equals the historical `[".grok", ".agents", ".claude", ".cursor"]`
+    // When all cells are on, this list is the historical `[".grok", ".agents", ".claude", ".cursor"]` plus Cursor's `.codex`
     let config_dir_names = compat.skill_config_dirs();
 
     if let Some(project_sources) = project_sources {
@@ -215,6 +215,7 @@ fn collect_skill_config_dirs_from_sources(
         }
         if compat.cursor.skills {
             try_add(home.join(".cursor"));
+            try_add(home.join(".codex"));
         }
     }
 
@@ -1839,7 +1840,7 @@ mod tests {
 
     #[tokio::test]
     async fn untrusted_project_skills_are_omitted() {
-        for config_dir in [".grok", ".agents", ".claude", ".cursor"] {
+        for config_dir in [".grok", ".agents", ".claude", ".cursor", ".codex"] {
             let tmp = tempfile::tempdir().unwrap();
             let repo = tmp.path().join("repo");
             let config_root = repo.join(config_dir);
@@ -2591,7 +2592,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         // Not a git repo, so it falls to the cwd-only branch (no upward walk)
-        for name in [".grok", ".agents", ".claude", ".cursor"] {
+        for name in [".grok", ".agents", ".claude", ".cursor", ".codex"] {
             fs::create_dir_all(cwd.join(name)).unwrap();
         }
 
@@ -2602,13 +2603,17 @@ mod tests {
             collect_skill_config_dirs(Some(cwd), None, tmp.path(), &[], CompatConfig::default());
         assert!(ends_with(&all, ".claude"), "claude missing: {all:?}");
         assert!(ends_with(&all, ".cursor"), "cursor missing: {all:?}");
+        assert!(
+            ends_with(&all, ".codex"),
+            "codex (read by Cursor) missing: {all:?}"
+        );
 
         // With cursor.skills off, .cursor is dropped and .claude kept
         let mut compat = CompatConfig::default();
         compat.cursor.skills = false;
         let dirs = collect_skill_config_dirs(Some(cwd), None, tmp.path(), &[], compat);
         assert!(
-            !ends_with(&dirs, ".cursor"),
+            !ends_with(&dirs, ".cursor") && !ends_with(&dirs, ".codex"),
             "cursor must be gated off: {dirs:?}"
         );
         assert!(ends_with(&dirs, ".claude"), "claude must remain: {dirs:?}");
