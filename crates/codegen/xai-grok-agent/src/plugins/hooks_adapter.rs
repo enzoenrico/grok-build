@@ -147,7 +147,6 @@ pub fn active_plugin_hook_specs_filtered(
         .flat_map(|plugin| plugin.hook_specs.iter().cloned())
         .collect()
 }
-
 /// Returns `base` with its plugin-layer hooks replaced by `specs`, or `None` when no hook remains.
 /// Returns `base` unchanged when neither side has a plugin hook.
 pub fn replace_plugin_hooks(

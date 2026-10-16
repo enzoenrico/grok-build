@@ -1118,6 +1118,7 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         _ => HashMap::new(),
     };
 
+    let has_live_session = session_snapshot.is_some();
     if let Some(snapshot) = session_snapshot {
         if gateway_catalog.is_some()
             && let Some(disabled) = match session_handle.as_ref() {
@@ -1237,10 +1238,107 @@ async fn handle_list(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             }
         }
     }
+    let cwd_for_label = cwd.clone();
+    let disabled_for_label = disabled_names.clone();
+    let servers = tokio::task::spawn_blocking(move || {
+        label_cursor_mcp_servers(
+            &mut servers,
+            &cwd_for_label,
+            &disabled_for_label,
+            has_live_session,
+        );
+        servers
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, "mcp/list cursor labeling failed");
+        Vec::new()
+    });
     to_ext_response(Ok(McpListResponse {
         servers,
         session_mcp_resolved,
     }))
+}
+
+/// Label Cursor stdio servers `cursor: {scope}` and HTTP/SSE servers `connector: {scope}`.
+/// Servers Cursor marked `disabled` are absent from the started catalog, so they are appended here.
+fn label_cursor_mcp_servers(
+    servers: &mut Vec<McpServerEntry>,
+    cwd: &std::path::Path,
+    disabled_names: &HashSet<String>,
+    has_live_session: bool,
+) {
+    let cursor_rows = xai_grok_config::mcp_servers::list_cursor_mcp_for_display(cwd);
+    let statuses = xai_grok_config::mcp_servers::cursor_mcp_connection_statuses(&cursor_rows);
+    let known: HashSet<String> = servers.iter().map(|entry| entry.name.clone()).collect();
+    for entry in servers.iter_mut() {
+        let Some(index) = cursor_rows.iter().position(|row| row.name == entry.name) else {
+            continue;
+        };
+        let Some(row) = cursor_rows.get(index) else {
+            continue;
+        };
+        if entry.source_label.is_none() {
+            entry.source_label = Some(row.source_label());
+        }
+        // A live session snapshot already has the handshake result. Without one, a TCP or
+        // PATH check is the status `/mcps` can show before a session exists.
+        if !has_live_session {
+            let enabled = row.enabled && !disabled_names.contains(&row.name);
+            entry.session = Some(probed_cursor_session(
+                enabled,
+                statuses.get(index).copied().unwrap_or("unavailable"),
+            ));
+        }
+    }
+    for (index, row) in cursor_rows.iter().enumerate() {
+        if known.contains(&row.name) {
+            continue;
+        }
+        let enabled = row.enabled && !disabled_names.contains(&row.name);
+        let source_label = row.source_label();
+        let config = if row.is_connector() {
+            McpServerConfig::Http {
+                url: row.detail.clone(),
+                scope: None,
+                scope_id: None,
+                scope_name: None,
+            }
+        } else {
+            McpServerConfig::Stdio {
+                command: std::path::PathBuf::from(&row.detail),
+                args: Vec::new(),
+                env: Vec::new(),
+            }
+        };
+        let status = statuses.get(index).copied().unwrap_or("unavailable");
+        servers.push(McpServerEntry {
+            name: row.name.clone(),
+            display_name: None,
+            icons: Vec::new(),
+            source: McpServerSource::Local,
+            source_label: Some(source_label),
+            setup: None,
+            setup_values: None,
+            config,
+            session: Some(probed_cursor_session(enabled, status)),
+        });
+    }
+}
+
+fn probed_cursor_session(enabled: bool, status: &str) -> McpServerSessionState {
+    McpServerSessionState {
+        enabled,
+        status: Some(if enabled && status == "ready" {
+            McpSessionStatus::Ready
+        } else {
+            McpSessionStatus::Unavailable
+        }),
+        tools: vec![],
+        auth_required: false,
+        setup_required: false,
+        blocked_reason: None,
+    }
 }
 
 // ── mcp/call handler ────────────────────────────────────────────────

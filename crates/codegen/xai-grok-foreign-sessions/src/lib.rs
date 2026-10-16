@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod capability;
 mod claude;
 mod codex;
+mod cursor;
 use capability::{ApprovedRoot, open_sqlite_transaction};
 pub const MAX_SESSIONS_PER_TOOL: usize = 50;
 pub const MAX_SESSION_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -98,15 +99,58 @@ pub fn scan_foreign_sessions(
     cwd: &Path,
     enabled: EnabledForeignSessionSources,
 ) -> Vec<ForeignSessionSummary> {
-    let scan_cursor = |_: &Path, _: SystemTime| Vec::new();
-    scan_with(cwd, enabled, claude::scan, codex::scan, scan_cursor)
+    scan_with(cwd, enabled, claude::scan, codex::scan, cursor::scan)
 }
+pub use cursor::{CursorTranscriptTurn, read_transcript as read_cursor_transcript};
+
+/// What a picker pick should do with a foreign session id.
+#[derive(Debug)]
+pub enum ForeignImportPlan {
+    /// `cursor-agent` can `session/load` this CLI transcript.
+    NativeCursorLoad,
+    /// Copy these turns into a grok session, then load that.
+    Import(Vec<CursorTranscriptTurn>),
+    /// No local transcript. The pager sends `/resume-claude` or `/resume-codex`.
+    NeedsSkill,
+    /// Nothing to load. The string is a toast.
+    Toast(String),
+}
+
+pub fn plan_foreign_import(
+    tool: ForeignSessionTool,
+    cwd: &Path,
+    session_id: &str,
+    cursor_backend: bool,
+) -> ForeignImportPlan {
+    match tool {
+        ForeignSessionTool::Cursor => cursor::plan_import(cwd, session_id, cursor_backend),
+        ForeignSessionTool::Claude => {
+            import_or_skill(cursor_backend, claude::read_transcript(cwd, session_id))
+        }
+        ForeignSessionTool::Codex => {
+            import_or_skill(cursor_backend, codex::read_transcript(cwd, session_id))
+        }
+    }
+}
+
+fn import_or_skill(cursor_backend: bool, turns: Vec<CursorTranscriptTurn>) -> ForeignImportPlan {
+    if cursor_backend {
+        return ForeignImportPlan::Toast(
+            "cursor-agent cannot resume Claude or Codex sessions. Switch to the grok backend to import the transcript.".into(),
+        );
+    }
+    if turns.is_empty() {
+        ForeignImportPlan::NeedsSkill
+    } else {
+        ForeignImportPlan::Import(turns)
+    }
+}
+
 pub fn most_recent_foreign_session(
     cwd: &Path,
     enabled: EnabledForeignSessionSources,
     within: Duration,
 ) -> Option<RecentForeignSession> {
-    let recent_cursor = |_: &Path, _: SystemTime, _: Duration| RecentProbe::Complete(None);
     match most_recent_with(
         cwd,
         enabled,
@@ -114,7 +158,7 @@ pub fn most_recent_foreign_session(
         SystemTime::now(),
         claude::most_recent,
         codex::most_recent,
-        recent_cursor,
+        cursor::most_recent,
     ) {
         RecentProbe::Complete(session) => session,
         RecentProbe::Incomplete => None,

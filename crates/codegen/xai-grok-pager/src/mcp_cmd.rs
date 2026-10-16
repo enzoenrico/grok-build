@@ -90,6 +90,11 @@ pub enum McpCommand {
         /// Server name
         name: String,
     },
+    /// Log in to a Cursor MCP connector via `cursor-agent mcp login` (or `agent mcp login`)
+    Login {
+        /// Connector name. Omit it to let the Cursor CLI prompt.
+        name: Option<String>,
+    },
     /// Diagnose MCP server configuration and connectivity
     Doctor {
         /// Emit machine-readable JSON output
@@ -153,6 +158,7 @@ pub async fn run(mcp_args: McpArgs) -> Result<()> {
         McpCommand::Remove { name, scope } => run_remove(&name, scope).await,
         McpCommand::Enable { name } => run_set_enabled(&name, true).await,
         McpCommand::Disable { name } => run_set_enabled(&name, false).await,
+        McpCommand::Login { name } => run_login(name),
         McpCommand::Doctor { json, name } => run_doctor(json, name).await,
     }
 }
@@ -165,9 +171,19 @@ fn run_list(json: bool) -> Result<()> {
     // `mcp_doctor::policy_subjects` judges this same TOML walk (plus the doctor-only `.mcp.json`
     // and plugin legs), so every server listed here has a verdict; the rule itself is the merge's.
     let blocked = xai_grok_shell::mcp_doctor::policy_blocked_servers(&cwd);
+    let cursor_listed = xai_grok_config::mcp_servers::list_cursor_mcp_for_display(&cwd);
+    let cursor_status: HashMap<String, &'static str> = cursor_listed
+        .iter()
+        .zip(xai_grok_config::mcp_servers::cursor_mcp_connection_statuses(&cursor_listed))
+        .map(|(row, status)| (row.name.clone(), status))
+        .collect();
+    let cursor_extra: Vec<_> = cursor_listed
+        .into_iter()
+        .filter(|row| !servers.contains_key(&row.name))
+        .collect();
 
     if json {
-        let payload: serde_json::Value = servers
+        let mut payload: Vec<serde_json::Value> = servers
             .iter()
             .map(|(name, (config, scope))| {
                 let mut entry = serde_json::to_value(config).unwrap_or_default();
@@ -188,8 +204,21 @@ fn run_list(json: bool) -> Result<()> {
                 entry
             })
             .collect();
+        for row in &cursor_extra {
+            payload.push(serde_json::json!({
+                "name": row.name,
+                "scope": row.scope,
+                "transport": row.transport,
+                "detail": row.detail,
+                "enabled": row.enabled && !disabled.contains(&row.name),
+                "source": "cursor",
+                "location": row.location.display().to_string(),
+                "connector": row.is_connector(),
+                "status": cursor_list_status(row, &disabled, cursor_status.get(&row.name).copied()),
+            }));
+        }
         println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else if servers.is_empty() {
+    } else if servers.is_empty() && cursor_extra.is_empty() {
         println!("No MCP servers configured. Run `grok mcp add --help` to get started.");
     } else {
         for (name, (config, scope)) in &servers {
@@ -220,6 +249,79 @@ fn run_list(json: bool) -> Result<()> {
             };
             println!("  {name}: {transport}{suffix}");
         }
+        print_cursor_mcp_group(
+            "MCP servers",
+            &cursor_extra,
+            &disabled,
+            &cursor_status,
+            false,
+        );
+        print_cursor_mcp_group("Connectors", &cursor_extra, &disabled, &cursor_status, true);
+    }
+    Ok(())
+}
+
+fn cursor_list_status(
+    row: &xai_grok_config::mcp_servers::CursorMcpListing,
+    disabled: &std::collections::HashSet<String>,
+    probed: Option<&'static str>,
+) -> &'static str {
+    if !row.enabled || disabled.contains(&row.name) {
+        "disabled"
+    } else if probed == Some("ready") {
+        "connected"
+    } else {
+        "disconnected"
+    }
+}
+
+fn print_cursor_mcp_group(
+    heading: &str,
+    rows: &[xai_grok_config::mcp_servers::CursorMcpListing],
+    disabled: &std::collections::HashSet<String>,
+    statuses: &HashMap<String, &'static str>,
+    connectors: bool,
+) {
+    let rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.is_connector() == connectors)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    println!();
+    println!("{heading}");
+    for row in rows {
+        let mut notes = vec![format!("cursor {}", row.scope)];
+        notes.push(cursor_list_status(row, disabled, statuses.get(&row.name).copied()).to_owned());
+        println!("  {}: {} ({})", row.name, row.detail, notes.join(", "));
+    }
+}
+
+fn run_login(name: Option<String>) -> Result<()> {
+    let program = crate::acp::cursor::cursor_cli_program();
+    let server = name.filter(|value| !value.trim().is_empty());
+    if !crate::acp::cursor::cursor_cli_installed(&program) {
+        let extra = server
+            .as_deref()
+            .map(|value| format!(" {value}"))
+            .unwrap_or_default();
+        bail!(
+            "Cursor CLI ({}) was not found. Install it, or set GROK_CURSOR_AGENT_BIN to the binary, then run `{} mcp login{extra}`.",
+            program.display(),
+            program.display()
+        );
+    }
+    let mut command = std::process::Command::new(&program);
+    command.arg("mcp").arg("login");
+    if let Some(server) = server.as_deref() {
+        command.arg(server);
+    }
+    let status = command.status().map_err(|error| {
+        anyhow::anyhow!("failed to run `{} mcp login`: {error}", program.display())
+    })?;
+    if !status.success() {
+        bail!("`{} mcp login` exited with {status}", program.display());
     }
     Ok(())
 }
@@ -645,10 +747,23 @@ async fn run_set_enabled(name: &str, enabled: bool) -> Result<()> {
         std::process::exit(1);
     }
 
-    // No-op check after the policy gate (blocked refuses, not "already enabled") and before the
-    // save, which rewrites `enabled` keys; disable writes only the user list, so judge that list.
-    let already = if enabled {
-        !xai_grok_shell::util::config::disabled_mcp_server_names(&cwd).contains(name)
+    // No-op check after the policy gate. A Cursor server is already in the requested state only
+    // when grok's disabled list and the `disabled` flag in that server's mcp.json agree.
+    // `cursor-agent` reads the file, not grok's list.
+    let cursor_row = xai_grok_config::mcp_servers::list_cursor_mcp_for_display(&cwd)
+        .into_iter()
+        .find(|row| row.name == name);
+    let grok_disabled =
+        xai_grok_shell::util::config::disabled_mcp_server_names(&cwd).contains(name);
+    let already = if let Some(row) = cursor_row.as_ref() {
+        let cursor_disabled = !row.enabled;
+        if enabled {
+            !grok_disabled && !cursor_disabled
+        } else {
+            grok_disabled && cursor_disabled
+        }
+    } else if enabled {
+        !grok_disabled
     } else {
         xai_grok_shell::config::load_from_disk()
             .is_ok_and(|user_config| user_disabled_list_has(&user_config, name))
@@ -1366,6 +1481,25 @@ url = "https://mcp.example.test/sse"
         )
         .unwrap();
         assert!(!user_disabled_list_has(&field_off, "svc"));
+    }
+
+    #[test]
+    fn login_parses_optional_server_name() {
+        let args = PagerArgs::try_parse_from(["grok", "mcp", "login"]).expect("login should parse");
+        match args.command {
+            Some(Command::Mcp(McpArgs {
+                command: McpCommand::Login { name },
+            })) => assert!(name.is_none()),
+            other => panic!("expected mcp login, got {other:?}"),
+        }
+        let args = PagerArgs::try_parse_from(["grok", "mcp", "login", "sentry"])
+            .expect("login name should parse");
+        match args.command {
+            Some(Command::Mcp(McpArgs {
+                command: McpCommand::Login { name },
+            })) => assert_eq!(name.as_deref(), Some("sentry")),
+            other => panic!("expected mcp login, got {other:?}"),
+        }
     }
 
     #[test]

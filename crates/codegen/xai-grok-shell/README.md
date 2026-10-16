@@ -480,7 +480,7 @@ grok --always-approve --prompt "Format all files"
 | `Ctrl+D` or `Ctrl+Q`         | Quit (with confirmation)        |
 | `Ctrl+O`                     | Toggle always-approve mode |
 | `Ctrl+T`                     | Toggle TODO/task panel          |
-| `Ctrl+R`                     | Search prompt history           |
+| `Ctrl+R`                     | Open the session picker (grok, Cursor, Claude, and Codex sessions) |
 | `Ctrl+V`                     | Paste from clipboard            |
 | `Ctrl+U`                     | Undo last input change          |
 | `Ctrl+G`                     | Move foreground task to background |
@@ -524,7 +524,7 @@ Type `/` in the input to access commands:
 - **Tool execution progress** with real-time output
 - **TODO panel** tracking task progress
 - **Session persistence** — conversations auto-save and can be resumed
-- **History search** — `Ctrl+R` to search previous prompts
+- **Session picker** — `Ctrl+R` to resume a previous grok, Cursor, Claude, or Codex session; Up arrow searches this session's prompts
 
 ### File References (`@`)
 

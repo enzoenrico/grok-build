@@ -479,6 +479,76 @@ fn between<'a>(value: &'a str, start: &str, end: &str) -> Option<&'a str> {
     value.get(start..end)
 }
 
+pub(super) fn read_transcript(
+    cwd: &Path,
+    session_id: &str,
+) -> Vec<super::cursor::CursorTranscriptTurn> {
+    if uuid::Uuid::try_parse(session_id).is_err() {
+        return Vec::new();
+    }
+    let Some(config_dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| xai_dirs::home_dir().map(|home| home.join(".claude")))
+    else {
+        return Vec::new();
+    };
+    let Some(root) = ApprovedRoot::new(&config_dir) else {
+        return Vec::new();
+    };
+    for dir in projects::scoped_project_dirs(root.path(), cwd) {
+        let path = dir.join(format!("{session_id}.jsonl"));
+        let Some(mut opened) = root.open_regular_file(&path) else {
+            continue;
+        };
+        return claude_turns(&mut opened.file);
+    }
+    Vec::new()
+}
+
+fn claude_turns(file: &mut std::fs::File) -> Vec<super::cursor::CursorTranscriptTurn> {
+    let mut bytes = Vec::new();
+    let _ = file.take(1024 * 1024).read_to_end(&mut bytes);
+    let text = String::from_utf8_lossy(&bytes);
+    let mut turns = Vec::new();
+    for line in text.lines() {
+        if turns.len() == 120 {
+            break;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let kind = entry.get("type").and_then(Value::as_str);
+        let user = match kind {
+            Some("user") => true,
+            Some("assistant") => false,
+            _ => continue,
+        };
+        if entry.get("isMeta").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(content) = entry.pointer("/message/content") else {
+            continue;
+        };
+        let body = match content {
+            Value::String(text) => text.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let body = body.chars().take(8_000).collect();
+        turns.push(super::cursor::CursorTranscriptTurn { user, text: body });
+    }
+    turns
+}
+
 fn is_generated_prompt(value: &str) -> bool {
     if value.starts_with("[Request interrupted by user") {
         return true;

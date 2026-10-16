@@ -368,6 +368,16 @@ pub async fn save_mcp_server_enabled_in(
     }
 
     // Disable is personal (user `disabled_mcp_servers`) and must not dirty shared files
+    match xai_grok_config::mcp_servers::set_cursor_mcp_server_disabled(cwd, server_name, !enabled) {
+        Ok(Some(path)) => modified.push(path),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "failed to update Cursor mcp.json for '{server_name}': {error}"
+            ));
+        }
+    }
+
     if enabled && let Some(path) = nearest_project_mcp_definition(cwd, server_name) {
         match clear_sticky_project_disabled_at(&path, server_name).await {
             Ok(true) => modified.push(path),
@@ -409,6 +419,9 @@ pub(crate) async fn restore_mcp_server_enabled_after_enable(
     for path in modified_paths {
         if path == user_path.as_path() {
             save_user_mcp_server_enabled(server_name, false).await?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            xai_grok_config::mcp_servers::set_cursor_mcp_disabled_at(path, server_name, true)
+                .map_err(|error| anyhow::anyhow!("failed to restore Cursor mcp.json: {error}"))?;
         } else {
             set_sticky_project_disabled_at(path, server_name).await?;
         }
@@ -838,6 +851,11 @@ pub fn cli_known_mcp_server_names(cwd: &std::path::Path) -> std::collections::Ha
             names.insert(name.to_string());
         }
     }
+    names.extend(
+        xai_grok_config::mcp_servers::list_cursor_mcp_for_display(cwd)
+            .into_iter()
+            .map(|row| row.name),
+    );
     names
 }
 

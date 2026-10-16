@@ -537,6 +537,7 @@ pub(crate) mod goal_role_tools;
 pub(crate) mod goal_stop_detector;
 pub(crate) mod goal_strategist;
 pub(crate) mod goal_summarizer;
+pub mod cursor_import;
 pub mod goal_tracker;
 pub mod helpers;
 pub(crate) mod image_describe;

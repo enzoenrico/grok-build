@@ -149,6 +149,10 @@ impl WorkflowRegistry {
             merge_scope(&mut entries, scoped);
         }
 
+        let mut cursor_entries = cursor_workflow_entries(session_cwd);
+        reject_same_scope_duplicates(&mut cursor_entries, "cursor", &mut duplicate_names);
+        merge_scope(&mut entries, cursor_entries);
+
         Self {
             entries,
             duplicate_names,
@@ -228,6 +232,170 @@ fn reject_same_scope_duplicates(
             entries.retain(|entry| entry.meta.name != name);
         }
     }
+}
+
+const MAX_CURSOR_WORKFLOW_FILES: usize = 64;
+const MAX_CURSOR_WORKFLOW_BODY: usize = 256 * 1024;
+
+/// Cursor has no Rhai workflows. Its commands and `workflows/` markdown files are the same
+/// kind of reusable prompt, so they show up in `/workflows` and run as one agent step.
+fn cursor_workflow_entries(session_cwd: Option<&Path>) -> Vec<RegistryEntry> {
+    let mut dirs: Vec<(PathBuf, Option<String>)> = Vec::new();
+    if let Some(config_dir) =
+        xai_grok_config::mcp_servers::cursor_user_config_dir(xai_dirs::home_dir().as_deref())
+    {
+        dirs.push((config_dir.join("commands"), None));
+        dirs.push((config_dir.join("workflows"), None));
+        for plugin in xai_grok_config::mcp_servers::cursor_installed_plugins(&config_dir) {
+            let prefix = Some(plugin.name.clone());
+            dirs.push((plugin.root.join("commands"), prefix.clone()));
+            dirs.push((plugin.root.join("workflows"), prefix));
+        }
+        for local in xai_grok_config::mcp_servers::cursor_local_plugin_dirs(&config_dir) {
+            let prefix = local
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string);
+            dirs.push((local.join("commands"), prefix.clone()));
+            dirs.push((local.join("workflows"), prefix));
+        }
+    }
+    if let Some(cwd) = session_cwd
+        && crate::agent::folder_trust::project_scope_allowed(cwd)
+    {
+        let root = project_root(cwd);
+        dirs.push((root.join(".cursor").join("commands"), None));
+        dirs.push((root.join(".cursor").join("workflows"), None));
+    }
+
+    let mut entries = Vec::new();
+    for (dir, prefix) in dirs {
+        entries.extend(scan_cursor_markdown_dir(&dir, prefix.as_deref()));
+    }
+    entries
+}
+
+fn scan_cursor_markdown_dir(dir: &Path, name_prefix: Option<&str>) -> Vec<RegistryEntry> {
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = read_dir
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .collect();
+    paths.sort();
+    paths.truncate(MAX_CURSOR_WORKFLOW_FILES);
+    paths
+        .into_iter()
+        .filter_map(|path| cursor_markdown_workflow(&path, name_prefix))
+        .collect()
+}
+
+fn cursor_markdown_workflow(path: &Path, name_prefix: Option<&str>) -> Option<RegistryEntry> {
+    let stem = path.file_stem().and_then(|stem| stem.to_str())?;
+    let stem = slug_workflow_name(stem)?;
+    let name = match name_prefix.and_then(slug_workflow_name) {
+        Some(prefix) => format!("{prefix}-{stem}"),
+        None => stem,
+    };
+    if !is_valid_workflow_name(&name) {
+        return None;
+    }
+    let text = read_capped_text(path, MAX_CURSOR_WORKFLOW_BODY)?;
+    let description = markdown_description(&text).unwrap_or_else(|| name.clone());
+    let description = truncate_to_bytes(&description, xai_workflow::MAX_WORKFLOW_DESCRIPTION_LEN);
+    let script = format!(
+        "let meta = #{{ name: {}, description: {} }};\nlet result = agent({});\ncomplete(result.output);\n",
+        rhai_string(&name),
+        rhai_string(&description),
+        rhai_string(&text),
+    );
+    if script.len() as u64 > MAX_WORKFLOW_SOURCE_BYTES {
+        return None;
+    }
+    let meta = xai_workflow::extract_meta(&script).ok()?;
+    Some(RegistryEntry {
+        meta,
+        script,
+        source: WorkflowSource::File(path.to_path_buf()),
+        source_label: "cursor",
+        path: Some(path.to_path_buf()),
+    })
+}
+
+fn slug_workflow_name(raw: &str) -> Option<String> {
+    let slug: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-').to_string();
+    is_valid_workflow_name(&slug).then_some(slug)
+}
+
+fn markdown_description(text: &str) -> Option<String> {
+    let rest = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))?;
+    let (front, _) = rest.split_once("\n---")?;
+    for line in front.lines() {
+        let Some(value) = line.trim().strip_prefix("description:") else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn read_capped_text(path: &Path, max_bytes: usize) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::Read::take(file, max_bytes as u64 + 1);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut reader, &mut bytes).ok()?;
+    if bytes.len() > max_bytes {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn truncate_to_bytes(input: &str, max: usize) -> String {
+    if input.len() <= max {
+        return input.to_string();
+    }
+    let mut out = String::new();
+    for ch in input.chars() {
+        if out.len() + ch.len_utf8() > max {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn rhai_string(input: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{{{:x}}}", u32::from(ch))),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn scan_directory(dir: &Path, source_label: &'static str) -> Vec<RegistryEntry> {
@@ -738,6 +906,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.meta.name, "alpha");
+    }
+
+    #[test]
+    fn cursor_markdown_command_is_a_one_step_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        let name = format!("cursor-cmd-{}", std::process::id());
+        let commands = dir.path().join(".cursor").join("commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        let body = format!("Say hello from {name}.");
+        std::fs::write(
+            commands.join(format!("{name}.md")),
+            format!("---\ndescription: Check status\n---\n\n{body}\n"),
+        )
+        .unwrap();
+
+        crate::agent::folder_trust::record_for_test(dir.path(), false);
+        assert!(
+            WorkflowRegistry::scan(Some(dir.path()))
+                .list()
+                .iter()
+                .all(|entry| entry.name != name)
+        );
+
+        crate::agent::folder_trust::record_for_test(dir.path(), true);
+        let registry = WorkflowRegistry::scan(Some(dir.path()));
+        let listing = registry
+            .list()
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .expect("cursor command listed");
+        assert_eq!(listing.source, "cursor");
+        assert_eq!(listing.description, "Check status");
+        let resolved = registry.resolve_by_name(&name).unwrap();
+        assert!(resolved.script.contains("agent("));
+        assert!(resolved.script.contains(&body));
+
+        let grok_dir = dir.path().join(".grok").join("workflows");
+        std::fs::create_dir_all(&grok_dir).unwrap();
+        std::fs::write(grok_dir.join(format!("{name}.rhai")), script(&name)).unwrap();
+        let shadowed = WorkflowRegistry::scan(Some(dir.path()));
+        assert_eq!(
+            shadowed
+                .list()
+                .into_iter()
+                .find(|entry| entry.name == name)
+                .expect("grok workflow")
+                .source,
+            "project"
+        );
+    }
+
+    #[test]
+    fn cursor_plugin_commands_are_prefixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = dir.path().join("commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        std::fs::write(
+            commands.join("status.md"),
+            "---\ndescription: Status\n---\n\nbody\n",
+        )
+        .unwrap();
+        let entries = scan_cursor_markdown_dir(&commands, Some("vercel"));
+        let entry = entries.first().expect("prefixed command");
+        assert_eq!(entry.meta.name, "vercel-status");
+        assert_eq!(entry.source_label, "cursor");
+        assert!(entry.script.contains("agent("));
     }
 
     #[test]

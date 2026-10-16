@@ -688,6 +688,29 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             scope,
             query,
         ),
+        TaskResult::CursorSessionMaterialized {
+            session_id,
+            cwd,
+            error,
+            native_load,
+            fallback_prompt,
+        } => match (error, native_load, fallback_prompt) {
+            (Some(error), _, _) => {
+                app.show_toast(&error);
+                vec![]
+            }
+            (None, _, Some(prompt)) => {
+                let mut effects = super::session::lifecycle::dispatch_new_session_inner(app, None);
+                effects.extend(dispatch(Action::SendPrompt(prompt), app));
+                effects
+            }
+            (None, _, None) => super::session::load::dispatch_load_session(
+                app,
+                session_id,
+                Some(std::path::PathBuf::from(cwd)),
+                false,
+            ),
+        },
         TaskResult::ForeignSessionsScanned { entries, seq } => {
             handle_foreign_sessions_scanned(app, entries, seq)
         }

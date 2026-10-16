@@ -1,3 +1,4 @@
+use super::super::McpServerSource;
 use super::*;
 
 #[test]
@@ -157,4 +158,253 @@ fn nearest_mcp_json_wins_a_shared_name() {
         vec![("svc", "near".to_owned()), ("far-only", "far".to_owned())],
         commands
     );
+}
+
+#[test]
+fn cursor_disabled_true_maps_to_enabled_false() {
+    let value = serde_json::json!({
+        "mcpServers": {
+            "off": { "command": "echo", "disabled": true },
+            "on": { "command": "echo", "disabled": false }
+        }
+    });
+    let config = mcp_config_from_json_value(&value);
+    assert!(!config.mcp_servers["off"].enabled);
+    assert!(config.mcp_servers["on"].enabled);
+}
+
+#[test]
+fn cursor_parent_mcp_json_is_visible_and_nearest_wins() {
+    let root = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".git")).unwrap();
+    std::fs::create_dir_all(root.path().join(".cursor")).unwrap();
+    std::fs::create_dir_all(root.path().join("pkg").join(".cursor")).unwrap();
+    std::fs::create_dir_all(root.path().join("pkg").join("nested")).unwrap();
+    std::fs::write(
+        root.path().join(".cursor").join("mcp.json"),
+        r#"{"mcpServers": {"shared": {"command": "parent"}, "parent-only": {"command": "parent"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("pkg").join(".cursor").join("mcp.json"),
+        r#"{"mcpServers": {
+            "shared": {"command": "child"},
+            "remote": {"url": "https://mcp.example.test/mcp", "disabled": true},
+            "events": {"url": "https://mcp.example.test/sse", "type": "sse"}
+        }}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(
+        config_dir
+            .path()
+            .join("plugins")
+            .join("local")
+            .join("linter"),
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir.path().join("mcp.json"),
+        r#"{"mcpServers": {"shared": {"command": "user"}, "user-only": {"command": "user"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        config_dir
+            .path()
+            .join("plugins")
+            .join("local")
+            .join("linter")
+            .join("mcp.json"),
+        r#"{"mcpServers": {"lint": {"command": "lint"}}}"#,
+    )
+    .unwrap();
+
+    let nested = root.path().join("pkg").join("nested");
+    let listed = list_cursor_mcp_in(&nested, Some(config_dir.path()));
+    let by_name: std::collections::HashMap<_, _> =
+        listed.iter().map(|row| (row.name.as_str(), row)).collect();
+
+    assert_eq!(by_name["shared"].detail, "child");
+    assert_eq!(by_name["shared"].scope, "project");
+    assert_eq!(by_name["parent-only"].detail, "parent");
+    assert_eq!(by_name["user-only"].scope, "user");
+    assert_eq!(by_name["user-only"].source_label(), "cursor: user");
+    assert!(!by_name["remote"].enabled);
+    assert!(by_name["remote"].is_connector());
+    assert_eq!(by_name["remote"].source_label(), "connector: project");
+    assert_eq!(by_name["events"].transport, "sse");
+    assert_eq!(by_name["lint"].scope, "plugin");
+    assert_eq!(by_name["lint"].plugin_name.as_deref(), Some("linter"));
+    assert_eq!(by_name.len(), 6);
+}
+
+#[test]
+fn cursor_disabled_flag_is_written_into_mcp_json() {
+    let root = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let mcp = root.path().join(".cursor").join("mcp.json");
+    std::fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+    std::fs::write(
+        &mcp,
+        r#"{"mcpServers":{"lint":{"command":"npx","args":["lint"],"env":{"A":"b"}}}}"#,
+    )
+    .unwrap();
+    // Keep the user file out of this assertion: point config dir at an empty directory.
+    let _ = config_dir;
+    let changed = set_cursor_mcp_server_disabled(root.path(), "lint", true).unwrap();
+    assert_eq!(changed.as_deref(), Some(mcp.as_path()));
+    let listed = list_cursor_mcp_in(root.path(), Some(config_dir.path()));
+    let lint = listed.iter().find(|row| row.name == "lint").unwrap();
+    assert!(!lint.enabled);
+    let raw = std::fs::read_to_string(&mcp).unwrap();
+    assert!(raw.contains("\"disabled\": true"));
+    assert!(raw.contains("\"A\": \"b\"") || raw.contains("\"A\":\"b\""));
+    assert!(
+        set_cursor_mcp_server_disabled(root.path(), "lint", false)
+            .unwrap()
+            .is_some()
+    );
+    let listed = list_cursor_mcp_in(root.path(), Some(config_dir.path()));
+    assert!(
+        listed
+            .iter()
+            .find(|row| row.name == "lint")
+            .unwrap()
+            .enabled
+    );
+}
+
+#[test]
+fn connection_status_checks_stdio_on_path_and_tcp() {
+    let missing = CursorMcpListing {
+        name: "missing".into(),
+        transport: "stdio",
+        scope: "user",
+        location: std::path::PathBuf::from("mcp.json"),
+        detail: "grok-mcp-probe-missing-bin".into(),
+        enabled: true,
+        plugin_name: None,
+    };
+    assert_eq!(cursor_mcp_connection_status(&missing), "unavailable");
+    let shell = CursorMcpListing {
+        detail: "sh -c true".into(),
+        ..missing.clone()
+    };
+    assert_eq!(cursor_mcp_connection_status(&shell), "ready");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let up = CursorMcpListing {
+        transport: "http",
+        detail: format!("http://127.0.0.1:{port}/mcp"),
+        ..missing.clone()
+    };
+    assert_eq!(cursor_mcp_connection_status(&up), "ready");
+    drop(listener);
+    let down = CursorMcpListing {
+        transport: "http",
+        detail: "http://127.0.0.1:1/mcp".into(),
+        ..missing
+    };
+    assert_eq!(cursor_mcp_connection_status(&down), "unavailable");
+}
+
+#[test]
+fn cursor_installed_plugins_resolve_sha_and_release_tag_dirs() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let sha_root = config_dir
+        .path()
+        .join("plugins/cache/acme/plugin-sha/abc123");
+    let tag_root = config_dir
+        .path()
+        .join("plugins/cache/acme/plugin-tag/release_v0.1.4");
+    std::fs::create_dir_all(sha_root.join(".cursor-plugin")).unwrap();
+    std::fs::create_dir_all(tag_root.join("skills/demo")).unwrap();
+    std::fs::create_dir_all(tag_root.join(".cursor-plugin")).unwrap();
+    std::fs::write(
+        sha_root.join(".cursor-plugin/plugin.json"),
+        r#"{"name":"sha-plugin","description":"from sha"}"#,
+    )
+    .unwrap();
+    std::fs::write(sha_root.join("mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(
+        tag_root.join(".cursor-plugin/plugin.json"),
+        r#"{"name":"tag-plugin","description":"from tag"}"#,
+    )
+    .unwrap();
+    let manifest = serde_json::json!({
+        "plugins": [
+            {
+                "name": "sha-plugin",
+                "marketplaceSlug": "acme",
+                "pluginId": "plugin-sha",
+                "resolvedCommitSha": "abc123",
+                "declaredCapabilityPaths": { "skill": ["skills/demo"], "command": ["commands/go.md"] }
+            },
+            {
+                "name": "tag-plugin",
+                "marketplaceSlug": "acme",
+                "pluginId": "plugin-tag",
+                "releaseTag": "v0.1.4",
+                "declaredCapabilityPaths": { "skill": ["skills/demo"], "subagent": ["agents/helper.md"] }
+            },
+            { "name": "../escape", "marketplaceSlug": "acme", "pluginId": "nope" }
+        ]
+    });
+    std::fs::create_dir_all(config_dir.path().join("plugins/cache")).unwrap();
+    std::fs::write(
+        config_dir
+            .path()
+            .join("plugins/cache/.cloud-plugin-manifest.json"),
+        serde_json::to_string(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    let installed = cursor_installed_plugins(config_dir.path());
+    let sha = installed
+        .iter()
+        .find(|plugin| plugin.name == "sha-plugin")
+        .expect("sha plugin");
+    assert_eq!(sha.root, sha_root);
+    assert_eq!(sha.marketplace.as_deref(), Some("acme"));
+    assert_eq!(sha.description.as_deref(), Some("from sha"));
+    assert_eq!(sha.skill_count, 1);
+    assert_eq!(sha.command_count, 1);
+    assert!(sha.has_mcp);
+    let tag = installed
+        .iter()
+        .find(|plugin| plugin.name == "tag-plugin")
+        .expect("tag plugin");
+    assert_eq!(tag.root, tag_root);
+    assert!(tag.has_agents);
+    assert!(
+        !installed
+            .iter()
+            .any(|plugin| plugin.name.contains("escape"))
+    );
+
+    let local = config_dir.path().join("plugins/local/desk");
+    std::fs::create_dir_all(&local).unwrap();
+    let locals = cursor_local_plugin_dirs(config_dir.path());
+    assert_eq!(locals, vec![local]);
+
+    let files = cursor_mcp_files(config_dir.path(), Some(config_dir.path()));
+    assert!(files.iter().any(|file| matches!(
+        &file.source,
+        McpServerSource::Plugin { plugin_name, .. } if plugin_name == "sha-plugin"
+    )));
+}
+
+#[test]
+fn cursor_installed_plugins_missing_manifest_is_empty() {
+    let config_dir = tempfile::tempdir().unwrap();
+    assert!(cursor_installed_plugins(config_dir.path()).is_empty());
+    std::fs::create_dir_all(config_dir.path().join("plugins/cache")).unwrap();
+    std::fs::write(
+        config_dir
+            .path()
+            .join("plugins/cache/.cloud-plugin-manifest.json"),
+        "not json",
+    )
+    .unwrap();
+    assert!(cursor_installed_plugins(config_dir.path()).is_empty());
 }

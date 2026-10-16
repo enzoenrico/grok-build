@@ -2,7 +2,7 @@
 //! A server with `enabled = false` still hides its name from later sources.
 //! Plugins come after those toml files.
 //! `~/.claude.json` comes after plugins.
-//! Cursor project `mcp.json` comes before the Cursor user file.
+//! Cursor project `mcp.json` (nearest directory first, up to `.git`) comes before the Cursor user file and Cursor plugin `mcp.json`.
 //! Project `.mcp.json` files come last.
 //! The caller applies folder trust and the managed MCP policy.
 
@@ -32,10 +32,14 @@ pub use config_toml::{
     parse_mcp_servers_from_toml,
 };
 pub use json_config::{
-    load_claude_json_mcp_servers_as_configs, load_claude_json_mcp_servers_as_configs_unfiltered,
-    load_cursor_mcp_servers_as_configs, load_mcp_json_file, load_mcp_json_servers,
-    load_mcp_json_servers_as_configs, load_mcp_json_servers_as_configs_unfiltered,
-    mcp_config_from_json_value, parse_mcp_config_with_oauth, read_mcp_json,
+    CursorInstalledPlugin, CursorMcpListing, cursor_installed_plugins, cursor_local_plugin_dirs,
+    cursor_mcp_connection_status, cursor_mcp_connection_statuses, cursor_user_config_dir,
+    list_cursor_mcp_for_display, load_claude_json_mcp_servers_as_configs,
+    load_claude_json_mcp_servers_as_configs_unfiltered, load_cursor_mcp_servers_as_configs,
+    load_mcp_json_file, load_mcp_json_servers, load_mcp_json_servers_as_configs,
+    load_mcp_json_servers_as_configs_unfiltered, mcp_config_from_json_value,
+    parse_mcp_config_with_oauth, read_mcp_json, set_cursor_mcp_disabled_at,
+    set_cursor_mcp_server_disabled,
 };
 pub use preferences::{
     McpPreferencesLoad, load_mcp_preferences, load_mcp_preferences_from, mcp_preferences_path,
@@ -191,12 +195,9 @@ impl McpServerOrigin {
             McpServerSource::ClaudeUser { path } | McpServerSource::ClaudeProject { path } => {
                 McpServerOrigin::ClaudeJson { path }
             }
-            McpServerSource::CursorUser { path } => McpServerOrigin::McpJson { path },
-            McpServerSource::CursorProject { .. } => McpServerOrigin::McpJson {
-                path: xai_dirs::home_dir()
-                    .map(|home| home.join(".cursor").join("mcp.json"))
-                    .unwrap_or_default(),
-            },
+            McpServerSource::CursorUser { path } | McpServerSource::CursorProject { path } => {
+                McpServerOrigin::McpJson { path }
+            }
             McpServerSource::McpJson { .. } => McpServerOrigin::McpJson {
                 path: cwd.join(".mcp.json"),
             },

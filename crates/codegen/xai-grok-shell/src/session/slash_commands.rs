@@ -493,6 +493,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "m",
     "marketplace",
     "max-mode",
+    "mcp",
     "mcps",
     "mem",
     "memory",

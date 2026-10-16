@@ -1287,23 +1287,16 @@ fn welcome_and_modal_foreign_picks_always_target_fresh_sessions() {
     );
     let effects = dispatch(Action::PickSession(0), &mut modal);
     assert!(
-        effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::CreateSession { .. }))
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::MaterializeCursorSession { session_id, .. } if session_id == "cursor-native"
+        ))
     );
     assert!(
         modal
             .agents
             .get(&AgentId(0))
             .is_some_and(|a| a.session.pending_prompts.is_empty())
-    );
-    assert_eq!(
-        modal
-            .agents
-            .get(&AgentId(1))
-            .and_then(|a| a.session.pending_prompts.front())
-            .map(|prompt| prompt.text.as_str()),
-        Some("/resume-cursor cursor-native")
     );
 }
 

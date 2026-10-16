@@ -42,6 +42,8 @@ pub enum PluginOrigin {
     UserGrok,
     /// `~/.claude/plugins/`.
     UserClaude,
+    /// Project `.cursor/plugins/`.
+    ProjectCursor,
     /// `~/.cursor/plugins/local/`.
     UserCursor,
     /// A plugin installed from a Cursor marketplace.
@@ -776,6 +778,7 @@ mod tests {
             PluginOrigin::ProjectClaude,
             PluginOrigin::UserGrok,
             PluginOrigin::UserClaude,
+            PluginOrigin::ProjectCursor,
             PluginOrigin::UserCursor,
             PluginOrigin::CursorInstalled {
                 marketplace: "cursor-public".into(),

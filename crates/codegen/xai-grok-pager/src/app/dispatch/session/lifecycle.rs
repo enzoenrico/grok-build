@@ -1131,14 +1131,26 @@ pub(in crate::app::dispatch) fn drain_startup_actions(app: &mut AppView) -> Vec<
             }
         }
         Some(DeferredSessionStartup::ForeignResume { tool, native_id }) => {
-            effects.extend(dispatch_new_session_inner(app, None));
-            effects.extend(dispatch(
-                Action::SendPrompt(
-                    crate::app::foreign_sessions::ForeignPickerSource::from_tool(tool)
-                        .resume_prompt(&native_id),
-                ),
-                app,
-            ));
+            let importable = tool == xai_grok_foreign_sessions::ForeignSessionTool::Cursor
+                || (!app.backend.is_cursor() && uuid::Uuid::try_parse(&native_id).is_ok());
+            if importable {
+                effects.extend(super::load::materialize_foreign_now(
+                    app,
+                    tool,
+                    native_id,
+                    app.cwd.to_string_lossy().into_owned(),
+                    String::new(),
+                ));
+            } else {
+                effects.extend(dispatch_new_session_inner(app, None));
+                effects.extend(dispatch(
+                    Action::SendPrompt(
+                        crate::app::foreign_sessions::ForeignPickerSource::from_tool(tool)
+                            .resume_prompt(&native_id),
+                    ),
+                    app,
+                ));
+            }
         }
         None => {
             if pending_chat {

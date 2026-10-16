@@ -148,6 +148,27 @@ const DEFAULT_CURSOR_AGENT_BIN: &str = "cursor-agent";
 const AGENT_BIN_FALLBACK: &str = "agent";
 const CHILD_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Binary `grok mcp login` and the Cursor ACP backend share: `GROK_CURSOR_AGENT_BIN`, else
+/// `cursor-agent` when it is on `PATH`, else `agent`.
+pub(crate) fn cursor_cli_program() -> PathBuf {
+    if let Some(configured) = std::env::var_os(CURSOR_AGENT_BIN_ENV) {
+        let path = PathBuf::from(&configured);
+        if !path.as_os_str().is_empty() {
+            return resolve_cursor_program(&path);
+        }
+    }
+    resolve_cursor_program(std::path::Path::new(DEFAULT_CURSOR_AGENT_BIN))
+}
+
+pub(crate) fn cursor_cli_installed(program: &std::path::Path) -> bool {
+    if program.components().nth(1).is_some() {
+        return program.is_file();
+    }
+    program
+        .to_str()
+        .is_some_and(|name| !name.is_empty() && bin_on_path(name))
+}
+
 fn resolve_cursor_program(configured: &std::path::Path) -> std::path::PathBuf {
     if configured.components().nth(1).is_some() {
         return configured.to_path_buf();

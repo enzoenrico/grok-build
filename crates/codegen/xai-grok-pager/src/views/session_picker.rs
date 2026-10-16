@@ -192,10 +192,10 @@ pub(crate) fn loading_spinner_active(
         })
 }
 /// Filter session entries by native, headless, remote, or external source. Default is
-/// [`Self::Grok`]: native Grok sessions only (local / remote / conversation).
+/// [`Self::Grok`]: native Grok sessions plus Cursor sessions from this workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SourceFilter {
-    /// Native Grok sessions only; excludes Claude/Codex/Cursor foreign rows.
+    /// Native Grok sessions and Cursor sessions. Claude and Codex stay on External.
     #[default]
     Grok,
     /// `grok -p` one-shots only (`session_kind == "headless"`).
@@ -247,12 +247,13 @@ impl SourceFilter {
         }
     }
     /// Returns `true` if a session with the given `source` string and `session_kind` passes the filter.
-    /// Foreign sources (`claude` / `codex` / `cursor`) only pass `External` and `All`. Headless rows
-    /// pass only `Headless`; every other page excludes them, mirroring the server-side fetch policy.
+    /// The default Grok page includes Claude, Codex, and Cursor rows beside this workspace's own
+    /// sessions. Headless rows pass only `Headless`; every other page excludes them, mirroring the
+    /// server-side fetch policy.
     pub fn matches(self, source: &str, session_kind: Option<&str>) -> bool {
         let is_headless = session_kind == Some("headless");
         match self {
-            Self::Grok => !crate::app::is_foreign_picker_source(source) && !is_headless,
+            Self::Grok => !is_headless,
             Self::Headless => is_headless && !crate::app::is_foreign_picker_source(source),
             Self::Local => {
                 (source == "local" || source == "both" || crate::app::is_daemon_session_row(source))
@@ -1313,9 +1314,9 @@ mod tests {
         assert!(SourceFilter::Grok.matches("remote", None));
         assert!(SourceFilter::Grok.matches("both", None));
         assert!(SourceFilter::Grok.matches("conversation", None));
-        assert!(!SourceFilter::Grok.matches("claude", None));
-        assert!(!SourceFilter::Grok.matches("codex", None));
-        assert!(!SourceFilter::Grok.matches("cursor", None));
+        assert!(SourceFilter::Grok.matches("claude", None));
+        assert!(SourceFilter::Grok.matches("codex", None));
+        assert!(SourceFilter::Grok.matches("cursor", None));
         assert!(SourceFilter::All.matches("local", None));
         assert!(SourceFilter::All.matches("remote", None));
         assert!(SourceFilter::All.matches("both", None));
@@ -1371,7 +1372,7 @@ mod tests {
             slot.session_kind = Some("headless".into());
         }
         let grok = filter_session_entries(Some(&entries), "", SourceFilter::Grok);
-        assert_eq!(grok, vec![0, 1, 2]);
+        assert_eq!(grok, vec![0, 1, 2, 3, 4, 5]);
         let headless = filter_session_entries(Some(&entries), "", SourceFilter::Headless);
         assert_eq!(headless, vec![6]);
         let all = filter_session_entries(Some(&entries), "", SourceFilter::All);

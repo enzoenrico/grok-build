@@ -79,6 +79,7 @@ fn origin_to_dto(origin: &xai_grok_agent::plugins::PluginOrigin) -> PluginOrigin
         AgentOrigin::ProjectClaude => PluginOrigin::ProjectClaude,
         AgentOrigin::UserGrok => PluginOrigin::UserGrok,
         AgentOrigin::UserClaude => PluginOrigin::UserClaude,
+        AgentOrigin::ProjectCursor => PluginOrigin::ProjectCursor,
         AgentOrigin::UserCursor => PluginOrigin::UserCursor,
         AgentOrigin::CursorInstalled { marketplace } => PluginOrigin::CursorInstalled {
             marketplace: marketplace.clone(),

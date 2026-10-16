@@ -368,6 +368,9 @@ pub fn plugin_group(plugin: &xai_hooks_plugins_types::PluginInfo) -> PluginGroup
         Some(PluginOrigin::ProjectClaude) => {
             PluginGroup::new(1, "origin:project-claude", "Project (Claude)")
         }
+        Some(PluginOrigin::ProjectCursor) => {
+            PluginGroup::new(1, "origin:project-cursor", "Project (Cursor)")
+        }
         Some(PluginOrigin::UserGrok) => PluginGroup::new(2, "origin:user", "User"),
         Some(PluginOrigin::UserClaude)
         | Some(PluginOrigin::ClaudeInstalled { marketplace: None }) => {
@@ -7087,6 +7090,12 @@ mod tests {
                 1,
                 "origin:project-claude",
                 "Project (Claude)",
+            ),
+            (
+                PluginOrigin::ProjectCursor,
+                1,
+                "origin:project-cursor",
+                "Project (Cursor)",
             ),
             (PluginOrigin::UserGrok, 2, "origin:user", "User"),
             (

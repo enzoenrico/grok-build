@@ -1465,6 +1465,15 @@ pub enum Effect {
         /// Conversation-entry bit (`source == "conversation"`), not sticky `--chat`.
         chat_kind: bool,
     },
+    /// Copy a foreign transcript into a grok session, or hand a Cursor CLI id to `session/load`.
+    MaterializeCursorSession {
+        session_id: String,
+        cwd: String,
+        title: String,
+        tool: xai_grok_foreign_sessions::ForeignSessionTool,
+        /// When set, a Cursor CLI transcript loads natively instead of being copied.
+        cursor_backend: bool,
+    },
     /// Scan enabled foreign session stores without delaying the native list.
     ScanForeignSessions {
         cwd: std::path::PathBuf,
@@ -2501,6 +2510,16 @@ pub enum TaskResult {
         /// `Some` marks the sessions as server-side search results, so the local fuzzy re-filter doesn't hide content-only hits.
         /// Zero hits are then a normal outcome rather than an empty-directory error.
         query: Option<String>,
+    },
+    /// Foreign transcript import finished.
+    /// `native_load` asks for `session/load` without copying. `fallback_prompt` is `/resume-claude`
+    /// or `/resume-codex` when there was no transcript to import. `error` is a toast.
+    CursorSessionMaterialized {
+        session_id: String,
+        cwd: String,
+        error: Option<String>,
+        native_load: bool,
+        fallback_prompt: Option<String>,
     },
     /// A background foreign-session scan completed.
     ForeignSessionsScanned {

@@ -72,7 +72,7 @@ impl HooksMap {
             serde_json::from_value(value).map_err(|e| format!("invalid hooks structure: {e}"))?;
         Self::assemble(
             entries,
-            |v| serde_json::from_value(v).map_err(|e| e.to_string()),
+            |v| serde_json::from_value(normalize_cursor_hook_event(v)).map_err(|e| e.to_string()),
             GroupErrorPolicy::Fail,
         )
     }
@@ -87,6 +87,68 @@ impl HooksMap {
             |v| v.try_into().map_err(|e: toml::de::Error| e.to_string()),
             GroupErrorPolicy::SkipEvent,
         )
+    }
+}
+
+/// Cursor writes each hook as `{ "command", "matcher" }` inside the event array.
+/// Grok's parser wants matcher groups `{ "matcher", "hooks": [{ "type", "command" }] }`.
+/// Arrays that already use the group shape are left alone. `"*"` and `""` match every call.
+fn normalize_cursor_hook_event(value: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(items) = value else {
+        return value;
+    };
+    if items.iter().any(|item| item.get("hooks").is_some()) {
+        return serde_json::Value::Array(items);
+    }
+    let groups = items
+        .into_iter()
+        .map(|item| {
+            let Some(object) = item.as_object() else {
+                return item;
+            };
+            if object.get("command").is_none() && object.get("url").is_none() {
+                return item;
+            }
+            let mut handler = serde_json::Map::new();
+            handler.insert(
+                "type".to_string(),
+                object
+                    .get("type")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::String("command".to_string())),
+            );
+            if let Some(command) = object.get("command") {
+                handler.insert("command".to_string(), command.clone());
+            }
+            if let Some(url) = object.get("url") {
+                handler.insert("url".to_string(), url.clone());
+            }
+            if let Some(timeout) = object.get("timeout") {
+                handler.insert("timeout".to_string(), timeout.clone());
+            }
+            if let Some(env) = object.get("env") {
+                handler.insert("env".to_string(), env.clone());
+            }
+            let mut group = serde_json::Map::new();
+            if let Some(matcher) = object.get("matcher").and_then(cursor_hook_matcher) {
+                group.insert("matcher".to_string(), matcher);
+            }
+            group.insert(
+                "hooks".to_string(),
+                serde_json::Value::Array(vec![serde_json::Value::Object(handler)]),
+            );
+            serde_json::Value::Object(group)
+        })
+        .collect();
+    serde_json::Value::Array(groups)
+}
+
+fn cursor_hook_matcher(value: &serde_json::Value) -> Option<serde_json::Value> {
+    let matcher = value.as_str()?.trim();
+    if matcher.is_empty() || matcher == "*" {
+        None
+    } else {
+        Some(serde_json::Value::String(matcher.to_string()))
     }
 }
 
@@ -1460,6 +1522,38 @@ mod tests {
         let has_post = specs.iter().any(|s| s.event == HookEventName::PostToolUse);
         assert!(has_pre, "expected PreToolUse hook");
         assert!(has_post, "expected PostToolUse hook");
+    }
+
+    #[test]
+    fn parse_hook_file_accepts_flat_cursor_hooks() {
+        let json = r#"{
+            "version": 1,
+            "hooks": {
+                "sessionStart": [{ "command": "./session-init.sh" }],
+                "preToolUse": [{ "command": "./hooks/validate-tool.sh", "matcher": "Shell|Read|Write" }],
+                "beforeSubmitPrompt": [{ "command": "./all.sh", "matcher": "*" }]
+            }
+        }"#;
+        let (specs, errors) = parse_hook_file(json, Path::new("/tmp/hooks.json"));
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let session = specs
+            .iter()
+            .find(|spec| spec.event == HookEventName::SessionStart)
+            .expect("sessionStart");
+        assert_eq!(session.command_raw.as_deref(), Some("./session-init.sh"));
+        assert!(session.configured_matcher.is_none());
+        let pre = specs
+            .iter()
+            .find(|spec| spec.command_raw.as_deref() == Some("./hooks/validate-tool.sh"))
+            .expect("preToolUse");
+        assert_eq!(pre.event, HookEventName::PreToolUse);
+        assert_eq!(pre.configured_matcher.as_deref(), Some("Shell|Read|Write"));
+        let all = specs
+            .iter()
+            .find(|spec| spec.command_raw.as_deref() == Some("./all.sh"))
+            .expect("star matcher");
+        assert_eq!(all.event, HookEventName::UserPromptSubmit);
+        assert!(all.configured_matcher.is_none());
     }
 
     #[test]

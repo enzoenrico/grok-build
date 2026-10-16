@@ -6,6 +6,7 @@ pub struct McpsCommand;
 impl SlashCommand for McpsCommand {
     slash_meta! {
         name: "mcps",
+        aliases: ["mcp"],
         description: "Show MCP server status",
         usage: "/mcps",
     }
