@@ -6,6 +6,7 @@
 //! one line at a time so neither side needs to know about the other.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
 use xai_grok_shell::sampling::types::{
@@ -18,6 +19,7 @@ use xai_grok_shell::sampling::types::{
     parse_reasoning_effort_meta,
 };
 
+use super::catalog::{self, CatalogRequest};
 use super::protocol;
 
 const INTERNAL_ID_PREFIX: &str = "grok-cursor-bridge-";
@@ -41,6 +43,16 @@ pub(crate) enum Routed {
         /// `session/prompt` id to answer when the cloud handoff is done.
         prompt_rpc_id: Option<Value>,
         prompt_id: Option<String>,
+    },
+    /// Answer a skills/hooks/plugins/marketplace/workflows/commands/MCP request off the ACP connection; Cursor's ACP has
+    /// none of them.
+    Catalog(Box<CatalogRequest>),
+    /// Add a prompt the user sent to the session cwd's prompt history (`x.ai/prompt_history`).
+    RecordPrompt {
+        cwd: String,
+        session_id: String,
+        prompt_id: Option<String>,
+        prompt: String,
     },
 }
 
@@ -91,11 +103,26 @@ pub(crate) struct CursorAdapter {
     auth_request_id: Option<String>,
     /// `session/new` and `session/load` lines waiting for that authenticate call.
     held_for_auth: Vec<String>,
+    /// Reads `[skills].disabled`; tests swap in a fixed set.
+    disabled_skills: Option<fn() -> HashSet<String>>,
+    /// `x.ai/session/list` requests forwarded to Cursor as ACP `session/list`, keyed by the internal id.
+    session_lists: HashMap<String, SessionListRequest>,
+    /// The resolved Cursor CLI, for catalog methods answered with `agent` subcommands.
+    cursor_program: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct SessionListRequest {
+    client_id: Value,
+    query: Option<String>,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Default)]
 struct CursorSession {
     skills: HashSet<String>,
+    /// Cursor's latest `availableCommands`, normalized and before disabled skills are hidden.
+    commands: Vec<Value>,
     cloud_agent_id: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
@@ -127,12 +154,22 @@ impl CursorAdapter {
             return vec![Routed::ToAgent(msg.to_string())];
         };
 
+        if let Some(catalog_method) = catalog::catalog_method(&method) {
+            let Some(id) = id else {
+                return Vec::new();
+            };
+            let request = self.catalog_request(id, catalog_method, msg.get("params"));
+            return vec![Routed::Catalog(Box::new(request))];
+        }
+
+        if method.strip_prefix('_').unwrap_or(&method) == "x.ai/session/list" {
+            let Some(id) = id else {
+                return Vec::new();
+            };
+            return self.list_cursor_sessions(id, msg.get("params"));
+        }
+
         if is_grok_extension(&method) {
-            if let Some(id) = id.as_ref()
-                && let Some(result) = cursor_local_extension_result(&method)
-            {
-                return vec![Routed::ToClient(success_response(id, result))];
-            }
             return match id {
                 Some(id) => vec![Routed::ToClient(error_response(
                     &id,
@@ -199,8 +236,7 @@ impl CursorAdapter {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 if let Some(requested) = requested {
-                    if let Some(resolved) =
-                        self.resolve_model_with_meta(&requested, meta.as_ref())
+                    if let Some(resolved) = self.resolve_model_with_meta(&requested, meta.as_ref())
                     {
                         self.preferred_model = Some(resolved.clone());
                         if let Some(session_id) = &session_id {
@@ -244,6 +280,7 @@ impl CursorAdapter {
                     .as_deref()
                     .and_then(|id| self.sessions.get(id))
                     .and_then(|session| session.cloud_agent_id.clone());
+                let record = self.prompt_record(session_id.as_deref(), &msg);
                 let mut cloud_handoff = false;
                 let mut cloud_task = None;
                 if let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) {
@@ -293,7 +330,7 @@ impl CursorAdapter {
                         .get(&session_id)
                         .and_then(|session| session.model.clone())
                         .or_else(|| self.preferred_model.clone());
-                    return vec![Routed::Cloud {
+                    let cloud = Routed::Cloud {
                         session_id: session_id.clone(),
                         request,
                         repo: self.cloud_repo(cloud_agent_id.as_deref(), &session_id),
@@ -301,7 +338,8 @@ impl CursorAdapter {
                         agent_id: cloud_agent_id,
                         prompt_rpc_id: id,
                         prompt_id,
-                    }];
+                    };
+                    return std::iter::once(cloud).chain(record).collect();
                 }
                 let prompt_id = msg
                     .pointer("/params/_meta/promptId")
@@ -322,6 +360,9 @@ impl CursorAdapter {
                         );
                     }
                 }
+                return std::iter::once(Routed::ToAgent(msg.to_string()))
+                    .chain(record)
+                    .collect();
             }
             _ => {}
         }
@@ -379,6 +420,9 @@ impl CursorAdapter {
         if self.auth_request_id.as_ref() == Some(&id_key(&id)) {
             return self.finish_cursor_auth(&msg);
         }
+        if let Some(reply) = self.session_list_reply(&id, Some(&msg)) {
+            return vec![Routed::ToClient(reply)];
+        }
         if id
             .as_str()
             .is_some_and(|s| s.starts_with(INTERNAL_ID_PREFIX))
@@ -419,7 +463,7 @@ impl CursorAdapter {
                     rewrite_modes(result);
                     protocol::absorb_cursor_skills(result);
                     if let Some(session_id) = &session_id {
-                        self.remember_skills(session_id, result.get("availableCommands"));
+                        self.remember_commands(session_id, result.get_mut("availableCommands"));
                     }
                     self.record_models(result);
                     if let Some(session_id) = session_id {
@@ -511,7 +555,7 @@ impl CursorAdapter {
         {
             protocol::normalize_commands(update.get_mut("availableCommands"));
             if let Some(session_id) = session_id {
-                self.remember_skills(&session_id, update.get("availableCommands"));
+                self.remember_commands(&session_id, update.get_mut("availableCommands"));
             }
         }
     }
@@ -549,6 +593,10 @@ impl CursorAdapter {
                 let Some(held_id) = held_msg.get("id") else {
                     continue;
                 };
+                if let Some(reply) = self.session_list_reply(held_id, None) {
+                    out.push(Routed::ToClient(reply));
+                    continue;
+                }
                 self.pending.remove(&id_key(held_id));
                 out.push(Routed::ToClient(error_response(
                     held_id,
@@ -592,6 +640,10 @@ impl CursorAdapter {
             let Some(held_id) = held_msg.get("id") else {
                 continue;
             };
+            if let Some(reply) = self.session_list_reply(held_id, None) {
+                out.push(reply);
+                continue;
+            }
             self.pending.remove(&id_key(held_id));
             out.push(error_response(
                 held_id,
@@ -631,12 +683,203 @@ impl CursorAdapter {
         super::cloud::repo_from_cwd(std::path::Path::new(cwd))
     }
 
-    fn remember_skills(&mut self, session_id: &str, commands: Option<&Value>) {
-        self.sessions
-            .entry(session_id.to_owned())
-            .or_default()
-            .skills
-            .extend(protocol::skill_names(commands));
+    /// Record Cursor's catalog for the session, then hide disabled skills from the copy the pager sees.
+    fn remember_commands(&mut self, session_id: &str, commands: Option<&mut Value>) {
+        let Some(commands) = commands else {
+            return;
+        };
+        let session = self.sessions.entry(session_id.to_owned()).or_default();
+        session.skills.extend(protocol::skill_names(Some(commands)));
+        let Some(list) = commands.as_array() else {
+            return;
+        };
+        session.commands = list.clone();
+        let disabled =
+            self.disabled_skills
+                .unwrap_or(xai_grok_shell::extensions::catalog::disabled_skills)();
+        if !disabled.is_empty() {
+            *commands = Value::Array(catalog::visible_commands(list, &disabled));
+        }
+    }
+
+    /// The prompt-history entry for a `session/prompt`, read before skill hoisting rewrites it: its text blocks,
+    /// trimmed and joined the way the grok session records them.
+    fn prompt_record(&self, session_id: Option<&str>, msg: &Value) -> Option<Routed> {
+        let session_id = session_id?;
+        let cwd = self.sessions.get(session_id)?.cwd.clone()?;
+        let prompt = msg
+            .pointer("/params/prompt")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if prompt.is_empty() {
+            return None;
+        }
+        Some(Routed::RecordPrompt {
+            cwd,
+            session_id: session_id.to_owned(),
+            prompt_id: msg
+                .pointer("/params/_meta/promptId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            prompt,
+        })
+    }
+
+    /// Forward the picker's `x.ai/session/list` as Cursor's ACP `session/list`, which needs an absolute `cwd`.
+    /// Held behind `cursor_login`, since Cursor rejects the list until `authenticate` succeeds.
+    fn list_cursor_sessions(&mut self, client_id: Value, params: Option<&Value>) -> Vec<Routed> {
+        self.next_internal_id += 1;
+        let internal_id = format!("{INTERNAL_ID_PREFIX}session-list-{}", self.next_internal_id);
+        let cwd = params
+            .and_then(|p| p.get("cwd"))
+            .and_then(Value::as_str)
+            .filter(|cwd| std::path::Path::new(cwd).is_absolute());
+        let mut list_params = Map::new();
+        if let Some(cwd) = cwd {
+            list_params.insert("cwd".to_owned(), Value::String(cwd.to_owned()));
+        }
+        self.session_lists.insert(
+            id_key(&Value::String(internal_id.clone())),
+            SessionListRequest {
+                client_id,
+                query: params
+                    .and_then(|p| p.get("query"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|q| !q.is_empty())
+                    .map(str::to_lowercase),
+                limit: params
+                    .and_then(|p| p.get("limit"))
+                    .and_then(Value::as_u64)
+                    .and_then(|limit| usize::try_from(limit).ok()),
+            },
+        );
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": internal_id,
+            "method": "session/list",
+            "params": list_params,
+        })
+        .to_string();
+        if !self.cursor_authenticated {
+            self.held_for_auth.push(line);
+            return self.start_cursor_auth();
+        }
+        vec![Routed::ToAgent(line)]
+    }
+
+    /// The pager's answer to a forwarded session list: Cursor's sessions as picker rows, or none when Cursor
+    /// failed (logged out, for example) so the picker shows an empty list instead of an error.
+    fn session_list_reply(
+        &mut self,
+        internal_id: &Value,
+        response: Option<&Value>,
+    ) -> Option<String> {
+        let request = self.session_lists.remove(&id_key(internal_id))?;
+        if let Some(error) = response.and_then(|r| r.get("error")) {
+            tracing::warn!(%error, "cursor backend: session/list failed");
+        }
+        let sessions: Vec<Value> = response
+            .and_then(|r| r.pointer("/result/sessions"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|session| {
+                let session_id = session.get("sessionId").and_then(Value::as_str)?;
+                let title = session
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or("Cursor chat");
+                if let Some(query) = &request.query
+                    && !title.to_lowercase().contains(query)
+                {
+                    return None;
+                }
+                let mut row = Map::new();
+                row.insert("sessionId".to_owned(), Value::String(session_id.to_owned()));
+                row.insert("summary".to_owned(), Value::String(title.to_owned()));
+                row.insert("source".to_owned(), Value::String("local".to_owned()));
+                for key in ["cwd", "updatedAt"] {
+                    if let Some(value) = session.get(key).filter(|v| v.is_string()) {
+                        row.insert(key.to_owned(), value.clone());
+                    }
+                }
+                Some(Value::Object(row))
+            })
+            .take(request.limit.unwrap_or(usize::MAX))
+            .collect();
+        Some(
+            json!({
+                "jsonrpc": "2.0",
+                "id": request.client_id,
+                "result": { "sessions": sessions },
+            })
+            .to_string(),
+        )
+    }
+
+    /// The catalog request for `method`, resolved against the session it names (or the only session).
+    fn catalog_request(
+        &self,
+        id: Value,
+        method: &'static str,
+        params: Option<&Value>,
+    ) -> CatalogRequest {
+        let params = params.cloned().unwrap_or_else(|| json!({}));
+        let session_id = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|id| self.sessions.contains_key(*id))
+            .map(str::to_owned)
+            .or_else(|| {
+                (self.sessions.len() == 1)
+                    .then(|| self.sessions.keys().next().cloned())
+                    .flatten()
+            });
+        let cwd = session_id
+            .as_deref()
+            .and_then(|id| self.sessions.get(id))
+            .and_then(|session| session.cwd.clone())
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let mut sessions: Vec<(String, Vec<Value>)> = self
+            .sessions
+            .iter()
+            .map(|(id, session)| (id.clone(), session.commands.clone()))
+            .collect();
+        sessions.sort_by(|a, b| a.0.cmp(&b.0));
+        CatalogRequest {
+            id,
+            method,
+            params,
+            cwd,
+            session_id,
+            sessions,
+            cursor_program: self
+                .cursor_program
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(super::DEFAULT_CURSOR_AGENT_BIN)),
+        }
+    }
+
+    pub(crate) fn with_cursor_program(mut self, program: PathBuf) -> Self {
+        self.cursor_program = Some(program);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_disabled_skills(mut self, disabled: fn() -> HashSet<String>) -> Self {
+        self.disabled_skills = Some(disabled);
+        self
     }
 
     fn remember_model(&mut self, session_id: &str, model_id: &str) {
@@ -718,7 +961,11 @@ impl CursorAdapter {
             let Some(obj) = m.as_object_mut() else {
                 continue;
             };
-            let Some(id) = obj.get("modelId").and_then(Value::as_str).map(str::to_owned) else {
+            let Some(id) = obj
+                .get("modelId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
                 continue;
             };
             let Some(spec) = parse_parameterized_model_spec(&id) else {
@@ -780,16 +1027,13 @@ impl CursorAdapter {
                     .or_insert_with(|| Value::Array(effort_objs));
             }
 
-            if spec.fast_mode.is_some()
-                || summary.is_some_and(|s| s.has_fast)
-                || spec.has_brackets
+            if spec.fast_mode.is_some() || summary.is_some_and(|s| s.has_fast) || spec.has_brackets
             {
                 meta.entry(SUPPORTS_FAST_MODE_META_KEY)
                     .or_insert(Value::Bool(true));
             }
             if let Some(fast) = spec.fast_mode {
-                meta.entry(FAST_MODE_META_KEY)
-                    .or_insert(Value::Bool(fast));
+                meta.entry(FAST_MODE_META_KEY).or_insert(Value::Bool(fast));
             }
 
             if spec.max_mode.is_some()
@@ -1054,38 +1298,6 @@ fn is_grok_extension(method: &str) -> bool {
         .starts_with("x.ai/")
 }
 
-/// Session list and MCP list are answered from disk so the picker and `/mcps` modal work
-/// while `cursor-agent` is the ACP backend. Other `x.ai/*` methods stay unsupported.
-fn cursor_local_extension_result(method: &str) -> Option<Value> {
-    match method.strip_prefix('_').unwrap_or(method) {
-        "x.ai/session/list" => Some(json!({ "sessions": [] })),
-        "x.ai/mcp/list" => Some(cursor_mcp_list_result()),
-        _ => None,
-    }
-}
-
-fn cursor_mcp_list_result() -> Value {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let listed = xai_grok_config::mcp_servers::list_cursor_mcp_for_display(&cwd);
-    let statuses = xai_grok_config::mcp_servers::cursor_mcp_connection_statuses(&listed);
-    let servers: Vec<Value> = listed
-        .iter()
-        .zip(statuses)
-        .map(|(server, status)| {
-            json!({
-                "name": server.name,
-                "source": "local",
-                "sourceLabel": server.source_label(),
-                "session": {
-                    "enabled": server.enabled,
-                    "status": status,
-                },
-            })
-        })
-        .collect();
-    json!({ "servers": servers })
-}
-
 fn cloud_request(task: Option<String>) -> CloudRequest {
     let Some(task) = task else {
         return CloudRequest::Refresh;
@@ -1139,15 +1351,6 @@ fn meta_mut(obj: &mut Map<String, Value>) -> &mut Map<String, Value> {
 
 fn id_key(id: &Value) -> String {
     id.to_string()
-}
-
-fn success_response(id: &Value, result: Value) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": result,
-    })
-    .to_string()
 }
 
 fn error_response(id: &Value, code: i64, message: &str) -> String {

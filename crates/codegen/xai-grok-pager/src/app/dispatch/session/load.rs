@@ -1427,16 +1427,14 @@ pub(in crate::app::dispatch) fn handle_session_loaded(
             silent: true,
             nonce: Default::default(),
         });
-        if let Some(effect) =
-            crate::app::dispatch::session::lifecycle::build_deferred_switch_effect(
-                agent,
-                agent_id,
-                hydrate_sid.clone(),
-                deferred,
-                app.cli_context_window_token.as_deref(),
-                app.cli_fast_mode,
-            )
-        {
+        if let Some(effect) = crate::app::dispatch::session::lifecycle::build_deferred_switch_effect(
+            agent,
+            agent_id,
+            hydrate_sid.clone(),
+            deferred,
+            app.cli_context_window_token.as_deref(),
+            app.cli_fast_mode,
+        ) {
             effects.push(effect);
         }
         if std::mem::take(&mut agent.pending_extensions_fetch)

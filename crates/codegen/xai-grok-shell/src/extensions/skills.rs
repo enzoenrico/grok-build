@@ -157,19 +157,32 @@ async fn reload_skills(
     cwd: &str,
     plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
     compat: CompatConfig,
+    extra: &[SkillInfo],
 ) -> Vec<SkillInfo> {
     let config = cli_config::load_config().await.skills;
     let project_trusted =
         crate::agent::folder_trust::project_scope_allowed(std::path::Path::new(cwd));
     let discovery =
         list_skills_with_plugins(Some(cwd), &config, plugin_registry, compat, project_trusted);
-    match tokio::time::timeout(std::time::Duration::from_secs(5), discovery).await {
+    let mut skills = match tokio::time::timeout(std::time::Duration::from_secs(5), discovery).await
+    {
         Ok(skills) => skills,
         Err(_) => {
             tracing::warn!("Skills reload timed out");
             vec![]
         }
+    };
+    let mut known: std::collections::HashSet<String> =
+        skills.iter().map(|skill| skill.name.clone()).collect();
+    for skill in extra {
+        if known.insert(skill.name.clone()) {
+            skills.push(SkillInfo {
+                enabled: !config.disabled.contains(&skill.name),
+                ..skill.clone()
+            });
+        }
     }
+    skills
 }
 
 /// Count how many skills have paths starting with the given prefix.
@@ -363,6 +376,46 @@ pub async fn handle(
     compat: CompatConfig,
 ) -> ExtResult {
     match args.method.as_ref() {
+        SKILLS_LIST_METHOD => {
+            let listed = handle_for_cwd(args, plugin_registry, compat, &[]).await;
+            // Sessions otherwise learn about disk changes only from inotify,
+            // which misses writes made through another NFS client.
+            agent.refresh_skill_baseline_for_all_sessions();
+            listed
+        }
+
+        "x.ai/workflows/list" => {
+            let req: WorkflowsListRequest = serde_json::from_str(args.params.get())?;
+            let Some(handle) = agent.session_handle_waiting_for_load(&req.session_id).await else {
+                return super::to_ext_response(Err::<serde_json::Value, _>(anyhow::anyhow!(
+                    "unknown session id: {}",
+                    req.session_id.0
+                )));
+            };
+            let (launches_enabled, _management_available) = handle.workflow_catalog_state().await;
+            let workflows = if launches_enabled {
+                crate::session::workflow::registry::list_workflows(Some(
+                    handle.tool_context.cwd.as_path(),
+                ))
+            } else {
+                Vec::new()
+            };
+            super::to_ext_response(Ok(serde_json::json!({ "workflows": workflows })))
+        }
+
+        _ => handle_for_cwd(args, plugin_registry, compat, &[]).await,
+    }
+}
+
+/// The `x.ai/skills/*` methods that read and write config for the request's `cwd` and need no session.
+/// `extra` are skills the backing agent advertises itself; they are listed and toggled alongside the discovered ones.
+pub(crate) async fn handle_for_cwd(
+    args: &acp::ExtRequest,
+    plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
+    compat: CompatConfig,
+    extra: &[SkillInfo],
+) -> ExtResult {
+    match args.method.as_ref() {
         "x.ai/skills/add" => {
             let req: SkillsAddRequest = serde_json::from_str(args.params.get())?;
             let cwd = req.cwd.as_deref().unwrap_or(".");
@@ -395,7 +448,7 @@ pub async fn handle(
                 )));
             }
 
-            let skills = reload_skills(cwd, plugin_registry, compat).await;
+            let skills = reload_skills(cwd, plugin_registry, compat, extra).await;
             let added_count = skills
                 .iter()
                 .filter(|s| s.path.starts_with(&resolved))
@@ -447,7 +500,7 @@ pub async fn handle(
                 )));
             }
 
-            let skills = reload_skills(cwd, plugin_registry, compat).await;
+            let skills = reload_skills(cwd, plugin_registry, compat, extra).await;
             let total = skills.len();
             let message = format!(
                 "Removed path {}. {} skill{} remaining.",
@@ -482,7 +535,7 @@ pub async fn handle(
                 )));
             }
 
-            let skills = reload_skills(cwd, plugin_registry, compat).await;
+            let skills = reload_skills(cwd, plugin_registry, compat, extra).await;
             let message = "Custom skills config reset".to_string();
 
             super::to_ext_response(Ok(SkillsResetResponse { skills, message }))
@@ -490,30 +543,8 @@ pub async fn handle(
 
         SKILLS_LIST_METHOD => {
             let req: SkillsListRequest = serde_json::from_str(args.params.get())?;
-            let skills = reload_skills(&req.cwd, plugin_registry, compat).await;
-            // Sessions otherwise learn about disk changes only from inotify,
-            // which misses writes made through another NFS client.
-            agent.refresh_skill_baseline_for_all_sessions();
+            let skills = reload_skills(&req.cwd, plugin_registry, compat, extra).await;
             super::to_ext_response(Ok(SkillsListResponse::from(skills)))
-        }
-
-        "x.ai/workflows/list" => {
-            let req: WorkflowsListRequest = serde_json::from_str(args.params.get())?;
-            let Some(handle) = agent.session_handle_waiting_for_load(&req.session_id).await else {
-                return super::to_ext_response(Err::<serde_json::Value, _>(anyhow::anyhow!(
-                    "unknown session id: {}",
-                    req.session_id.0
-                )));
-            };
-            let (launches_enabled, _management_available) = handle.workflow_catalog_state().await;
-            let workflows = if launches_enabled {
-                crate::session::workflow::registry::list_workflows(Some(
-                    handle.tool_context.cwd.as_path(),
-                ))
-            } else {
-                Vec::new()
-            };
-            super::to_ext_response(Ok(serde_json::json!({ "workflows": workflows })))
         }
 
         "x.ai/skills/config" => {
@@ -525,7 +556,7 @@ pub async fn handle(
             let paths = config.paths.clone();
             let ignore = config.ignore.clone();
 
-            let skills = reload_skills(cwd, plugin_registry, compat).await;
+            let skills = reload_skills(cwd, plugin_registry, compat, extra).await;
             let total_skills = skills.len();
 
             let auto_sources = discover_auto_sources(cwd, &skills);
@@ -584,7 +615,7 @@ pub async fn handle(
             let cwd = req.cwd.as_deref().unwrap_or(".");
 
             // Validate the skill name exists before modifying config.
-            let current_skills = reload_skills(cwd, plugin_registry, compat).await;
+            let current_skills = reload_skills(cwd, plugin_registry, compat, extra).await;
             if !current_skills.iter().any(|s| s.name == req.name) {
                 return super::to_ext_response(Err::<SkillsListResponse, _>(anyhow::anyhow!(
                     "Skill '{}' not found",

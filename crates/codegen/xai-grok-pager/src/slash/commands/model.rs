@@ -1031,7 +1031,10 @@ mod tests {
         state.available.insert(id, info);
         let mut ctx = dummy_exec_ctx(&state);
 
-        match ModelCommand.run(&mut ctx, "grok-4.7[context=500k,effort=high,fast=false,maxMode=true]") {
+        match ModelCommand.run(
+            &mut ctx,
+            "grok-4.7[context=500k,effort=high,fast=false,maxMode=true]",
+        ) {
             CommandResult::Action(Action::SwitchModel(choice)) => {
                 assert_eq!(choice.model_id.0.as_ref(), "grok-4.7");
                 assert_eq!(choice.effort, Some(ReasoningEffort::High));

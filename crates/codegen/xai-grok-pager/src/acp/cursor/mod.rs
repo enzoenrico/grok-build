@@ -4,7 +4,9 @@
 //! `--backend cursor`, `GROK_BACKEND=cursor`, or `[cli] backend = "cursor"` in `config.toml`.
 
 mod adapter;
+mod catalog;
 mod cloud;
+mod mcp;
 pub(crate) mod protocol;
 mod startup;
 
@@ -387,10 +389,10 @@ impl CursorIo {
         let mut stdin = child.stdin.take().context("cursor-agent stdin")?;
         let stdout = child.stdout.take().context("cursor-agent stdout")?;
         let stderr = child.stderr.take().context("cursor-agent stderr")?;
-        let adapter = Arc::new(Mutex::new(CursorAdapter::new(
-            command.default_model.clone(),
-            command.forward_mcp_servers,
-        )));
+        let adapter = Arc::new(Mutex::new(
+            CursorAdapter::new(command.default_model.clone(), command.forward_mcp_servers)
+                .with_cursor_program(resolve_cursor_program(&command.program)),
+        ));
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
 
         let deliver = {
@@ -405,6 +407,24 @@ impl CursorIo {
                         }
                         Routed::ToClient(line) => {
                             let _ = to_client_tx.send(line);
+                        }
+                        Routed::Catalog(request) => {
+                            catalog::spawn(*request, to_client_tx.clone());
+                        }
+                        Routed::RecordPrompt {
+                            cwd,
+                            session_id,
+                            prompt_id,
+                            prompt,
+                        } => {
+                            tokio::task::spawn_blocking(move || {
+                                xai_grok_shell::extensions::catalog::record_prompt(
+                                    &cwd,
+                                    &session_id,
+                                    prompt_id.as_deref(),
+                                    &prompt,
+                                );
+                            });
                         }
                         Routed::Cloud {
                             session_id,

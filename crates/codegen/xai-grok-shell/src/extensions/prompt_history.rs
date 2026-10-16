@@ -46,7 +46,7 @@ pub async fn handle(_agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     }
 }
 
-async fn handle_prompt_history(args: &acp::ExtRequest) -> ExtResult {
+pub(crate) async fn handle_prompt_history(args: &acp::ExtRequest) -> ExtResult {
     let request: PromptHistoryRequest = parse_params(args)?;
 
     // If session_id is specified, use slow path (needed for rewind feature).

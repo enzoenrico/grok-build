@@ -231,13 +231,13 @@ impl ModelState {
         self.reasoning_effort = effort_override
             .or_else(|| parse_reasoning_effort_meta(meta))
             .or_else(|| spec.as_ref().and_then(|s| s.effort));
-        self.fast_mode = parse_fast_mode_meta(meta)
-            .or_else(|| spec.as_ref().and_then(|s| s.fast_mode));
-        self.max_mode = parse_max_mode_meta(meta)
-            .or_else(|| spec.as_ref().and_then(|s| s.max_mode));
+        self.fast_mode =
+            parse_fast_mode_meta(meta).or_else(|| spec.as_ref().and_then(|s| s.fast_mode));
+        self.max_mode =
+            parse_max_mode_meta(meta).or_else(|| spec.as_ref().and_then(|s| s.max_mode));
         let meta_params = parse_model_parameters_meta(meta);
-        self.model_parameters = meta_params
-            .unwrap_or_else(|| spec.map(|s| s.raw_params).unwrap_or_default());
+        self.model_parameters =
+            meta_params.unwrap_or_else(|| spec.map(|s| s.raw_params).unwrap_or_default());
     }
 
     pub fn supports_fast_mode(&self) -> bool {
@@ -412,7 +412,12 @@ impl ModelState {
             return None;
         }
         self.available.iter().find_map(|(id, info)| {
-            let id_base = id.0.as_ref().split('[').next().unwrap_or(id.0.as_ref()).trim();
+            let id_base =
+                id.0.as_ref()
+                    .split('[')
+                    .next()
+                    .unwrap_or(id.0.as_ref())
+                    .trim();
             if info.name.eq_ignore_ascii_case(query) || id_base.eq_ignore_ascii_case(query) {
                 Some(id.clone())
             } else {
@@ -571,7 +576,10 @@ mod tests {
         assert_eq!(Some("Model A (high)".to_owned()), state.footer_label());
 
         state.fast_mode = Some(true);
-        assert_eq!(Some("Model A (high · fast)".to_owned()), state.footer_label());
+        assert_eq!(
+            Some("Model A (high · fast)".to_owned()),
+            state.footer_label()
+        );
 
         state.max_mode = Some(true);
         assert_eq!(

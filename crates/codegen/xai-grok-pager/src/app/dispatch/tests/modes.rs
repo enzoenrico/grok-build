@@ -113,11 +113,13 @@ fn show_word_select_tip_targets_the_takeover_child() {
         .agents
         .get(&root_id)
         .unwrap_or_else(|| panic!("missing root agent"));
-    assert!(!root
-        .subagent_view(child_sid)
-        .unwrap()
-        .ephemeral_tip
-        .is_active());
+    assert!(
+        !root
+            .subagent_view(child_sid)
+            .unwrap()
+            .ephemeral_tip
+            .is_active()
+    );
     crate::appearance::cache::set_keep_text_selection(TextSelection::Flash);
 }
 
