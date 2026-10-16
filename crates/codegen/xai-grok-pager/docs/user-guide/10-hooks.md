@@ -66,6 +66,7 @@ Hooks are discovered from several places (all are merged):
 | Global | `~/.grok/hooks/*.json` | Always | Personal hooks |
 | Global | `~/.claude/settings.json` (and `settings.local.json`) | Always | Claude Code compatibility (configurable) |
 | Global | `~/.cursor/hooks.json` | Always | Cursor compatibility (configurable) |
+| Global | `/etc/cursor/hooks.json` on Linux, `/Library/Application Support/Cursor/hooks.json` on macOS, `C:\ProgramData\Cursor\hooks.json` on Windows | Always | Cursor enterprise hooks (configurable) |
 | Project | `<project>/.grok/hooks/*.json` | Requires trust | Per-repo automation |
 | Project | `<project>/.claude/settings.json` (and `settings.local.json`) | Requires trust | Claude compatibility (configurable) |
 | Project | `<project>/.cursor/hooks.json` | Requires trust | Cursor compatibility (configurable) |
@@ -114,20 +115,33 @@ After a block, prompts already queued behind the blocked one do not auto-run: th
 
 ### Cursor Hook Compatibility
 
-Grok accepts Cursor's camelCase hook event names, so `~/.cursor/hooks.json` loads unchanged:
+Cursor-format `hooks.json` files (`{"version": 1, "hooks": {"<event>": [{"command": ...}]}}`) load unchanged from `~/.cursor/hooks.json`, `<project>/.cursor/hooks.json`, Cursor's enterprise file (`/etc/cursor/hooks.json`, `/Library/Application Support/Cursor/hooks.json`, or `C:\ProgramData\Cursor\hooks.json`; override with `GROK_CURSOR_ENTERPRISE_HOOKS`, empty disables), and Cursor plugins. Grok detects the format and speaks Cursor's hook protocol to them instead of Grok's:
 
-| Cursor event | Maps to |
-|---|---|
-| `sessionStart`, `sessionEnd` | `SessionStart`, `SessionEnd` |
-| `preToolUse`, `postToolUse`, `postToolUseFailure` | `PreToolUse`, `PostToolUse`, `PostToolUseFailure` |
-| `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile` | `PreToolUse` |
-| `afterShellExecution`, `afterMCPExecution`, `afterFileEdit` | `PostToolUse` |
-| `afterAgentResponse`, `afterAgentThought` | `PostToolUse` |
-| `beforeSubmitPrompt` | `UserPromptSubmit` |
-| `subagentStart`, `subagentStop` | `SubagentStart`, `SubagentStop` |
-| `preCompact`, `stop` | `PreCompact`, `Stop` |
+| Cursor event | Runs at | Fires for |
+|---|---|---|
+| `sessionStart`, `sessionEnd` | `SessionStart`, `SessionEnd` | every session |
+| `preToolUse`, `postToolUse`, `postToolUseFailure` | `PreToolUse`, `PostToolUse`, `PostToolUseFailure` | every tool |
+| `beforeShellExecution`, `afterShellExecution` | `PreToolUse`, `PostToolUse` | shell tools only |
+| `beforeMCPExecution`, `afterMCPExecution` | `PreToolUse`, `PostToolUse` | MCP tools only |
+| `beforeReadFile` | `PreToolUse` | file reads only |
+| `afterFileEdit` | `PostToolUse` | file writes and edits only |
+| `beforeSubmitPrompt` | `UserPromptSubmit` | your prompts |
+| `stop`, `afterAgentResponse` | `Stop` | turn end |
+| `subagentStart`, `subagentStop` | `SubagentStart`, `SubagentStop` | subagents |
+| `preCompact` | `PreCompact` | compaction |
 
-Cursor's per-operation hooks (`beforeShellExecution`, `afterFileEdit`, etc.) map to the generic `PreToolUse`/`PostToolUse` events. The hook script receives the tool name in the JSON input and can filter accordingly, or use the `matcher` field.
+What matches Cursor:
+
+- **Input.** The hook's stdin is Cursor's JSON: `conversation_id`, `generation_id`, `hook_event_name`, `cursor_version`, `workspace_roots`, `transcript_path`, plus each event's fields (`command`/`cwd` for shell events, `tool_name`/`tool_input` for MCP events, `file_path`/`content` for `beforeReadFile`, `file_path`/`edits` for `afterFileEdit`, `prompt` for `beforeSubmitPrompt`, `status`/`loop_count` for `stop`, and so on). Tool names use Cursor's vocabulary (`Shell`, `Read`, `Write`, `Grep`, `Task`, `MCP:<tool>`).
+- **Matchers.** `matcher` is a regex tested against Cursor's target for the event: the tool name for `preToolUse`, the command for shell events, the MCP tool name, the subagent type, and so on.
+- **Output.** `permission: "allow" | "deny" | "ask"` with `user_message` / `agent_message`, `updated_input` (`preToolUse`), `continue: false` (`beforeSubmitPrompt`), `followup_message` (`stop`, `subagentStop`), `additional_context` (`postToolUse`), `updated_mcp_tool_output` (`postToolUse` on MCP tools), and `env` (`sessionStart`, passed to later hooks in the session).
+- **Exit codes and failure.** Exit 2 blocks. Other failures fail open unless the entry sets `"failClosed": true`; invalid JSON from a permission hook (`preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile`) denies.
+- **Loop limit.** `stop`/`subagentStop` follow-ups honor `loop_limit` (default 5, `null` for no limit).
+- **Environment and working directory.** Project hooks run from the project root, user hooks from `~/.cursor`, and plugin hooks from the plugin root, with `CURSOR_PROJECT_DIR`, `CURSOR_VERSION`, `CURSOR_TRANSCRIPT_PATH`, and `CLAUDE_PROJECT_DIR` set.
+
+Differences from Cursor: `afterAgentThought`, `beforeTabFileRead`, `afterTabFileEdit`, and `workspaceOpen` are skipped (Grok has no matching moment); `sessionStart` `additional_context` and a `subagentStart` deny are logged but not applied, because those Grok events are observe-only; `afterAgentResponse` runs when the turn ends; `type: "prompt"` hooks are skipped; and fields Grok cannot know (`user_email`, `model`, MCP `url`/`command`) are null or omitted. Claude-format hooks inside Cursor files (`{"hooks": {"PreToolUse": [{"matcher": ..., "hooks": [...]}]}}`) keep Grok's protocol.
+
+`compat.cursor.hooks = false` (or `GROK_CURSOR_HOOKS_ENABLED=false`) turns off every Cursor hook source above, including hooks bundled in Cursor plugins.
 
 ---
 
