@@ -42,6 +42,13 @@ pub enum PluginOrigin {
     UserGrok,
     /// `~/.claude/plugins/`.
     UserClaude,
+    /// `~/.cursor/plugins/local/`.
+    UserCursor,
+    /// A plugin installed from a Cursor marketplace.
+    CursorInstalled {
+        /// Marketplace slug (`cursor-public`, for example).
+        marketplace: String,
+    },
     /// A compat marketplace clone.
     ClaudeMarketplace {
         /// Marketplace name from the settings/registry entry.
@@ -769,6 +776,10 @@ mod tests {
             PluginOrigin::ProjectClaude,
             PluginOrigin::UserGrok,
             PluginOrigin::UserClaude,
+            PluginOrigin::UserCursor,
+            PluginOrigin::CursorInstalled {
+                marketplace: "cursor-public".into(),
+            },
             PluginOrigin::ClaudeMarketplace {
                 marketplace: "mp".into(),
             },

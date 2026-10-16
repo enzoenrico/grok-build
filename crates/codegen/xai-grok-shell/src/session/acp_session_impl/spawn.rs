@@ -1618,9 +1618,10 @@ pub(crate) async fn spawn_session_actor(
             plugin_registry.as_deref(),
         )
     };
-    let built_hook_registry = xai_grok_agent::plugins::hooks_adapter::with_plugin_hooks(
+    let built_hook_registry = xai_grok_agent::plugins::hooks_adapter::with_plugin_hooks_filtered(
         built_hook_registry,
         plugin_hook_source,
+        rebuild_spec.compat.cursor.hooks,
     );
     drop(hooks_discovery);
     let hook_registry_for_handle = built_hook_registry.clone();

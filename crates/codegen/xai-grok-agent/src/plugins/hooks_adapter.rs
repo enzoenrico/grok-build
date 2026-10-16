@@ -115,13 +115,37 @@ pub fn with_plugin_hooks(
     base: Option<Arc<HookRegistry>>,
     source: PluginHookSource<'_>,
 ) -> Option<Arc<HookRegistry>> {
+    with_plugin_hooks_filtered(base, source, true)
+}
+
+/// Like [`with_plugin_hooks`], but drops hooks from Cursor plugins when `include_cursor` is false.
+/// `compat.cursor.hooks = false` uses that so the hooks cell covers plugin hooks as well as `hooks.json`.
+pub fn with_plugin_hooks_filtered(
+    base: Option<Arc<HookRegistry>>,
+    source: PluginHookSource<'_>,
+    include_cursor: bool,
+) -> Option<Arc<HookRegistry>> {
     match source {
         PluginHookSource::Registry(plugins) => replace_plugin_hooks(
             base,
-            plugins.map(active_plugin_hook_specs).unwrap_or_default(),
+            plugins
+                .map(|registry| active_plugin_hook_specs_filtered(registry, include_cursor))
+                .unwrap_or_default(),
         ),
         PluginHookSource::Parent => base,
     }
+}
+
+pub fn active_plugin_hook_specs_filtered(
+    registry: &PluginRegistry,
+    include_cursor: bool,
+) -> Vec<HookSpec> {
+    registry
+        .active_plugins()
+        .into_iter()
+        .filter(|plugin| include_cursor || !plugin.origin.is_cursor())
+        .flat_map(|plugin| plugin.hook_specs.iter().cloned())
+        .collect()
 }
 
 /// Returns `base` with its plugin-layer hooks replaced by `specs`, or `None` when no hook remains.
@@ -153,7 +177,14 @@ fn process_hooks_content(
     plugin_root: &str,
     plugin_data: &str,
 ) -> (Vec<HookSpec>, Vec<String>) {
-    let (filtered_content, skipped_events) = prefilter_unsupported_events(content);
+    // Cursor documents use Cursor's event names and report unknown events from their own parser.
+    let cursor_document = serde_json::from_str::<serde_json::Value>(content)
+        .is_ok_and(|value| xai_grok_hooks::cursor::is_cursor_document(&value));
+    let (filtered_content, skipped_events) = if cursor_document {
+        (content.to_string(), Vec::new())
+    } else {
+        prefilter_unsupported_events(content)
+    };
     let mut warnings: Vec<String> = Vec::new();
 
     for event in &skipped_events {
@@ -172,11 +203,17 @@ fn process_hooks_content(
     let plugin_env: HashMap<String, String> = HashMap::from([
         ("GROK_PLUGIN_ROOT".to_string(), plugin_root.to_string()),
         ("CLAUDE_PLUGIN_ROOT".to_string(), plugin_root.to_string()),
+        ("CURSOR_PLUGIN_ROOT".to_string(), plugin_root.to_string()),
         ("GROK_PLUGIN_DATA".to_string(), plugin_data.to_string()),
         ("CLAUDE_PLUGIN_DATA".to_string(), plugin_data.to_string()),
     ]);
 
     for spec in &mut specs {
+        // Cursor runs plugin hooks from the plugin root, not from the hooks file's directory.
+        if let Some(cursor) = spec.cursor.as_mut() {
+            cursor.working_dir = PathBuf::from(plugin_root);
+            spec.source_dir = PathBuf::from(plugin_root);
+        }
         // Plugin-owned keys always win over user-declared `env`, or a plugin author could repoint the plugin root and break the contract
         for (k, v) in &plugin_env {
             spec.extra_env.insert(k.clone(), v.clone());
@@ -310,6 +347,48 @@ mod tests {
         let json = r#"{"settings": {}}"#;
         let (_, skipped) = prefilter_unsupported_events(json);
         assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn cursor_plugin_hooks_keep_cursor_events_and_run_from_plugin_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("kit");
+        let hooks_file = root.join("hooks").join("hooks.json");
+        std::fs::create_dir_all(hooks_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hooks_file,
+            r#"{"version":1,"hooks":{
+                "beforeShellExecution":[{"command":"${CURSOR_PLUGIN_ROOT}/scripts/guard.sh","matcher":"rm"}],
+                "afterFileEdit":[{"command":"./scripts/fmt.sh"}]
+            }}"#,
+        )
+        .unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+
+        let (specs, warnings) = parse_plugin_hooks(&hooks_file, "kit", &root_str, "/data");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(specs.len(), 2, "{specs:?}");
+        for spec in &specs {
+            let cursor = spec.cursor.as_ref().expect("cursor dialect");
+            assert_eq!(cursor.working_dir, root);
+            assert_eq!(spec.source_dir, root);
+            assert_eq!(
+                spec.extra_env.get("CURSOR_PLUGIN_ROOT").map(String::as_str),
+                Some(root_str.as_str())
+            );
+        }
+        let guard = specs
+            .iter()
+            .find(|s| {
+                s.cursor.as_ref().is_some_and(|c| {
+                    c.event == xai_grok_hooks::cursor::CursorEvent::BeforeShellExecution
+                })
+            })
+            .expect("beforeShellExecution survives the pre-filter");
+        assert_eq!(
+            guard.command.as_deref(),
+            Some(root.join("scripts/guard.sh").as_path())
+        );
     }
 
     #[test]
@@ -685,6 +764,45 @@ mod tests {
         assert_eq!(
             vec![USER_HOOK.to_owned(), PARENT_PLUGIN_HOOK.to_owned()],
             hook_names(merged.as_deref())
+        );
+    }
+
+    #[test]
+    fn cursor_hooks_cell_off_drops_only_cursor_plugin_hooks() {
+        use crate::plugins::PluginScope;
+        use crate::plugins::manifest::PathOrInline;
+
+        let grok = crate::plugins::registry::tests::make_discovered(
+            "parent-plugin",
+            PluginScope::User,
+            true,
+        );
+        let mut cursor = crate::plugins::registry::tests::make_discovered(
+            "other-plugin",
+            PluginScope::User,
+            true,
+        );
+        cursor.origin = crate::plugins::PluginOrigin::UserCursor;
+        let mut plugins = vec![grok, cursor];
+        for plugin in &mut plugins {
+            plugin.manifest.hooks = Some(PathOrInline::Inline(session_start_hooks()));
+        }
+        let plugins = PluginRegistry::from_discovered(
+            plugins,
+            &[],
+            &["parent-plugin".to_owned(), "other-plugin".to_owned()],
+        );
+
+        let with_cursor = with_plugin_hooks_filtered(None, own_registry(&plugins), true);
+        let without_cursor = with_plugin_hooks_filtered(None, own_registry(&plugins), false);
+
+        assert_eq!(
+            vec![OTHER_PLUGIN_HOOK.to_owned(), PARENT_PLUGIN_HOOK.to_owned()],
+            hook_names(with_cursor.as_deref())
+        );
+        assert_eq!(
+            vec![PARENT_PLUGIN_HOOK.to_owned()],
+            hook_names(without_cursor.as_deref())
         );
     }
 

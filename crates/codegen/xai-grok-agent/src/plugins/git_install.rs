@@ -384,7 +384,7 @@ pub fn clone_operands<'a>(
 }
 
 /// Clone a git repo using the `git` CLI (supports shallow clone, SSH, etc.; optionally SHA-pinned via `git_sha`).
-fn clone_repo(
+pub(crate) fn clone_repo(
     url: &str,
     git_ref: Option<&str>,
     git_sha: Option<&str>,
@@ -472,7 +472,10 @@ fn run_git_in(cwd: &Path, args: &[&str]) -> Result<(), String> {
     run_git_in_capture(cwd, args).map(|_| ())
 }
 
-fn run_git_in_capture(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+pub(crate) fn run_git_in_capture(
+    cwd: &Path,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
     // Same auth/LFS/SSH suppression as marketplace cache clones.
     let mut cmd = xai_tty_utils::git_command();
     cmd.args(args).current_dir(cwd);

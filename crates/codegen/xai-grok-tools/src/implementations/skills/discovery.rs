@@ -80,6 +80,11 @@ pub fn find_command_paths(dir: &Path) -> Vec<PathBuf> {
 
 /// Scan a directory for `.md` files (flat, no recursion).
 pub fn scan_md_files(dir: &Path) -> Vec<PathBuf> {
+    scan_files_with_extensions(dir, &["md"])
+}
+
+/// Scan a directory for files with one of `extensions` (flat, no recursion).
+pub fn scan_files_with_extensions(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
     if !dir.is_dir() {
         return vec![];
     }
@@ -87,7 +92,12 @@ pub fn scan_md_files(dir: &Path) -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+            if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| extensions.contains(&e))
+            {
                 paths.push(path);
             }
         }

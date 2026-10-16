@@ -79,6 +79,10 @@ fn origin_to_dto(origin: &xai_grok_agent::plugins::PluginOrigin) -> PluginOrigin
         AgentOrigin::ProjectClaude => PluginOrigin::ProjectClaude,
         AgentOrigin::UserGrok => PluginOrigin::UserGrok,
         AgentOrigin::UserClaude => PluginOrigin::UserClaude,
+        AgentOrigin::UserCursor => PluginOrigin::UserCursor,
+        AgentOrigin::CursorInstalled { marketplace } => PluginOrigin::CursorInstalled {
+            marketplace: marketplace.clone(),
+        },
         AgentOrigin::ClaudeMarketplace { marketplace } => PluginOrigin::ClaudeMarketplace {
             marketplace: marketplace.clone(),
         },
@@ -99,6 +103,7 @@ fn origin_to_dto(origin: &xai_grok_agent::plugins::PluginOrigin) -> PluginOrigin
 /// Derive the legacy `marketplace_source` label kept for older pagers: the marketplace display name, or `git: owner/repo` for a direct git install.
 fn marketplace_source_label(origin: &PluginOrigin) -> Option<String> {
     match origin {
+        PluginOrigin::CursorInstalled { marketplace } => Some(marketplace.clone()),
         PluginOrigin::MarketplaceInstall {
             source_name: Some(name),
             ..
@@ -207,6 +212,8 @@ mod tests {
             skill_dirs: vec![],
             command_dirs: vec![],
             agent_dirs: vec![],
+            rule_dirs: vec![],
+            dialect: Default::default(),
             hooks_path: None,
             mcp_config_path: None,
             lsp_config_path: None,
@@ -274,6 +281,27 @@ mod tests {
                 git_url: None,
             })
         );
+    }
+
+    #[test]
+    fn cursor_origins_map_to_dto() {
+        let installed = loaded_plugin_to_info(&make_loaded_plugin(AgentOrigin::CursorInstalled {
+            marketplace: "cursor-public".to_string(),
+        }));
+        assert_eq!(
+            installed.origin,
+            Some(PluginOrigin::CursorInstalled {
+                marketplace: "cursor-public".to_string(),
+            })
+        );
+        assert_eq!(
+            installed.marketplace_source.as_deref(),
+            Some("cursor-public")
+        );
+
+        let local = loaded_plugin_to_info(&make_loaded_plugin(AgentOrigin::UserCursor));
+        assert_eq!(local.origin, Some(PluginOrigin::UserCursor));
+        assert_eq!(local.marketplace_source, None);
     }
 
     #[test]
