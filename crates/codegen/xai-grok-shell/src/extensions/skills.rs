@@ -363,6 +363,44 @@ pub async fn handle(
     compat: CompatConfig,
 ) -> ExtResult {
     match args.method.as_ref() {
+        SKILLS_LIST_METHOD => {
+            let listed = handle_for_cwd(args, plugin_registry, compat).await;
+            // Sessions otherwise learn about disk changes only from inotify,
+            // which misses writes made through another NFS client.
+            agent.refresh_skill_baseline_for_all_sessions();
+            listed
+        }
+
+        "x.ai/workflows/list" => {
+            let req: WorkflowsListRequest = serde_json::from_str(args.params.get())?;
+            let Some(handle) = agent.session_handle_waiting_for_load(&req.session_id).await else {
+                return super::to_ext_response(Err::<serde_json::Value, _>(anyhow::anyhow!(
+                    "unknown session id: {}",
+                    req.session_id.0
+                )));
+            };
+            let (launches_enabled, _management_available) = handle.workflow_catalog_state().await;
+            let workflows = if launches_enabled {
+                crate::session::workflow::registry::list_workflows(Some(
+                    handle.tool_context.cwd.as_path(),
+                ))
+            } else {
+                Vec::new()
+            };
+            super::to_ext_response(Ok(serde_json::json!({ "workflows": workflows })))
+        }
+
+        _ => handle_for_cwd(args, plugin_registry, compat).await,
+    }
+}
+
+/// The `x.ai/skills/*` methods that read and write config for the request's `cwd` and need no session.
+pub(crate) async fn handle_for_cwd(
+    args: &acp::ExtRequest,
+    plugin_registry: Option<&xai_grok_agent::plugins::PluginRegistry>,
+    compat: CompatConfig,
+) -> ExtResult {
+    match args.method.as_ref() {
         "x.ai/skills/add" => {
             let req: SkillsAddRequest = serde_json::from_str(args.params.get())?;
             let cwd = req.cwd.as_deref().unwrap_or(".");
@@ -491,29 +529,7 @@ pub async fn handle(
         SKILLS_LIST_METHOD => {
             let req: SkillsListRequest = serde_json::from_str(args.params.get())?;
             let skills = reload_skills(&req.cwd, plugin_registry, compat).await;
-            // Sessions otherwise learn about disk changes only from inotify,
-            // which misses writes made through another NFS client.
-            agent.refresh_skill_baseline_for_all_sessions();
             super::to_ext_response(Ok(SkillsListResponse::from(skills)))
-        }
-
-        "x.ai/workflows/list" => {
-            let req: WorkflowsListRequest = serde_json::from_str(args.params.get())?;
-            let Some(handle) = agent.session_handle_waiting_for_load(&req.session_id).await else {
-                return super::to_ext_response(Err::<serde_json::Value, _>(anyhow::anyhow!(
-                    "unknown session id: {}",
-                    req.session_id.0
-                )));
-            };
-            let (launches_enabled, _management_available) = handle.workflow_catalog_state().await;
-            let workflows = if launches_enabled {
-                crate::session::workflow::registry::list_workflows(Some(
-                    handle.tool_context.cwd.as_path(),
-                ))
-            } else {
-                Vec::new()
-            };
-            super::to_ext_response(Ok(serde_json::json!({ "workflows": workflows })))
         }
 
         "x.ai/skills/config" => {

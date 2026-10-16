@@ -19,13 +19,45 @@ fn load_filtered_marketplace_sources() -> Vec<xai_grok_plugin_marketplace::Marke
 
 pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     match args.method.as_ref() {
-        "x.ai/marketplace/list" => handle_list().await,
-        "x.ai/marketplace/action" => handle_action(agent, args).await,
+        "x.ai/marketplace/list" => super::to_ext_response(Ok(list_marketplaces().await)),
+        "x.ai/marketplace/action" => {
+            let req: MarketplaceActionRequest = super::parse_params(args)?;
+            let reloader = SessionReloader {
+                agent,
+                session_id: acp::SessionId::new(req.session_id),
+            };
+            super::to_ext_response(Ok(run_marketplace_action(&reloader, req.action).await))
+        }
         _ => Err(acp::Error::method_not_found()),
     }
 }
 
-async fn handle_list() -> ExtResult {
+/// Reloads plugins after a marketplace install, update, or uninstall changed what is on disk.
+#[async_trait::async_trait(?Send)]
+pub(crate) trait PluginReloader {
+    /// `false` when nothing could be reloaded, so the outcome tells the user to restart.
+    async fn reload_plugins(&self) -> bool;
+}
+
+struct SessionReloader<'a> {
+    agent: &'a MvpAgent,
+    session_id: acp::SessionId,
+}
+
+#[async_trait::async_trait(?Send)]
+impl PluginReloader for SessionReloader<'_> {
+    async fn reload_plugins(&self) -> bool {
+        self.agent
+            .execute_plugins_action(
+                &self.session_id,
+                xai_hooks_plugins_types::PluginsAction::Reload,
+            )
+            .await
+            .is_some()
+    }
+}
+
+pub(crate) async fn list_marketplaces() -> MarketplaceListResponse {
     let t0 = std::time::Instant::now();
     let sources = load_filtered_marketplace_sources();
     let source_names: Vec<String> = sources
@@ -102,15 +134,14 @@ async fn handle_list() -> ExtResult {
         })),
     );
 
-    let response = MarketplaceListResponse { sources: results };
-    super::to_ext_response(Ok(response))
+    MarketplaceListResponse { sources: results }
 }
 
-async fn handle_action(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
-    let req: MarketplaceActionRequest = super::parse_params(args)?;
-    let sid = acp::SessionId::new(req.session_id);
-
-    let outcome = match req.action {
+pub(crate) async fn run_marketplace_action(
+    reloader: &dyn PluginReloader,
+    action: MarketplaceAction,
+) -> xai_hooks_plugins_types::ActionOutcome {
+    match action {
         MarketplaceAction::Refresh { source_url_or_path } => {
             // Force re-sync git caches (local sources are re-scanned on next
             // list) on the blocking pool (LocalSet invariant: plugin/acquire.rs).
@@ -131,22 +162,20 @@ async fn handle_action(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
         MarketplaceAction::Install {
             source_url_or_path,
             plugin_relative_path,
-        } => handle_install(agent, &sid, &source_url_or_path, &plugin_relative_path).await,
+        } => handle_install(reloader, &source_url_or_path, &plugin_relative_path).await,
         MarketplaceAction::Update {
             source_url_or_path,
             plugin_relative_path,
-        } => handle_update(agent, &sid, &source_url_or_path, &plugin_relative_path).await,
+        } => handle_update(reloader, &source_url_or_path, &plugin_relative_path).await,
         MarketplaceAction::Uninstall {
             source_url_or_path,
             plugin_relative_path,
-        } => handle_uninstall(agent, &sid, &source_url_or_path, &plugin_relative_path).await,
+        } => handle_uninstall(reloader, &source_url_or_path, &plugin_relative_path).await,
         MarketplaceAction::AddSource { url } => handle_add_source(&url).await,
         MarketplaceAction::RemoveSource { source_url_or_path } => {
             handle_remove_source(&source_url_or_path).await
         }
-    };
-
-    super::to_ext_response(Ok(outcome))
+    }
 }
 
 fn refresh_sources(
@@ -205,8 +234,7 @@ async fn run_post_install(repo_key: &str) {
 }
 
 async fn handle_update(
-    agent: &MvpAgent,
-    sid: &acp::SessionId,
+    reloader: &dyn PluginReloader,
     source_url_or_path: &str,
     plugin_relative_path: &str,
 ) -> xai_hooks_plugins_types::ActionOutcome {
@@ -230,16 +258,14 @@ async fn handle_update(
     match updated {
         Ok(result) => {
             run_post_install(&result.repo_key).await;
-            let reload_outcome = agent
-                .execute_plugins_action(sid, xai_hooks_plugins_types::PluginsAction::Reload)
-                .await;
+            let reloaded = reloader.reload_plugins().await;
             let mut msg = format!(
                 "Updated {} ({} -> {})",
                 result.repo_key,
                 result.old_version.as_deref().unwrap_or("?"),
                 result.new_version.as_deref().unwrap_or("?")
             );
-            if reload_outcome.is_none() {
+            if !reloaded {
                 msg.push_str("\nRestart or run /plugins reload to activate the update.");
             }
             ActionOutcome {
@@ -303,8 +329,7 @@ fn update_error_outcome(
 }
 
 async fn handle_install(
-    agent: &MvpAgent,
-    sid: &acp::SessionId,
+    reloader: &dyn PluginReloader,
     source_url_or_path: &str,
     plugin_relative_path: &str,
 ) -> xai_hooks_plugins_types::ActionOutcome {
@@ -327,12 +352,10 @@ async fn handle_install(
         }) => {
             // Auto-enable installed plugin so it's active after reload.
             run_post_install(&repo_key).await;
-            let reload_outcome = agent
-                .execute_plugins_action(sid, xai_hooks_plugins_types::PluginsAction::Reload)
-                .await;
+            let reloaded = reloader.reload_plugins().await;
             let mut msg =
                 format!("Installed from {source_name}: {plugin_relative_path} (key: {repo_key})");
-            if reload_outcome.is_none() {
+            if !reloaded {
                 msg.push_str("\nRestart or run /plugins reload to activate the plugin.");
             }
             ActionOutcome {
@@ -410,8 +433,7 @@ fn action_outcome(
 }
 
 async fn handle_uninstall(
-    agent: &MvpAgent,
-    sid: &acp::SessionId,
+    reloader: &dyn PluginReloader,
     source_url_or_path: &str,
     plugin_relative_path: &str,
 ) -> xai_hooks_plugins_types::ActionOutcome {
@@ -436,9 +458,7 @@ async fn handle_uninstall(
     }
 
     // Trigger plugin reload so the removed plugin disappears from the session.
-    let _ = agent
-        .execute_plugins_action(sid, xai_hooks_plugins_types::PluginsAction::Reload)
-        .await;
+    reloader.reload_plugins().await;
 
     outcome
 }

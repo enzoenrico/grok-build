@@ -199,7 +199,7 @@ async fn managed_hooks_only_refuses_enabling_non_managed_hooks() {
                 );
                 assert_eq!(
                     outcome.message,
-                    super::hooks_plugins::MANAGED_HOOKS_ONLY_REFUSAL
+                    crate::extensions::hook_actions::MANAGED_HOOKS_ONLY_REFUSAL
                 );
             }
             guard.assert_unchanged();
