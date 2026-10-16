@@ -2,6 +2,10 @@
 //! Fallback locations (checked in order when the root manifest is absent):
 //! 1. `.grok-plugin/plugin.json`
 //! 2. `.claude-plugin/plugin.json`
+//! 3. `.cursor-plugin/plugin.json`
+//!
+//! Plugins installed by Cursor are read in Cursor's order instead (`.cursor-plugin`, `.claude-plugin`, `plugin.json`), and a
+//! `.cursor-plugin` manifest switches the plugin to Cursor's component defaults (see [`ManifestDialect`]).
 //!
 //! If no manifest is found, the plugin can still function via convention-based discovery (skills/, agents/, .mcp.json, hooks/hooks.json).
 //! The plugin name is then derived from the directory name.
@@ -23,6 +27,43 @@ fn is_valid_plugin_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !name.starts_with('-')
         && !name.ends_with('-')
+}
+
+/// Which plugin format's component defaults apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ManifestDialect {
+    #[default]
+    Grok,
+    /// Cursor's plugin format: `rules/`, `.mdc`/`.markdown`/`.txt` components, `mcp.json` as a second MCP default,
+    /// `hooks` naming a directory, and `skills` entries naming a `SKILL.md`.
+    Cursor,
+}
+
+impl ManifestDialect {
+    /// Extensions accepted for command files; rules and agents take the same set minus `txt`.
+    pub fn command_extensions(self) -> &'static [&'static str] {
+        match self {
+            Self::Grok => &["md"],
+            Self::Cursor => &["md", "mdc", "markdown", "txt"],
+        }
+    }
+}
+
+/// Cursor plugin names may contain periods and upper case; grok namespaces are `[a-z0-9-]`.
+pub fn sanitize_cursor_name(name: &str) -> String {
+    let mapped: String = name
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    mapped.trim_matches('-').to_string()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -149,6 +190,11 @@ pub struct PluginManifest {
     pub mcp_servers: Option<PathOrInline>,
     #[serde(default)]
     pub lsp_servers: Option<PathOrInline>,
+    /// Cursor rule files (`.md`/`.mdc`/`.markdown`); defaults to `rules/` for Cursor plugins.
+    #[serde(default)]
+    pub rules: Option<PathOrPaths>,
+    #[serde(skip)]
+    pub dialect: ManifestDialect,
 }
 
 impl PluginManifest {
@@ -166,7 +212,26 @@ impl PluginManifest {
     }
 
     pub fn skill_dirs(&self, plugin_root: &Path) -> Vec<PathBuf> {
-        resolve_dirs(&self.skills, plugin_root, "skills")
+        let dirs = resolve_dirs(&self.skills, plugin_root, "skills");
+        match self.dialect {
+            ManifestDialect::Grok => dirs,
+            ManifestDialect::Cursor => dirs
+                .into_iter()
+                .map(|dir| match dir.parent() {
+                    Some(parent) if dir.file_name().is_some_and(|n| n == "SKILL.md") => {
+                        parent.to_path_buf()
+                    }
+                    _ => dir,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn rule_dirs(&self, plugin_root: &Path) -> Vec<PathBuf> {
+        match self.dialect {
+            ManifestDialect::Grok => Vec::new(),
+            ManifestDialect::Cursor => resolve_dirs(&self.rules, plugin_root, "rules"),
+        }
     }
 
     pub fn command_dirs(&self, plugin_root: &Path) -> Vec<PathBuf> {
@@ -179,13 +244,26 @@ impl PluginManifest {
 
     /// Returns the manifest-specified path or the default `hooks/hooks.json`.
     pub fn hooks_path(&self, plugin_root: &Path) -> Option<PathBuf> {
+        if self.dialect == ManifestDialect::Cursor
+            && let Some(PathOrInline::Path(p)) = &self.hooks
+            && !p.ends_with(".json")
+        {
+            let dir_hooks = PathOrInline::Path(format!("{}/hooks.json", p.trim_end_matches('/')));
+            return resolve_component_path(&Some(dir_hooks), plugin_root, "", "hooks");
+        }
         resolve_component_path(&self.hooks, plugin_root, "hooks/hooks.json", "hooks")
     }
 
     pub fn mcp_config_path(&self, plugin_root: &Path) -> Option<PathBuf> {
-        if matches!(self.mcp_servers, Some(PathOrInline::Inline(_))) {
-            let default = plugin_root.join(".mcp.json");
-            return default.is_file().then_some(default);
+        let default_files: &[&str] = match self.dialect {
+            ManifestDialect::Grok => &[".mcp.json"],
+            ManifestDialect::Cursor => &[".mcp.json", "mcp.json"],
+        };
+        if self.mcp_servers.is_none() || matches!(self.mcp_servers, Some(PathOrInline::Inline(_))) {
+            return default_files
+                .iter()
+                .map(|name| plugin_root.join(name))
+                .find(|path| path.is_file());
         }
         resolve_component_path(&self.mcp_servers, plugin_root, ".mcp.json", "MCP config")
     }
@@ -262,6 +340,16 @@ const MANIFEST_PATHS: &[&str] = &[
     "plugin.json",
     ".grok-plugin/plugin.json",
     ".claude-plugin/plugin.json",
+    CURSOR_MANIFEST_PATH,
+];
+
+const CURSOR_MANIFEST_PATH: &str = ".cursor-plugin/plugin.json";
+
+/// Cursor's own search order (`resolvePluginManifest` in the Cursor CLI).
+const CURSOR_MANIFEST_PATHS: &[&str] = &[
+    CURSOR_MANIFEST_PATH,
+    ".claude-plugin/plugin.json",
+    "plugin.json",
 ];
 
 #[derive(Debug)]
@@ -273,7 +361,20 @@ pub enum ManifestLoadResult {
 
 /// Tries manifest files in priority order (see [`MANIFEST_PATHS`]).
 pub fn load_manifest(plugin_root: &Path) -> Result<ManifestLoadResult, ManifestError> {
-    for rel_path in MANIFEST_PATHS {
+    load_manifest_for(plugin_root, ManifestDialect::Grok)
+}
+
+/// Loads a manifest in the search order of `dialect`. A `.cursor-plugin` manifest always yields the Cursor dialect, and
+/// Cursor manifests have their name folded to grok's namespace charset before validation.
+pub fn load_manifest_for(
+    plugin_root: &Path,
+    dialect: ManifestDialect,
+) -> Result<ManifestLoadResult, ManifestError> {
+    let paths = match dialect {
+        ManifestDialect::Grok => MANIFEST_PATHS,
+        ManifestDialect::Cursor => CURSOR_MANIFEST_PATHS,
+    };
+    for rel_path in paths {
         let manifest_path = plugin_root.join(rel_path);
         if manifest_path.is_file() {
             let content =
@@ -281,11 +382,15 @@ pub fn load_manifest(plugin_root: &Path) -> Result<ManifestLoadResult, ManifestE
                     path: manifest_path.clone(),
                     source: e,
                 })?;
-            let manifest: PluginManifest =
+            let mut manifest: PluginManifest =
                 serde_json::from_str(&content).map_err(|e| ManifestError::ParseError {
                     path: manifest_path.clone(),
                     message: e.to_string(),
                 })?;
+            if dialect == ManifestDialect::Cursor || *rel_path == CURSOR_MANIFEST_PATH {
+                manifest.dialect = ManifestDialect::Cursor;
+                manifest.name = sanitize_cursor_name(&manifest.name);
+            }
             manifest.validate()?;
             manifest.warn_unsupported_features(&manifest.name);
             return Ok(ManifestLoadResult::Found(Box::new(manifest)));
@@ -595,6 +700,8 @@ mod tests {
             hooks: None,
             mcp_servers: None,
             lsp_servers: None,
+            rules: None,
+            dialect: Default::default(),
         };
         let dirs = manifest.skill_dirs(&root);
         assert_eq!(dirs.len(), 1);
@@ -622,6 +729,8 @@ mod tests {
             hooks: None,
             mcp_servers: None,
             lsp_servers: None,
+            rules: None,
+            dialect: Default::default(),
         };
         let dirs = manifest.skill_dirs(&root);
         assert!(dirs.is_empty());
@@ -651,6 +760,8 @@ mod tests {
             hooks: None,
             mcp_servers: None,
             lsp_servers: None,
+            rules: None,
+            dialect: Default::default(),
         };
         let dirs = manifest.skill_dirs(&root);
         assert!(
@@ -680,6 +791,8 @@ mod tests {
             hooks: None,
             mcp_servers: None,
             lsp_servers: None,
+            rules: None,
+            dialect: Default::default(),
         };
         let dirs = manifest.skill_dirs(&root);
         assert_eq!(dirs.len(), 1, "path within plugin root should be accepted");
@@ -709,6 +822,8 @@ mod tests {
             hooks: Some(PathOrInline::Path("../outside-hooks.json".to_string())),
             mcp_servers: None,
             lsp_servers: None,
+            rules: None,
+            dialect: Default::default(),
         };
         assert!(
             manifest.hooks_path(&root).is_none(),
@@ -739,6 +854,8 @@ mod tests {
             hooks: None,
             mcp_servers: Some(PathOrInline::Path("../outside-mcp.json".to_string())),
             lsp_servers: None,
+            rules: None,
+            dialect: Default::default(),
         };
         assert!(
             manifest.mcp_config_path(&root).is_none(),
@@ -762,6 +879,8 @@ mod tests {
             hooks: None,
             mcp_servers: Some(PathOrInline::Inline(servers)),
             lsp_servers: None,
+            rules: None,
+            dialect: Default::default(),
         }
     }
 

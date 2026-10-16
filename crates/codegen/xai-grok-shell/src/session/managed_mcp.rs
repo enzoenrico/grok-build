@@ -913,6 +913,8 @@ headers = { "X-A" = "1", "X-B" = "2", "X-C" = "3" }
                 server_name: { "type": "http", "url": url }
             }))),
             lsp_servers: None,
+            rules: None,
+            dialect: Default::default(),
         };
         let id = PluginId::new(PluginScope::User, plugin_root, "native-plugin");
         let dp = DiscoveredPlugin {
@@ -926,6 +928,7 @@ headers = { "X-A" = "1", "X-B" = "2", "X-C" = "3" }
             skill_dirs: vec![],
             command_dirs: vec![],
             agent_dirs: vec![],
+            rule_dirs: vec![],
             hooks_path: None,
             mcp_config_path: None,
             lsp_config_path: None,
@@ -1701,6 +1704,8 @@ Authorization = "Bearer org2-token"
                 "sentry": { "type": "http", "url": "https://mcp.sentry.dev/mcp" }
             }))),
             lsp_servers: None,
+            rules: None,
+            dialect: Default::default(),
         };
         let id = PluginId::new(PluginScope::User, &plugin_root, "sentry");
         let dp = DiscoveredPlugin {
@@ -1714,6 +1719,7 @@ Authorization = "Bearer org2-token"
             skill_dirs: vec![],
             command_dirs: vec![],
             agent_dirs: vec![],
+            rule_dirs: vec![],
             hooks_path: None,
             mcp_config_path: Some(mcp_json),
             lsp_config_path: None,
@@ -1769,6 +1775,8 @@ Authorization = "Bearer org2-token"
                 "sentry": { "type": "http", "url": "https://inline.example/mcp" }
             }))),
             lsp_servers: None,
+            rules: None,
+            dialect: Default::default(),
         };
         let id = PluginId::new(PluginScope::User, &plugin_root, "sentry");
         let dp = DiscoveredPlugin {
@@ -1782,6 +1790,7 @@ Authorization = "Bearer org2-token"
             skill_dirs: vec![],
             command_dirs: vec![],
             agent_dirs: vec![],
+            rule_dirs: vec![],
             hooks_path: None,
             mcp_config_path: Some(mcp_json),
             lsp_config_path: None,
@@ -1843,6 +1852,8 @@ Authorization = "Bearer org2-token"
             hooks: None,
             mcp_servers: None,
             lsp_servers: None,
+            rules: None,
+            dialect: Default::default(),
         };
         let id = PluginId::new(PluginScope::User, &plugin_root, "slack");
         let dp = DiscoveredPlugin {
@@ -1856,6 +1867,7 @@ Authorization = "Bearer org2-token"
             skill_dirs: vec![],
             command_dirs: vec![],
             agent_dirs: vec![],
+            rule_dirs: vec![],
             hooks_path: None,
             mcp_config_path: Some(mcp_json),
             lsp_config_path: None,

@@ -106,6 +106,23 @@ pub async fn run_command_hook(
     ctx: &RunContext<'_>,
     mode: GateKind,
 ) -> (HookRunnerResult, Duration, Option<String>) {
+    let (result, elapsed, system_message) = spawn_and_parse(spec, envelope, ctx, mode).await;
+    match &spec.cursor {
+        Some(cursor) => (
+            cursor.apply_fail_closed(result, &spec.name),
+            elapsed,
+            system_message,
+        ),
+        None => (result, elapsed, system_message),
+    }
+}
+
+async fn spawn_and_parse(
+    spec: &HookSpec,
+    envelope: &HookEventEnvelope,
+    ctx: &RunContext<'_>,
+    mode: GateKind,
+) -> (HookRunnerResult, Duration, Option<String>) {
     let start = Instant::now();
 
     let Some(ref command) = spec.command else {
@@ -117,7 +134,11 @@ pub async fn run_command_hook(
     };
     let command_str = command.to_string_lossy();
 
-    let stdin_json = match serde_json::to_string(&envelope.to_hook_json()) {
+    let stdin_value = match &spec.cursor {
+        Some(cursor) => cursor.stdin_json(envelope, &spec.name),
+        None => envelope.to_hook_json(),
+    };
+    let stdin_json = match serde_json::to_string(&stdin_value) {
         Ok(j) => j,
         Err(e) => {
             let elapsed = start.elapsed();
@@ -210,19 +231,33 @@ pub async fn run_command_hook(
     #[cfg(unix)]
     let env_root = Cow::Borrowed(ctx.workspace_root);
 
+    let (working_dir, cursor_env) = match &spec.cursor {
+        Some(cursor) if cursor.working_dir.is_dir() => {
+            (cursor.working_dir.as_path(), cursor.process_env(envelope))
+        }
+        Some(cursor) => (
+            std::path::Path::new(ctx.workspace_root),
+            cursor.process_env(envelope),
+        ),
+        None => (std::path::Path::new(ctx.workspace_root), Default::default()),
+    };
+
     #[allow(clippy::disallowed_methods)]
     let mut child = match cmd
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .current_dir(ctx.workspace_root)
+        .current_dir(working_dir)
         // SECURITY: extra_env is applied before the GROK_* identity vars so a hook cannot spoof them.
+        .envs(&cursor_env)
         .envs(&spec.extra_env)
         .env("GROK_HOOK_EVENT", envelope.hook_event_name.to_string())
         .env("GROK_HOOK_NAME", &spec.name)
         .env("GROK_SESSION_ID", ctx.session_id)
         .env("GROK_WORKSPACE_ROOT", env_root.as_ref())
         .env("CLAUDE_PROJECT_DIR", env_root.as_ref())
+        .env("CURSOR_PROJECT_DIR", env_root.as_ref())
+        .env("CURSOR_VERSION", crate::cursor::CURSOR_VERSION_LABEL)
         .kill_on_drop(true)
         .spawn()
     {
@@ -326,6 +361,11 @@ pub async fn run_command_hook(
                 "hook command completed"
             );
 
+            if let Some(cursor) = &spec.cursor {
+                let result =
+                    cursor.parse_output(mode, &stdout, &stderr, exit_code, &spec.name, envelope);
+                return (result, elapsed, None);
+            }
             let system_message = extract_system_message(&stdout);
             let (result, elapsed) = match mode {
                 GateKind::Observe => {
@@ -1958,6 +1998,7 @@ mod tests {
                 source_dir: std::path::PathBuf::from(source),
                 extra_env: std::collections::HashMap::new(),
                 layer: crate::config::HookProvenance::File,
+                cursor: None,
             };
         use crate::config::HandlerType;
         assert_eq!(
@@ -2000,6 +2041,7 @@ mod tests {
             source_dir: std::env::temp_dir(),
             extra_env: std::collections::HashMap::new(),
             layer: crate::config::HookProvenance::File,
+            cursor: None,
         }
     }
 
@@ -2296,6 +2338,7 @@ mod tests {
             source_dir: std::env::temp_dir(),
             extra_env,
             layer: crate::config::HookProvenance::File,
+            cursor: None,
         };
 
         let envelope = make_envelope();

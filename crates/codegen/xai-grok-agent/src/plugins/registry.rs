@@ -36,6 +36,10 @@ pub struct LoadedPlugin {
     pub command_dirs: Vec<PathBuf>,
     /// Resolved agent directories.
     pub agent_dirs: Vec<PathBuf>,
+    /// Cursor rule directories; always-apply rules from these join the system prompt.
+    pub rule_dirs: Vec<PathBuf>,
+    /// Plugin format, which decides command file extensions and hook working directory.
+    pub dialect: super::manifest::ManifestDialect,
     /// Resolved hooks file path.
     pub hooks_path: Option<PathBuf>,
     /// Resolved MCP config file path.
@@ -140,12 +144,13 @@ impl PluginRegistry {
             }
 
             // Count components
-            let skill_count =
-                count_skill_subdirs(&dp.skill_dirs) + count_md_files(&dp.command_dirs);
+            let dialect = dp.manifest.dialect;
+            let command_names = collect_named_files(&dp.command_dirs, dialect.command_extensions());
+            let skill_count = count_skill_subdirs(&dp.skill_dirs) + command_names.len();
             let agent_count = count_md_files(&dp.agent_dirs);
             let skill_names = {
                 let mut names = collect_skill_names(&dp.skill_dirs);
-                names.extend(collect_md_names(&dp.command_dirs));
+                names.extend(command_names);
                 names
             };
             let agent_names = collect_md_names(&dp.agent_dirs);
@@ -190,6 +195,8 @@ impl PluginRegistry {
                 skill_dirs: dp.skill_dirs,
                 command_dirs: dp.command_dirs,
                 agent_dirs: dp.agent_dirs,
+                rule_dirs: dp.rule_dirs,
+                dialect,
                 hooks_path: dp.hooks_path,
                 mcp_config_path: dp.mcp_config_path.clone(),
                 lsp_config_path: dp.lsp_config_path.clone(),
@@ -463,13 +470,20 @@ fn count_md_files(dirs: &[PathBuf]) -> usize {
 }
 
 fn collect_md_names(dirs: &[PathBuf]) -> Vec<String> {
+    collect_named_files(dirs, &["md"])
+}
+
+fn collect_named_files(dirs: &[PathBuf], extensions: &[&str]) -> Vec<String> {
     dirs.iter()
         .flat_map(|dir| std::fs::read_dir(dir).ok())
         .flatten()
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
-                && e.path().extension().is_some_and(|ext| ext == "md")
+                && e.path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| extensions.contains(&ext))
         })
         .filter_map(|e| {
             e.path()
@@ -607,6 +621,8 @@ pub(crate) mod tests {
                 hooks: None,
                 mcp_servers: None,
                 lsp_servers: None,
+                rules: None,
+                dialect: Default::default(),
             },
             id: PluginId::new(scope, &root, name),
             root: root.clone(),
@@ -622,6 +638,7 @@ pub(crate) mod tests {
             skill_dirs: vec![],
             command_dirs: vec![],
             agent_dirs: vec![],
+            rule_dirs: vec![],
             hooks_path: None,
             mcp_config_path: None,
             lsp_config_path: None,

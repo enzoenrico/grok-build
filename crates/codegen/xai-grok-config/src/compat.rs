@@ -409,6 +409,8 @@ impl CompatConfig {
         }
         if self.cursor.skills {
             dirs.push(".cursor");
+            // Cursor also loads `.codex/skills`, so the Cursor cell covers it while the Codex skills cell stays reserved.
+            dirs.push(".codex");
         }
         dirs
     }

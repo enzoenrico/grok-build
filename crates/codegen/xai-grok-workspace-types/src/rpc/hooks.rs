@@ -40,6 +40,9 @@ pub struct HookSpecWire {
     /// `default` decodes a server that predates this field as `file`.
     #[serde(default = "default_layer")]
     pub layer: String,
+    /// Opaque Cursor-dialect options; carried verbatim so a Cursor hook keeps its protocol across the hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<serde_json::Value>,
 }
 
 fn default_layer() -> String {

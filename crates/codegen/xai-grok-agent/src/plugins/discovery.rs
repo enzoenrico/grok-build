@@ -8,6 +8,7 @@
 //! 5. `~/.claude/plugins/*/` (scope: `User`, compat)
 //!    `~/.grok/installed-plugins/*/` (scope: `User`, marketplace installs)
 //!    Installed plugins from `~/.claude/plugins/installed_plugins.json` (scope: `User`)
+//!    Cursor's installed plugins (`plugins/cache`) and `plugins/local` (scope: `User`, see [`super::cursor`])
 //! 6. Paths from `[plugins].paths` in config (scope: `ConfigPath`)
 //!
 //! Deduplicates by canonical path and resolves name conflicts via the canonical source precedence.
@@ -17,7 +18,9 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use super::manifest::{ManifestLoadResult, PluginManifest, load_manifest, name_from_dirname};
+use super::manifest::{
+    ManifestDialect, ManifestLoadResult, PluginManifest, load_manifest_for, name_from_dirname,
+};
 use super::trust::TrustStore;
 
 // ── Public types ──────────────────────────────────────────────────────
@@ -84,6 +87,13 @@ pub enum PluginOrigin {
     UserGrok,
     /// `~/.claude/plugins/`.
     UserClaude,
+    /// `~/.cursor/plugins/local/`.
+    UserCursor,
+    /// A plugin installed from a Cursor marketplace (`~/.cursor/plugins/cache`).
+    CursorInstalled {
+        /// Marketplace slug from Cursor's plugin manifest (`cursor-public`, for example).
+        marketplace: String,
+    },
     /// A compat marketplace clone (project `extraKnownMarketplaces` or user `known_marketplaces.json`).
     ClaudeMarketplace {
         /// Marketplace name from the settings/registry entry.
@@ -103,6 +113,21 @@ pub enum PluginOrigin {
     },
     /// `[plugins].paths` in config.
     ConfigPath,
+}
+
+impl PluginOrigin {
+    pub fn is_cursor(&self) -> bool {
+        matches!(self, Self::UserCursor | Self::CursorInstalled { .. })
+    }
+
+    /// Cursor sources are read with Cursor's manifest order and component defaults.
+    pub fn manifest_dialect(&self) -> ManifestDialect {
+        if self.is_cursor() {
+            ManifestDialect::Cursor
+        } else {
+            ManifestDialect::Grok
+        }
+    }
 }
 
 /// Stable internal identity for a plugin.
@@ -150,6 +175,8 @@ pub struct DiscoveredPlugin {
     pub command_dirs: Vec<PathBuf>,
     /// Resolved agent directories.
     pub agent_dirs: Vec<PathBuf>,
+    /// Cursor rule directories (`rules/`); empty for grok-format plugins.
+    pub rule_dirs: Vec<PathBuf>,
     /// Resolved hooks file path.
     pub hooks_path: Option<PathBuf>,
     /// Resolved MCP config file path.
@@ -193,7 +220,10 @@ impl DiscoveryConfig {
                 tracing::debug!(plugin = %name, id = %dp.id.0, "plugin already in enabled/disabled list");
                 continue;
             }
-            if matches!(dp.scope, PluginScope::CliOverride | PluginScope::ConfigPath) {
+            // Installing a plugin in Cursor already chose it, so Cursor installs start enabled; `[plugins].disabled` still wins.
+            if matches!(dp.scope, PluginScope::CliOverride | PluginScope::ConfigPath)
+                || dp.origin.is_cursor()
+            {
                 tracing::debug!(plugin = %name, scope = ?dp.scope, "auto-adding to enabled list");
                 self.enabled.push(name.clone());
             } else {
@@ -402,6 +432,17 @@ pub fn discover_plugins(
         }
     }
 
+    // 5d. Cursor: marketplace installs in `plugins/cache`, then hand-placed `plugins/local`.
+    if let Some(config_dir) = super::cursor::config_dir() {
+        collect_cursor_plugins(
+            &config_dir,
+            trust_store,
+            project_trusted,
+            &mut seen_paths,
+            &mut candidates,
+        );
+    }
+
     // 6. Config-path plugins
     for dir in &config.config_paths {
         if dir.is_dir() {
@@ -460,6 +501,51 @@ pub fn discover_plugins(
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────
+
+fn collect_cursor_plugins(
+    config_dir: &Path,
+    trust_store: &TrustStore,
+    project_trusted: bool,
+    seen_paths: &mut HashSet<PathBuf>,
+    candidates: &mut Vec<DiscoveredPlugin>,
+) {
+    for install in super::cursor::installed_plugins(config_dir) {
+        let before = candidates.len();
+        collect_plugin(
+            &install.root,
+            PluginScope::User,
+            PluginOrigin::CursorInstalled {
+                marketplace: install.marketplace,
+            },
+            trust_store,
+            project_trusted,
+            seen_paths,
+            candidates,
+        );
+        // Cursor's recorded name wins over the directory-derived one (cache dirs are named by plugin id).
+        if let (true, Some(name)) = (candidates.len() > before, install.name) {
+            let name = super::manifest::sanitize_cursor_name(&name);
+            if let Some(plugin) = candidates.last_mut()
+                && !name.is_empty()
+                && plugin.manifest.name != name
+            {
+                plugin.id = PluginId::new(plugin.scope, &plugin.canonical_root, &name);
+                plugin.manifest.name = name;
+            }
+        }
+    }
+    for dir in super::cursor::local_plugin_dirs(config_dir) {
+        collect_plugin(
+            &dir,
+            PluginScope::User,
+            PluginOrigin::UserCursor,
+            trust_store,
+            project_trusted,
+            seen_paths,
+            candidates,
+        );
+    }
+}
 
 /// Scan a plugins parent directory (e.g. `~/.grok/plugins/`) and collect
 /// each subdirectory as a plugin candidate.
@@ -602,7 +688,8 @@ fn collect_plugin(
     }
 
     // Load manifest or derive from directory name
-    let manifest = match load_manifest(plugin_root) {
+    let dialect = origin.manifest_dialect();
+    let manifest = match load_manifest_for(plugin_root, dialect) {
         Ok(ManifestLoadResult::Found(m)) => *m,
         Ok(ManifestLoadResult::NotFound) => {
             // Convention-based: derive name from directory, check for skills/ or agents/ or .mcp.json or hooks/hooks.json
@@ -621,8 +708,18 @@ fn collect_plugin(
             let has_mcp = plugin_root.join(".mcp.json").is_file();
             let has_lsp = plugin_root.join(".lsp.json").is_file();
             let has_hooks = plugin_root.join("hooks").join("hooks.json").is_file();
+            let has_cursor_components = dialect == ManifestDialect::Cursor
+                && (plugin_root.join("rules").is_dir()
+                    || plugin_root.join("mcp.json").is_file()
+                    || plugin_root.join("SKILL.md").is_file());
 
-            if !has_skills && !has_agents && !has_mcp && !has_lsp && !has_hooks {
+            if !has_skills
+                && !has_agents
+                && !has_mcp
+                && !has_lsp
+                && !has_hooks
+                && !has_cursor_components
+            {
                 tracing::debug!(
                     path = %plugin_root.display(),
                     "directory has no manifest and no recognized plugin components; skipping"
@@ -645,6 +742,8 @@ fn collect_plugin(
                 hooks: None,
                 mcp_servers: None,
                 lsp_servers: None,
+                rules: None,
+                dialect,
             }
         }
         Err(e) => {
@@ -675,8 +774,13 @@ fn collect_plugin(
     let skill_dirs = manifest.skill_dirs(plugin_root);
     let command_dirs = manifest.command_dirs(plugin_root);
     let agent_dirs = manifest.agent_dirs(plugin_root);
+    let rule_dirs = manifest.rule_dirs(plugin_root);
     let hooks_path = manifest.hooks_path(plugin_root);
-    let mcp_config_path = manifest.mcp_config_path(plugin_root);
+    // Cursor MCP discovery owns `plugins/local/*/mcp.json`; loading it here too would register every server twice.
+    let mcp_config_path = match origin {
+        PluginOrigin::UserCursor => None,
+        _ => manifest.mcp_config_path(plugin_root),
+    };
     let lsp_config_path = manifest.lsp_config_path(plugin_root);
 
     candidates.push(DiscoveredPlugin {
@@ -690,6 +794,7 @@ fn collect_plugin(
         skill_dirs,
         command_dirs,
         agent_dirs,
+        rule_dirs,
         hooks_path,
         mcp_config_path,
         lsp_config_path,
@@ -942,6 +1047,66 @@ mod tests {
         assert_eq!(c.scope, PluginScope::CliOverride);
         assert_eq!(&c.origin, &PluginOrigin::CliOverride);
         assert!(c.trusted);
+    }
+
+    #[test]
+    fn cursor_plugins_load_with_cursor_layout_and_start_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("cursor");
+        let cached =
+            super::super::cursor::cache_version_dir(&config, "acme", "docs-helper", "abc123");
+        let write = |path: PathBuf, body: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write(cached.join(super::super::cursor::CACHE_COMPLETE_MARKER), "");
+        write(
+            cached.join(".cursor-plugin/plugin.json"),
+            r#"{"name":"Docs.Helper","rules":"./guides"}"#,
+        );
+        write(
+            cached.join("guides/style.mdc"),
+            "---\nalwaysApply: true\n---\nBe terse.\n",
+        );
+        write(cached.join("commands/review.txt"), "Review the diff.\n");
+        write(cached.join("mcp.json"), r#"{"mcpServers":{}}"#);
+        let local = super::super::cursor::plugins_dir(&config).join("local/my-tool");
+        write(local.join("rules/a.md"), "x");
+        write(local.join("mcp.json"), r#"{"mcpServers":{}}"#);
+
+        let trust = TrustStore::load_from(tmp.path().join("trust"));
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+        collect_cursor_plugins(&config, &trust, false, &mut seen, &mut candidates);
+
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        let installed = &candidates[0];
+        assert_eq!(installed.plugin_name(), "docs-helper");
+        assert_eq!(installed.scope, PluginScope::User);
+        assert_eq!(
+            installed.origin,
+            PluginOrigin::CursorInstalled {
+                marketplace: "acme".into()
+            }
+        );
+        assert_eq!(installed.manifest.dialect, ManifestDialect::Cursor);
+        assert_eq!(installed.rule_dirs, vec![cached.join("guides")]);
+        assert_eq!(installed.mcp_config_path, Some(cached.join("mcp.json")));
+        assert!(installed.trusted);
+
+        let local_plugin = &candidates[1];
+        assert_eq!(local_plugin.plugin_name(), "my-tool");
+        assert_eq!(local_plugin.origin, PluginOrigin::UserCursor);
+        assert_eq!(local_plugin.rule_dirs, vec![local.join("rules")]);
+        assert_eq!(local_plugin.mcp_config_path, None);
+
+        let mut config = DiscoveryConfig {
+            disabled: vec!["my-tool".into()],
+            ..Default::default()
+        };
+        config.populate_plugin_lists(&candidates);
+        assert_eq!(config.enabled, vec!["docs-helper".to_string()]);
+        assert_eq!(config.disabled, vec!["my-tool".to_string()]);
     }
 
     #[test]

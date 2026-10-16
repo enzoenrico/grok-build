@@ -95,6 +95,7 @@ fn managed_registry(name: &str, layer: HookProvenance) -> xai_grok_hooks::discov
         source_dir: std::env::temp_dir(),
         extra_env: std::collections::HashMap::new(),
         layer,
+        cursor: None,
     }])
 }
 

@@ -401,11 +401,11 @@ Control vendor compatibility for Cursor, Claude, and Codex. Every cell defaults 
 
 ```toml
 [compat.cursor]
-skills = true     # scan ~/.cursor/skills/ and <cwd>/.cursor/skills/
+skills = true     # ~/.cursor/skills/, <cwd>/.cursor/skills/, and skills from installed Cursor plugins
 rules = true      # scan ~/.cursor/rules/ and <dir>/.cursor/rules/
 agents = true     # scan ~/.cursor/ for named instruction files
 mcps = true       # scan ~/.cursor/mcp.json and <cwd>/.cursor/mcp.json
-hooks = true      # scan ~/.cursor/hooks.json and <cwd>/.cursor/hooks.json
+hooks = true      # ~/.cursor/hooks.json, <repo>/.cursor/hooks.json, the enterprise hooks file, and Cursor plugin hooks
 sessions = true   # staged; no scanner consumer yet
 
 [compat.claude]

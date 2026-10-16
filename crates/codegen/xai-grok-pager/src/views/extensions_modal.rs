@@ -373,6 +373,14 @@ pub fn plugin_group(plugin: &xai_hooks_plugins_types::PluginInfo) -> PluginGroup
         | Some(PluginOrigin::ClaudeInstalled { marketplace: None }) => {
             PluginGroup::new(3, "origin:user-claude", "User (Claude)")
         }
+        Some(PluginOrigin::UserCursor) => {
+            PluginGroup::new(3, "origin:user-cursor", "User (Cursor)")
+        }
+        Some(PluginOrigin::CursorInstalled { marketplace }) => PluginGroup {
+            rank: 4,
+            key: format!("cursor-mp:{marketplace}"),
+            label: marketplace.clone(),
+        },
         Some(PluginOrigin::ClaudeMarketplace { marketplace })
         | Some(PluginOrigin::ClaudeInstalled {
             marketplace: Some(marketplace),
@@ -7092,6 +7100,20 @@ mod tests {
                 3,
                 "origin:user-claude",
                 "User (Claude)",
+            ),
+            (
+                PluginOrigin::UserCursor,
+                3,
+                "origin:user-cursor",
+                "User (Cursor)",
+            ),
+            (
+                PluginOrigin::CursorInstalled {
+                    marketplace: "cursor-public".into(),
+                },
+                4,
+                "cursor-mp:cursor-public",
+                "cursor-public",
             ),
             (
                 PluginOrigin::ClaudeMarketplace {

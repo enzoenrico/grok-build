@@ -13931,6 +13931,7 @@ dependencies = [
 name = "xai-grok-hooks"
 version = "0.1.0"
 dependencies = [
+ "dunce",
  "fastrand",
  "regex",
  "reqwest 0.12.24",
@@ -13945,6 +13946,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "xai-dirs",
  "xai-grok-config",
  "xai-grok-extra-ca",
  "xai-grok-sandbox",

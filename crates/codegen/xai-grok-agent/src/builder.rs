@@ -1215,6 +1215,14 @@ impl AgentBuilder {
         } else {
             vec![]
         };
+        if definition.agents_md
+            && self.compat.cursor.rules
+            && let Some(registry) = self.plugin_registry.as_deref()
+        {
+            // User-level, so they precede project files, which take precedence on conflicts.
+            let plugin_rules = crate::prompt::agents_md::plugin_rule_files(registry);
+            agents_md_files.splice(0..0, plugin_rules);
+        }
         {
             let initial_paths: Vec<PathBuf> = agents_md_files
                 .iter()

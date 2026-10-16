@@ -114,7 +114,7 @@ impl HookRegistry {
     /// An invalid pattern can't be rejected here (the registry is live), so it installs [`HookMatcher::never`]: fail closed rather than match all.
     pub fn recompile_matchers(&mut self) {
         for specs in self.hooks.values_mut() {
-            for spec in specs.iter_mut() {
+            for spec in specs.iter_mut().filter(|spec| spec.cursor.is_none()) {
                 if let Some(ref pattern) = spec.configured_matcher {
                     match HookMatcher::new(pattern) {
                         Ok(m) => spec.matcher = Some(m),
@@ -235,14 +235,16 @@ pub fn collect_specs_from_sources(
 /// Otherwise a byte-identical hook in a user-writable layer (which loads earlier) would shadow the root-owned copy's provenance.
 pub fn registry_from_specs_deduped(specs: Vec<HookSpec>) -> HookRegistry {
     let mut hooks: HashMap<HookEventName, Vec<HookSpec>> = HashMap::new();
-    let mut seen_content: HashMap<(HookEventName, String, String, String), (HookEventName, usize)> =
-        HashMap::new();
+    type ContentKey = (HookEventName, String, String, String, Option<&'static str>);
+    let mut seen_content: HashMap<ContentKey, (HookEventName, usize)> = HashMap::new();
     for spec in specs {
+        // Cursor events that share a grok event (preToolUse, beforeShellExecution) are distinct hooks.
         let key = (
             spec.event.canonical(),
             spec.command_raw.clone().unwrap_or_default(),
             spec.url_raw.clone().unwrap_or_default(),
             spec.configured_matcher.clone().unwrap_or_default(),
+            spec.cursor.as_ref().map(|cursor| cursor.event.key()),
         );
         match seen_content.get(&key) {
             None => {
@@ -366,6 +368,10 @@ pub fn discover_hook_source_paths(options: DiscoveryOptions<'_>) -> HookSourcePa
             }
         };
 
+    if include_cursor && let Some(enterprise) = cursor_enterprise_hooks_path() {
+        global.push(HookSourceConfig::SettingsFile(enterprise));
+    }
+
     if let Some(h) = options.home {
         if include_claude {
             global.push(HookSourceConfig::SettingsFile(
@@ -401,6 +407,20 @@ pub fn discover_hook_source_paths(options: DiscoveryOptions<'_>) -> HookSourcePa
     }
 
     HookSourcePaths { global, project }
+}
+
+/// Cursor's system-wide (MDM) hooks file. `GROK_CURSOR_ENTERPRISE_HOOKS` overrides the path, and an empty value disables it.
+fn cursor_enterprise_hooks_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("GROK_CURSOR_ENTERPRISE_HOOKS") {
+        return (!path.is_empty()).then(|| PathBuf::from(path));
+    }
+    Some(if cfg!(target_os = "macos") {
+        PathBuf::from("/Library/Application Support/Cursor/hooks.json")
+    } else if cfg!(windows) {
+        PathBuf::from(r"C:\ProgramData\Cursor\hooks.json")
+    } else {
+        PathBuf::from("/etc/cursor/hooks.json")
+    })
 }
 
 /// Config-layer specs go first, so first-wins dedup prefers them over a byte-identical file hook.
@@ -583,6 +603,24 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(gates, expected, "gate events changed");
+    }
+
+    #[test]
+    fn cursor_enterprise_hooks_file_is_global_when_cursor_hooks_are_on() {
+        let Some(enterprise) = cursor_enterprise_hooks_path() else {
+            return;
+        };
+        let is_enterprise = |source: &HookSourceConfig| matches!(source, HookSourceConfig::SettingsFile(path) if path == &enterprise);
+        let on = discover_hook_source_paths(untrusted_without_git_root());
+        assert!(on.global.iter().any(is_enterprise));
+        let off = discover_hook_source_paths(DiscoveryOptions {
+            compat: CompatHooks {
+                cursor: false,
+                claude: true,
+            },
+            ..untrusted_without_git_root()
+        });
+        assert!(!off.global.iter().any(is_enterprise));
     }
 
     #[test]
@@ -906,6 +944,7 @@ mod tests {
             source_dir: std::path::PathBuf::from("/tmp"),
             extra_env: std::collections::HashMap::new(),
             layer,
+            cursor: None,
         };
         use crate::config::HookProvenance;
 
@@ -1050,6 +1089,7 @@ mod tests {
             source_dir: std::path::PathBuf::from("/tmp"),
             extra_env: std::collections::HashMap::new(),
             layer: crate::config::HookProvenance::Requirements,
+            cursor: None,
         };
         let mut registry = HookRegistry::default();
         registry.append_specs(vec![spec.clone()]);
@@ -1289,6 +1329,7 @@ mod tests {
             source_dir: PathBuf::from("/tmp"),
             extra_env: Default::default(),
             layer: crate::config::HookProvenance::File,
+            cursor: None,
         }
     }
 

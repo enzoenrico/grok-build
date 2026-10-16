@@ -440,7 +440,7 @@ fn registry_and_defaults_cover_every_cell() {
 #[test]
 fn skill_config_dirs_all_on_lists_every_vendor() {
     assert_eq!(
-        vec![".grok", ".agents", ".claude", ".cursor"],
+        vec![".grok", ".agents", ".claude", ".cursor", ".codex"],
         CompatConfig::default().skill_config_dirs()
     );
 }
@@ -456,7 +456,10 @@ fn skill_config_dirs_gates_each_vendor() {
 
     let mut c2 = CompatConfig::default();
     c2.claude.skills = false;
-    assert_eq!(vec![".grok", ".agents", ".cursor"], c2.skill_config_dirs());
+    assert_eq!(
+        vec![".grok", ".agents", ".cursor", ".codex"],
+        c2.skill_config_dirs()
+    );
 }
 
 #[test]
