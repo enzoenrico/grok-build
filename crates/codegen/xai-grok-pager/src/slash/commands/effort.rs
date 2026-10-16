@@ -65,6 +65,8 @@ impl SlashCommand for EffortCommand {
         match ctx.models.resolve_effort_for_model(&model_id, trimmed) {
             Ok(effort) => CommandResult::Action(Action::SwitchModel(ModelChoice {
                 effort: Some(effort),
+                fast_mode: ctx.models.fast_mode,
+                max_mode: ctx.models.max_mode,
                 ..ModelChoice::new(model_id)
             })),
             Err(err) => CommandResult::Error(err.message()),

@@ -33,7 +33,10 @@ use xai_grok_shell::sampling::error::{
     RATE_LIMITED_ERROR_CODE, error_detail_from_data, format_rate_limited_user_message,
 };
 use xai_grok_shell::sampling::types::{
-    REASONING_EFFORT_META_KEY, parse_canonical_effort_token, reasoning_effort_meta_value,
+    CONTEXT_WINDOW_META_KEY, FAST_MODE_META_KEY, MAX_MODE_META_KEY, MODEL_PARAMETERS_META_KEY,
+    REASONING_EFFORT_META_KEY, fast_mode_meta_value, max_mode_meta_value,
+    model_parameters_meta_value, parse_canonical_effort_token, parse_context_window_token,
+    parse_parameterized_model_spec, reasoning_effort_meta_value,
 };
 use xai_grok_shell::util::config as cli_config;
 use xai_grok_telemetry::startup::PendingStartup;
@@ -84,6 +87,10 @@ pub struct HeadlessOptions {
     pub permission_mode_flag: Option<String>,
     /// Effort token (`--reasoning-effort` / `--effort`); a menu id or canonical level after models load.
     pub reasoning_effort: Option<String>,
+    /// Context window token (`--context-window` / `--context`).
+    pub context_window: Option<String>,
+    /// Fast mode override (`--fast` / `--no-fast`).
+    pub fast_mode: Option<bool>,
     /// Wait for background tasks to report `task_completed` before exiting (default true).
     pub wait_for_background: bool,
     /// Max time to wait for background work to finish after the first turn ends.
@@ -682,7 +689,7 @@ async fn resume_session_in_new_worktree(
         )
     })
 }
-/// Apply `-m` / effort after session open.
+/// Apply `-m` / effort / context-window / fast-mode after session open.
 /// Effort is soft-ignored on a non-supporting model (still applying `-m`) but hard-fails on a genuinely unknown token.
 async fn apply_headless_model_and_effort(
     acp_tx: &AcpAgentTx,
@@ -690,10 +697,17 @@ async fn apply_headless_model_and_effort(
     models: &ModelState,
     model_name: Option<&str>,
     effort_token: Option<&str>,
+    context_window_token: Option<&str>,
+    fast_mode: Option<bool>,
 ) -> anyhow::Result<()> {
-    if model_name.is_none() && effort_token.is_none() {
+    if model_name.is_none()
+        && effort_token.is_none()
+        && context_window_token.is_none()
+        && fast_mode.is_none()
+    {
         return Ok(());
     }
+    let spec = model_name.and_then(parse_parameterized_model_spec);
     let model_id = if let Some(name) = model_name {
         models
             .resolve_by_name_or_id(name)
@@ -706,12 +720,15 @@ async fn apply_headless_model_and_effort(
             {
                 return Ok(());
             }
+            None if context_window_token.is_some() || fast_mode.is_some() => {
+                return Ok(());
+            }
             None => {
                 anyhow::bail!("--effort/--reasoning-effort: no active model to apply effort to");
             }
         }
     };
-    let effort = match effort_token {
+    let mut effort = match effort_token {
         None => None,
         Some(token) if models.available.is_empty() => {
             if parse_canonical_effort_token(token).is_none() {
@@ -737,17 +754,55 @@ async fn apply_headless_model_and_effort(
             }
         },
     };
-    if model_name.is_none() && effort.is_none() {
+    if effort.is_none() {
+        effort = spec.as_ref().and_then(|s| s.effort);
+    }
+    let context_window = match context_window_token {
+        Some(token) => match parse_context_window_token(token) {
+            Some(w) => Some(w),
+            None => anyhow::bail!("--context-window: invalid context window '{token}'"),
+        },
+        None => spec.as_ref().and_then(|s| s.context_window),
+    };
+    let resolved_fast = fast_mode.or_else(|| spec.as_ref().and_then(|s| s.fast_mode));
+    let resolved_max = spec.as_ref().and_then(|s| s.max_mode);
+    let raw_params = spec.map(|s| s.raw_params).unwrap_or_default();
+
+    if model_name.is_none()
+        && effort.is_none()
+        && context_window.is_none()
+        && resolved_fast.is_none()
+        && resolved_max.is_none()
+        && raw_params.is_empty()
+    {
         return Ok(());
     }
-    let meta = effort.map(|eff| {
-        let mut m = acp::Meta::new();
+    let mut m = acp::Meta::new();
+    if let Some(eff) = effort {
         m.insert(
             REASONING_EFFORT_META_KEY.to_string(),
             reasoning_effort_meta_value(eff),
         );
-        m
-    });
+    }
+    if let Some(window) = context_window {
+        m.insert(
+            CONTEXT_WINDOW_META_KEY.to_string(),
+            serde_json::Value::from(window.get()),
+        );
+    }
+    if let Some(fast) = resolved_fast {
+        m.insert(FAST_MODE_META_KEY.to_string(), fast_mode_meta_value(fast));
+    }
+    if let Some(max) = resolved_max {
+        m.insert(MAX_MODE_META_KEY.to_string(), max_mode_meta_value(max));
+    }
+    if !raw_params.is_empty() {
+        m.insert(
+            MODEL_PARAMETERS_META_KEY.to_string(),
+            model_parameters_meta_value(&raw_params),
+        );
+    }
+    let meta = (!m.is_empty()).then_some(m);
     acp_send(
         acp::SetSessionModelRequest::new(session_id.clone(), model_id.clone()).meta(meta),
         acp_tx,
@@ -761,12 +816,14 @@ async fn apply_headless_model_and_effort(
                 e
             )
         } else {
-            anyhow::anyhow!("Couldn't apply reasoning effort: {e}")
+            anyhow::anyhow!("Couldn't apply model configuration: {e}")
         }
     })?;
     tracing::debug!(
         model_id = %model_id.0,
         effort = ?effort,
+        context_window = ?context_window,
+        fast_mode = ?resolved_fast,
         "headless: model/effort set"
     );
     Ok(())
@@ -1155,6 +1212,8 @@ pub async fn run_single_turn(
         &session_models,
         options.model.as_deref(),
         options.reasoning_effort.as_deref(),
+        options.context_window.as_deref(),
+        options.fast_mode,
     )
     .await
     {

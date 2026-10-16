@@ -2493,6 +2493,8 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                 max_turns: args.max_turns,
                 permission_mode_flag: args.permission_mode_flag.clone(),
                 reasoning_effort: args.reasoning_effort.clone(),
+                context_window: args.context_window.clone(),
+                fast_mode: args.fast_mode_override(),
                 wait_for_background: !args.no_wait_for_background,
                 background_wait_timeout: std::time::Duration::from_secs(
                     args.background_wait_timeout_secs,

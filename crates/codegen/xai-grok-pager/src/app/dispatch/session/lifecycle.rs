@@ -28,7 +28,9 @@ use crate::scrollback::state::ScrollbackState;
 use crate::slash::commands::context_window::format_window;
 use agent_client_protocol as acp;
 use std::time::Instant;
-use xai_grok_shell::sampling::types::ReasoningEffort;
+use xai_grok_shell::sampling::types::{
+    ReasoningEffort, parse_context_window_token, parse_parameterized_model_spec,
+};
 /// A deferred model switch to apply once the session exists, plus any effort error to report.
 /// `switch` is still populated when a `-m` model was stashed even if the effort token failed, so an invalid effort never drops the CLI model override.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +129,74 @@ pub(crate) fn apply_deferred_switch_outcome(
         agent.scrollback.push_block(RenderBlock::system(msg));
     }
     outcome.switch
+}
+
+pub(crate) fn build_deferred_switch_effect(
+    agent: &mut AgentView,
+    agent_id: AgentId,
+    session_id: acp::SessionId,
+    deferred: Option<DeferredModelSwitch>,
+    cli_context_window_token: Option<&str>,
+    cli_fast_mode: Option<bool>,
+) -> Option<Effect> {
+    let has_extra_cli = cli_context_window_token.is_some() || cli_fast_mode.is_some();
+    let has_bracket_spec = deferred
+        .as_ref()
+        .and_then(|s| parse_parameterized_model_spec(&s.model_id.0))
+        .is_some();
+
+    if !has_extra_cli && !has_bracket_spec {
+        let switch = deferred?;
+        agent.session.model_switch_pending = true;
+        return Some(Effect::SwitchModel {
+            agent_id,
+            session_id,
+            choice: ModelChoice {
+                effort: switch.effort,
+                ..ModelChoice::new(switch.model_id)
+            },
+            prev_model_id: switch.prev_model_id,
+        });
+    }
+
+    let (raw_model_id, mut effort, prev_model_id) = match deferred {
+        Some(s) => (s.model_id, s.effort, s.prev_model_id),
+        None => {
+            let current = agent.session.models.current.clone()?;
+            (current, None, None)
+        }
+    };
+
+    let spec = parse_parameterized_model_spec(&raw_model_id.0);
+    let model_id = agent
+        .session
+        .models
+        .resolve_by_name_or_id(&raw_model_id.0)
+        .unwrap_or(raw_model_id);
+    if effort.is_none() {
+        effort = spec.as_ref().and_then(|s| s.effort);
+    }
+    let context_window_selection = cli_context_window_token
+        .and_then(parse_context_window_token)
+        .or_else(|| spec.as_ref().and_then(|s| s.context_window));
+    let fast_mode = cli_fast_mode.or_else(|| spec.as_ref().and_then(|s| s.fast_mode));
+    let max_mode = spec.as_ref().and_then(|s| s.max_mode);
+    let model_parameters = spec.map(|s| s.raw_params).unwrap_or_default();
+
+    agent.session.model_switch_pending = true;
+    Some(Effect::SwitchModel {
+        agent_id,
+        session_id,
+        choice: ModelChoice {
+            model_id,
+            effort,
+            context_window_selection,
+            fast_mode,
+            max_mode,
+            model_parameters,
+        },
+        prev_model_id,
+    })
 }
 /// `Always` skips the popup and creates a worktree, `Never` stays in-cwd, `Ask` opens the worktree question modal (as `/fork` does).
 /// Otherwise proceeds directly via [`dispatch_new_session_from_tab`].
@@ -1416,12 +1486,17 @@ pub(in crate::app::dispatch) fn handle_session_created(
         }
         agent.apply_session_modes(modes);
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
+        let deferred_switch_effect = build_deferred_switch_effect(
+            agent,
+            agent_id,
+            session_id_clone.clone(),
+            deferred,
+            app.cli_context_window_token.as_deref(),
+            app.cli_fast_mode,
+        );
         let deferred_mode = agent.deferred_session_mode.take();
         let deferred_permission = agent.deferred_permission_mode.take();
         let cwd = agent.session.cwd.clone();
-        if deferred.is_some() {
-            agent.session.model_switch_pending = true;
-        }
         let mut effects =
             deferred_mode_effects(&session_id_clone, deferred_mode, deferred_permission);
         let mut drain = if app.reconnect_pending {
@@ -1462,16 +1537,8 @@ pub(in crate::app::dispatch) fn handle_session_created(
             silent: true,
             nonce: Default::default(),
         });
-        if let Some(switch) = deferred {
-            effects.push(Effect::SwitchModel {
-                agent_id,
-                session_id: session_id_clone.clone(),
-                choice: ModelChoice {
-                    effort: switch.effort,
-                    ..ModelChoice::new(switch.model_id)
-                },
-                prev_model_id: switch.prev_model_id,
-            });
+        if let Some(effect) = deferred_switch_effect {
+            effects.push(effect);
         }
         if std::mem::take(&mut agent.pending_extensions_fetch)
             && let Some(modal) = agent.extensions_modal.as_mut()
@@ -1554,12 +1621,17 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             agent.scrollback.push_block(RenderBlock::system(summary));
         }
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
+        let deferred_switch_effect = build_deferred_switch_effect(
+            agent,
+            agent_id,
+            session_id_clone.clone(),
+            deferred,
+            app.cli_context_window_token.as_deref(),
+            app.cli_fast_mode,
+        );
         let deferred_mode = agent.deferred_session_mode.take();
         let deferred_permission = agent.deferred_permission_mode.take();
         let cwd = agent.session.cwd.clone();
-        if deferred.is_some() {
-            agent.session.model_switch_pending = true;
-        }
         let mut effects =
             deferred_mode_effects(&session_id_clone, deferred_mode, deferred_permission);
         let mut drain = if app.reconnect_pending {
@@ -1600,16 +1672,8 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             silent: true,
             nonce: Default::default(),
         });
-        if let Some(switch) = deferred {
-            effects.push(Effect::SwitchModel {
-                agent_id,
-                session_id: session_id_clone.clone(),
-                choice: ModelChoice {
-                    effort: switch.effort,
-                    ..ModelChoice::new(switch.model_id)
-                },
-                prev_model_id: switch.prev_model_id,
-            });
+        if let Some(effect) = deferred_switch_effect {
+            effects.push(effect);
         }
         if std::mem::take(&mut agent.pending_extensions_fetch)
             && let Some(modal) = agent.extensions_modal.as_mut()
@@ -1891,6 +1955,9 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
         model_id,
         effort,
         context_window_selection,
+        fast_mode,
+        max_mode,
+        model_parameters,
     } = choice;
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.session.model_switch_pending = false;
@@ -1908,7 +1975,22 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     .unwrap_or_else(|| model_id.0.to_string());
                 let prev_model = agent.session.models.current.clone();
                 let prev_effort = agent.session.models.reasoning_effort;
+                let prev_fast = agent.session.models.fast_mode;
+                let prev_max = agent.session.models.max_mode;
                 agent.session.models.set_current(model_id.clone(), effort);
+                if let Some(fast) =
+                    fast_mode.or(prev_fast.filter(|_| prev_model.as_ref() == Some(&model_id)))
+                {
+                    agent.session.models.fast_mode = Some(fast);
+                }
+                if let Some(max) =
+                    max_mode.or(prev_max.filter(|_| prev_model.as_ref() == Some(&model_id)))
+                {
+                    agent.session.models.max_mode = Some(max);
+                }
+                if !model_parameters.is_empty() {
+                    agent.session.models.model_parameters = model_parameters;
+                }
                 let resolved_effort = agent.session.models.reasoning_effort;
                 if let Some(selection) = context_window_selection
                     && !model_changed_during_switch
@@ -1931,6 +2013,16 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                     agent.scrollback.push_block(RenderBlock::system(format!(
                         "Context window set to {}",
                         format_window(selection.get())
+                    )));
+                } else if let Some(fast) = fast_mode {
+                    agent.scrollback.push_block(RenderBlock::system(format!(
+                        "Fast mode: {}",
+                        if fast { "ON" } else { "OFF" }
+                    )));
+                } else if let Some(max) = max_mode {
+                    agent.scrollback.push_block(RenderBlock::system(format!(
+                        "Max mode: {}",
+                        if max { "ON" } else { "OFF" }
                     )));
                 }
                 if unchanged {

@@ -960,7 +960,19 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                 enabled,
             }]
         }
-        Action::NextModel => vec![],
+        Action::NextModel => {
+            let ActiveView::Agent(id) = app.active_view else {
+                return vec![];
+            };
+            let Some(next_id) = app
+                .agents
+                .get(&id)
+                .and_then(|agent| agent.session.models.next_model())
+            else {
+                return vec![];
+            };
+            dispatch(Action::SwitchModel(ModelChoice::new(next_id)), app)
+        }
         Action::SwitchModel(mut choice) => {
             let ActiveView::Agent(id) = app.active_view else {
                 return vec![];
@@ -992,11 +1004,25 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
                         );
                 }
                 let ModelChoice {
-                    model_id, effort, ..
+                    model_id,
+                    effort,
+                    fast_mode,
+                    max_mode,
+                    model_parameters,
+                    ..
                 } = choice;
                 let prev_model = agent.session.models.current.clone();
                 let prev_effort = agent.session.models.reasoning_effort;
                 agent.session.models.set_current(model_id.clone(), effort);
+                if let Some(fast) = fast_mode {
+                    agent.session.models.fast_mode = Some(fast);
+                }
+                if let Some(max) = max_mode {
+                    agent.session.models.max_mode = Some(max);
+                }
+                if !model_parameters.is_empty() {
+                    agent.session.models.model_parameters = model_parameters;
+                }
                 let resolved_effort = agent.session.models.reasoning_effort;
                 let unchanged =
                     prev_model.as_ref() == Some(&model_id) && prev_effort == resolved_effort;

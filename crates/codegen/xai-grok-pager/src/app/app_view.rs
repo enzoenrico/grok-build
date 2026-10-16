@@ -825,6 +825,10 @@ pub struct AppView {
     pub cli_model_override: Option<acp::ModelId>,
     /// CLI effort token (`--reasoning-effort` / `--effort`). Applied on session create.
     pub cli_effort_token: Option<String>,
+    /// CLI context window token (`--context-window` / `--context`). Applied on session create.
+    pub cli_context_window_token: Option<String>,
+    /// CLI fast mode override (`--fast` / `--no-fast`). Applied on session create.
+    pub cli_fast_mode: Option<bool>,
     /// Default YOLO for new sessions, seeded at startup from `effective_yolo_for_launch`.
     pub default_yolo: bool,
     /// Soft-default still owns the mode: settings/update may rewrite the UI and `default_yolo`.
@@ -1467,6 +1471,8 @@ impl AppView {
             welcome_shimmer_frame: 0,
             cli_model_override: None,
             cli_effort_token: None,
+            cli_context_window_token: None,
+            cli_fast_mode: None,
             default_yolo: false,
             permission_mode_from_soft_default: true,
             auto_mode_gate: xai_grok_shell::util::config::auto_permission_mode_enabled_from_disk(),
