@@ -386,6 +386,57 @@ fn neutralize_reminder_tags(content: &str) -> String {
         .into_owned()
 }
 
+/// Always-apply rules from the `rules/` dirs of active Cursor-format plugins, sorted by plugin then file name.
+/// Glob-scoped, agent-requested, and manual plugin rules are not loaded.
+pub fn plugin_rule_files(registry: &crate::plugins::PluginRegistry) -> Vec<AgentConfigFile> {
+    let mut files = Vec::new();
+    for plugin in registry.active_plugins() {
+        let mut paths: Vec<PathBuf> = plugin
+            .rule_dirs
+            .iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ["md", "mdc", "markdown"].contains(&ext))
+            })
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(body) =
+                xai_grok_tools::implementations::cursor_rules_on_read::always_apply_rule_body(
+                    &content,
+                )
+            else {
+                continue;
+            };
+            let body = xai_grok_tools::util::substitute_plugin_tokens(
+                &body,
+                Some(&plugin.root_str()),
+                Some(&plugin.data_dir_str()),
+            );
+            files.push(AgentConfigFile {
+                file_name: path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                file_path: path.to_string_lossy().into_owned(),
+                content: body,
+                source: InstructionSource::Home,
+            });
+        }
+    }
+    files
+}
+
 fn render_agents_md(configs: &[AgentConfigFile]) -> Option<String> {
     if configs.is_empty() {
         return None;
@@ -1405,5 +1456,68 @@ mod tests {
 
         assert!(has_direct, "Direct CLAUDE.md should be found");
         assert!(has_subdir, ".claude/CLAUDE.md should be found");
+    }
+
+    #[test]
+    fn plugin_rule_files_keep_always_apply_rules_of_active_plugins() {
+        use crate::plugins::discovery::{DiscoveredPlugin, PluginId, PluginScope};
+        use crate::plugins::manifest::{ManifestDialect, PluginManifest};
+        use crate::plugins::{PluginOrigin, PluginRegistry};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("style");
+        let rules = root.join("rules");
+        fs::create_dir_all(&rules).unwrap();
+        fs::write(
+            rules.join("b-always.mdc"),
+            "---\nalwaysApply: true\n---\nUse ${CURSOR_PLUGIN_ROOT}/bin.\n",
+        )
+        .unwrap();
+        fs::write(
+            rules.join("a-always.md"),
+            "---\nalwaysApply: true\n---\nFirst.\n",
+        )
+        .unwrap();
+        fs::write(
+            rules.join("globbed.mdc"),
+            "---\nglobs: \"*.rs\"\nalwaysApply: false\n---\nOnly for Rust.\n",
+        )
+        .unwrap();
+        fs::write(
+            rules.join("notes.txt"),
+            "---\nalwaysApply: true\n---\nNot a rule.\n",
+        )
+        .unwrap();
+
+        let dp = DiscoveredPlugin {
+            manifest: PluginManifest {
+                name: "style".into(),
+                dialect: ManifestDialect::Cursor,
+                ..Default::default()
+            },
+            id: PluginId::new(PluginScope::User, &root, "style"),
+            root: root.clone(),
+            canonical_root: root.clone(),
+            scope: PluginScope::User,
+            origin: PluginOrigin::UserCursor,
+            trusted: true,
+            skill_dirs: vec![],
+            command_dirs: vec![],
+            agent_dirs: vec![],
+            rule_dirs: vec![rules.clone()],
+            hooks_path: None,
+            mcp_config_path: None,
+            lsp_config_path: None,
+            conflict: None,
+        };
+        let registry = PluginRegistry::from_discovered(vec![dp], &[], &["style".into()]);
+
+        let files = plugin_rule_files(&registry);
+        let contents: Vec<&str> = files.iter().map(|f| f.content.trim()).collect();
+        assert_eq!(
+            contents,
+            vec!["First.", format!("Use {}/bin.", root.display()).as_str()]
+        );
+        assert!(files.iter().all(|f| f.source == InstructionSource::Home));
     }
 }
