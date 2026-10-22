@@ -100,6 +100,51 @@ pub(crate) fn run_command(session_id: &str, args: &str) -> Result<String, String
         .command(session_id, parsed, repo_url.as_deref(), &api, auth)
 }
 
+pub(crate) fn run_swarm(session_id: &str, args: &str) -> Result<String, String> {
+    let parsed = parse_swarm_args(args)?;
+    let cwd = std::env::current_dir().ok();
+    let repo = cwd.as_deref().and_then(cloud::repo_from_cwd);
+    let api =
+        std::env::var("CURSOR_CLOUD_API").unwrap_or_else(|_| "https://api.cursor.com".to_owned());
+    let jobs = process();
+    let mut jobs = jobs.lock().unwrap_or_else(|err| err.into_inner());
+    match parsed {
+        SwarmArgs::Rollup => Ok(jobs.format_swarm(session_id)),
+        SwarmArgs::Launch { n, prompt } => {
+            let auth = if n == 0 {
+                CloudAuth::Bearer(String::new())
+            } else {
+                cloud::resolve_cloud_auth()?
+            };
+            jobs.launch_swarm(&api, &auth, session_id, n, &prompt, repo.as_ref(), None)
+        }
+    }
+}
+
+pub(crate) fn parse_swarm_args(args: &str) -> Result<SwarmArgs, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(SwarmArgs::Rollup);
+    }
+    let Some((count, prompt)) = args.split_once(char::is_whitespace) else {
+        return Err("Usage: /swarm <n> <prompt>".to_owned());
+    };
+    let Ok(n) = count.parse::<u32>() else {
+        return Err("Usage: /swarm <n> <prompt>".to_owned());
+    };
+    if n > SWARM_CAP {
+        return Err(format!("Swarm size is capped at {SWARM_CAP}."));
+    }
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("Usage: /swarm <n> <prompt>".to_owned());
+    }
+    Ok(SwarmArgs::Launch {
+        n,
+        prompt: prompt.to_owned(),
+    })
+}
+
 pub(crate) fn parse_cloud_args(args: &str) -> Result<CloudArgs, String> {
     let mut parts = args.split_whitespace();
     let Some(first) = parts.next() else {
@@ -134,12 +179,36 @@ pub(crate) fn classify_ampersand(raw: &str) -> Result<JobOp, String> {
     }
 }
 
+pub(crate) const SWARM_CAP: u32 = 8;
+
+/// One swarm member. A failed create stays here and is not a cloud job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SwarmMember {
+    Job(String),
+    Failed { branch: String, error: String },
+}
+
+/// The latest swarm on a session: the prompt plus each member, in create order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Swarm {
+    prompt: String,
+    members: Vec<SwarmMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SwarmArgs {
+    Rollup,
+    Launch { n: u32, prompt: String },
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct CloudJobList {
     jobs: Vec<RemoteJob>,
     focused: HashMap<String, String>,
     /// Set by `/cloud <id>`. The next `& <task>` follows that job instead of creating one.
     follow: HashMap<String, bool>,
+    swarms: HashMap<String, Swarm>,
+    swarm_seq: u32,
 }
 
 impl CloudJobList {
@@ -418,6 +487,115 @@ impl CloudJobList {
             Err(format!("{id} matches more than one cloud job."))
         }
     }
+
+    /// Create `n` cloud jobs with one prompt and distinct branches. A member that fails stays on
+    /// its rollup row. The others are not cancelled.
+    pub(crate) fn launch_swarm(
+        &mut self,
+        api_base: &str,
+        auth: &CloudAuth,
+        session_id: &str,
+        n: u32,
+        prompt: &str,
+        repo: Option<&CloudRepo>,
+        model_id: Option<&str>,
+    ) -> Result<String, String> {
+        if n > SWARM_CAP {
+            return Err(format!("Swarm size is capped at {SWARM_CAP}."));
+        }
+        let prompt = prompt.trim();
+        if prompt.is_empty() {
+            return Err("Usage: /swarm <n> <prompt>".to_owned());
+        }
+        self.follow.insert(session_id.to_owned(), false);
+        if n == 0 {
+            self.swarms.insert(
+                session_id.to_owned(),
+                Swarm {
+                    prompt: prompt.to_owned(),
+                    members: Vec::new(),
+                },
+            );
+            return Ok(self.format_swarm(session_id));
+        }
+        self.swarm_seq = self.swarm_seq.saturating_add(1);
+        let seq = self.swarm_seq;
+        let base = repo
+            .and_then(|repo| repo.starting_ref.as_deref())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("main");
+        let mut members = Vec::with_capacity(n as usize);
+        for index in 1..=n {
+            let branch = format!("{base}-swarm-{seq}-{index}");
+            match cloud::create_agent(api_base, auth, prompt, repo, model_id, &branch) {
+                Ok(agent) => {
+                    let job = self.commit(session_id, prompt, repo, &agent);
+                    members.push(SwarmMember::Job(job.id));
+                }
+                Err(error) => {
+                    members.push(SwarmMember::Failed { branch, error });
+                }
+            }
+        }
+        self.swarms.insert(
+            session_id.to_owned(),
+            Swarm {
+                prompt: prompt.to_owned(),
+                members,
+            },
+        );
+        Ok(self.format_swarm(session_id))
+    }
+
+    /// One rollup for the latest swarm on this session.
+    pub(crate) fn format_swarm(&self, session_id: &str) -> String {
+        let Some(swarm) = self.swarms.get(session_id) else {
+            return "No swarm on this session.".to_owned();
+        };
+        let mut lines = Vec::with_capacity(swarm.members.len() + 1);
+        lines.push(format!(
+            "Swarm ({}): {}",
+            swarm.members.len(),
+            one_line(&swarm.prompt)
+        ));
+        for member in &swarm.members {
+            match member {
+                SwarmMember::Failed { branch, error } => {
+                    lines.push(format!("failed  {branch}  {}", one_line(error)));
+                }
+                SwarmMember::Job(id) => {
+                    let Some(job) = self
+                        .jobs
+                        .iter()
+                        .find(|job| job.session_id == session_id && job.id == *id)
+                    else {
+                        lines.push(format!("failed  {id}  missing"));
+                        continue;
+                    };
+                    let branch = job.branch.as_deref().unwrap_or("-");
+                    let mut line = format!(
+                        "{}  {}  {branch}",
+                        swarm_status(job.run_status.as_deref()),
+                        job.id
+                    );
+                    if let Some(url) = &job.pr_url {
+                        line.push_str("  ");
+                        line.push_str(url);
+                    }
+                    lines.push(line);
+                }
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+fn swarm_status(status: Option<&str>) -> &'static str {
+    match status {
+        Some("FINISHED") => "finished",
+        Some("ERROR" | "CANCELLED" | "EXPIRED") => "failed",
+        _ => "running",
+    }
 }
 
 fn visible(job: &RemoteJob, session_id: &str, repo_url: Option<&str>) -> bool {
@@ -474,7 +652,7 @@ fn format_job(job: &RemoteJob) -> String {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
@@ -917,5 +1095,316 @@ mod tests {
             "cloud list of 20 fixture jobs took {elapsed:?}"
         );
         eprintln!("cloud list 20 fixture jobs: {elapsed:?}");
+    }
+
+    struct SwarmJoin {
+        addr: String,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for SwarmJoin {
+        fn drop(&mut self) {
+            self.stop.store(false, Ordering::Relaxed);
+            let _ = TcpStream::connect(&self.addr);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    struct SwarmFake {
+        next: u32,
+        fail_create: Option<u32>,
+        agents: HashMap<String, (String, String, bool)>,
+        log: Vec<String>,
+        bodies: Vec<String>,
+    }
+
+    fn branch_name_from_body(body: &str) -> String {
+        const KEY: &str = "\"branchName\":\"";
+        body.split(KEY)
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("swarm")
+            .to_owned()
+    }
+
+    fn handle_swarm(req: &str, state: &Mutex<SwarmFake>) -> String {
+        let mut fake = state.lock().unwrap_or_else(|err| err.into_inner());
+        let Some((method, path)) = request_line(req) else {
+            return reply("400 Bad Request", "bad request");
+        };
+        fake.log.push(format!("{method} {path}"));
+        let body = req
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or("");
+        if method == "POST" {
+            fake.bodies.push(body.to_owned());
+        }
+        let parts: Vec<&str> = path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.first().copied() != Some("v1") || parts.get(1).copied() != Some("agents") {
+            return reply("404 Not Found", "missing");
+        }
+        if parts.len() == 2 && method == "POST" {
+            fake.next += 1;
+            let n = fake.next;
+            if fake.fail_create == Some(n) {
+                return reply("500 Internal Server Error", "unavailable");
+            }
+            let id = format!("bc-{n}");
+            let branch = branch_name_from_body(body);
+            let running = n == 1;
+            fake.agents
+                .insert(id.clone(), (format!("run-{n}"), branch, running));
+            let created = format!(
+                "{{\"agent\":{{\"id\":\"{id}\",\"url\":\"https://cursor.com/agents/{id}\"}},\"run\":{{\"id\":\"run-{n}\",\"status\":\"CREATING\"}}}}"
+            );
+            return reply("200 OK", &created);
+        }
+        let Some(id) = parts.get(2).copied() else {
+            return reply("404 Not Found", "missing id");
+        };
+        let Some((run_id, branch, running)) = fake.agents.get(id).cloned() else {
+            return reply("404 Not Found", "missing agent");
+        };
+        if parts.len() == 3 && method == "GET" {
+            let body = format!(
+                "{{\"id\":\"{id}\",\"url\":\"https://cursor.com/agents/{id}\",\"latestRunId\":\"{run_id}\"}}"
+            );
+            return reply("200 OK", &body);
+        }
+        if parts.len() == 5 && method == "GET" && parts.get(3).copied() == Some("runs") {
+            let status = if running { "RUNNING" } else { "FINISHED" };
+            let pr = if running {
+                String::new()
+            } else {
+                format!(",\"prUrl\":\"https://github.com/acme/app/pull/{id}\"")
+            };
+            let result = if running {
+                String::new()
+            } else {
+                ",\"result\":\"done\"".to_owned()
+            };
+            let body = format!(
+                "{{\"id\":\"{run_id}\",\"status\":\"{status}\"{result},\"git\":{{\"branches\":[{{\"name\":{branch:?}{pr}}}]}}}}"
+            );
+            return reply("200 OK", &body);
+        }
+        reply("404 Not Found", "missing route")
+    }
+
+    fn start_swarm_fake(fail_create: Option<u32>) -> (String, Arc<Mutex<SwarmFake>>, SwarmJoin) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(SwarmFake {
+            next: 0,
+            fail_create,
+            agents: HashMap::new(),
+            log: Vec::new(),
+            bodies: Vec::new(),
+        }));
+        let stop = Arc::new(AtomicBool::new(true));
+        let stop_thread = stop.clone();
+        let state_thread = state.clone();
+        let handle = thread::spawn(move || {
+            while stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        if !stop_thread.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        let mut buf = [0_u8; 8192];
+                        let Ok(n) = sock.read(&mut buf) else {
+                            continue;
+                        };
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let response = handle_swarm(&req, &state_thread);
+                        let _ = sock.write_all(response.as_bytes());
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (
+            format!("http://{addr}"),
+            state,
+            SwarmJoin {
+                addr: addr.to_string(),
+                stop,
+                handle: Some(handle),
+            },
+        )
+    }
+
+    fn launch(list: &mut CloudJobList, api: &str, n: u32, prompt: &str) -> Result<String, String> {
+        list.launch_swarm(
+            api,
+            &CloudAuth::Basic("test-key".to_owned()),
+            "s1",
+            n,
+            prompt,
+            Some(&repo()),
+            None,
+        )
+    }
+
+    #[test]
+    fn swarm_zero_creates_no_jobs() {
+        let mut list = CloudJobList::default();
+        let rollup = launch(&mut list, "http://127.0.0.1:1", 0, "fix the docs").unwrap();
+        assert_eq!(rollup, "Swarm (0): fix the docs");
+        assert!(list.jobs.is_empty());
+        assert_eq!(list.format_swarm("s1"), rollup);
+    }
+
+    #[test]
+    fn swarm_one_member_rolls_up() {
+        let (api, state, _server) = start_swarm_fake(None);
+        let mut list = CloudJobList::default();
+        let rollup = launch(&mut list, &api, 1, "fix the docs").unwrap();
+        assert_eq!(list.jobs.len(), 1);
+        let job = &list.jobs[0];
+        assert_eq!(job.prompt, "fix the docs");
+        assert_eq!(job.branch.as_deref(), Some("feature-swarm-1-1"));
+        assert_eq!(job.run_status.as_deref(), Some("RUNNING"));
+        assert!(job.pr_url.is_none());
+        assert!(rollup.contains("running"), "{rollup}");
+        assert!(rollup.contains("bc-1"), "{rollup}");
+        assert!(rollup.contains("feature-swarm-1-1"), "{rollup}");
+        assert!(!rollup.contains("https://"), "{rollup}");
+        assert_eq!(list.format_swarm("s1"), rollup);
+        let fake = state.lock().unwrap_or_else(|err| err.into_inner());
+        assert_eq!(
+            fake.log
+                .iter()
+                .filter(|line| line.as_str() == "POST /v1/agents")
+                .count(),
+            1,
+            "{:?}",
+            fake.log
+        );
+        assert!(
+            fake.bodies
+                .iter()
+                .any(|body| body.contains("fix the docs") && body.contains("feature-swarm-1-1")),
+            "{:?}",
+            fake.bodies
+        );
+        assert!(
+            !fake.log.iter().any(|line| line.contains("cancel")),
+            "{:?}",
+            fake.log
+        );
+    }
+
+    #[test]
+    fn swarm_eight_members_under_100ms() {
+        let (api, state, _server) = start_swarm_fake(None);
+        let mut list = CloudJobList::default();
+        let started = std::time::Instant::now();
+        let rollup = launch(&mut list, &api, 8, "fix the docs").unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(list.jobs.len(), 8, "{rollup}");
+        let branches: std::collections::HashSet<_> = list
+            .jobs
+            .iter()
+            .filter_map(|job| job.branch.clone())
+            .collect();
+        assert_eq!(branches.len(), 8, "{branches:?}");
+        assert!(list.jobs.iter().all(|job| job.prompt == "fix the docs"));
+        let rows = rollup.lines().skip(1).count();
+        assert_eq!(rows, 8, "{rollup}");
+        assert!(rollup.contains("running"), "{rollup}");
+        assert!(rollup.contains("finished"), "{rollup}");
+        assert!(
+            rollup.contains("https://github.com/acme/app/pull/"),
+            "{rollup}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "swarm of 8 mocked members took {elapsed:?}"
+        );
+        eprintln!("swarm 8 members: {elapsed:?}");
+        let fake = state.lock().unwrap_or_else(|err| err.into_inner());
+        assert_eq!(fake.bodies.len(), 8, "{:?}", fake.log);
+        assert!(
+            fake.bodies.iter().all(|body| body.contains("fix the docs")),
+            "{:?}",
+            fake.bodies
+        );
+    }
+
+    #[test]
+    fn swarm_nine_is_rejected() {
+        let mut list = CloudJobList::default();
+        let err = launch(&mut list, "http://127.0.0.1:1", 9, "fix the docs").unwrap_err();
+        assert!(err.contains("capped at 8"), "{err}");
+        assert!(list.jobs.is_empty());
+        assert!(list.swarms.is_empty());
+        assert!(parse_swarm_args("9 fix the docs").is_err());
+    }
+
+    #[test]
+    fn swarm_member_http_500_stays_on_that_row() {
+        let (api, state, _server) = start_swarm_fake(Some(2));
+        let mut list = CloudJobList::default();
+        let rollup = launch(&mut list, &api, 3, "fix the docs").unwrap();
+        assert_eq!(list.jobs.len(), 2, "{rollup}");
+        assert!(list.jobs.iter().all(|job| job.prompt == "fix the docs"));
+        assert!(
+            list.jobs
+                .iter()
+                .all(|job| job.run_status.as_deref() != Some("CANCELLED")),
+            "{rollup}"
+        );
+        let lines: Vec<_> = rollup.lines().skip(1).collect();
+        assert_eq!(lines.len(), 3, "{rollup}");
+        let failed: Vec<_> = lines
+            .iter()
+            .copied()
+            .filter(|line| line.starts_with("failed"))
+            .collect();
+        assert_eq!(failed.len(), 1, "{rollup}");
+        assert!(failed[0].contains("500"), "{rollup}");
+        assert!(failed[0].contains("feature-swarm-1-2"), "{rollup}");
+        assert!(
+            lines
+                .iter()
+                .filter(|line| !line.starts_with("failed"))
+                .all(|line| !line.contains("500")),
+            "{rollup}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("running")),
+            "{rollup}"
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("finished")
+                && line.contains("https://github.com/acme/app/pull/")),
+            "{rollup}"
+        );
+        let fake = state.lock().unwrap_or_else(|err| err.into_inner());
+        assert_eq!(
+            fake.log
+                .iter()
+                .filter(|line| line.as_str() == "POST /v1/agents")
+                .count(),
+            3,
+            "{:?}",
+            fake.log
+        );
+        assert!(
+            !fake.log.iter().any(|line| line.contains("cancel")),
+            "{:?}",
+            fake.log
+        );
     }
 }
