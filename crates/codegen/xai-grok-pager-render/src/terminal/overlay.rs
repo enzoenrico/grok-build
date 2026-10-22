@@ -203,6 +203,27 @@ pub fn static_image(
     )
 }
 
+/// Place an image with the prompt-preview protocol, which includes iTerm2.
+/// The bytes are the Kitty or iTerm2 payload. `None` when neither protocol is available.
+pub fn composer_gutter_image(
+    image_data: &[u8],
+    cols: u16,
+    rows: u16,
+    cell_x: u16,
+    cell_y: u16,
+    owner_id: u64,
+) -> Option<Escapes> {
+    static_image_for_protocol(
+        prompt_preview_graphics_protocol(),
+        image_data,
+        cols,
+        rows,
+        cell_x,
+        cell_y,
+        owner_id,
+    )
+}
+
 pub fn volatile_image(
     image_data: &[u8],
     cols: u16,

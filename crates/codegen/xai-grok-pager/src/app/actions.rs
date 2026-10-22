@@ -690,6 +690,9 @@ pub enum Action {
     /// Commit a read-only list of background tasks, subagents, and scheduled tasks as a system block (`/tasks`).
     /// This is what minimal mode uses in place of the `TasksPane`.
     ShowTasks,
+    /// `/bot`: list, route, create, or clear the Grok bot for this session.
+    /// The string is the argument text after `/bot`.
+    BotCommand(String),
     /// Show the current plan: preview popover if exists, toast if not.
     ShowPlan,
     /// Enter plan mode. If a description is provided, also start a turn with that text as the prompt.
@@ -2279,6 +2282,12 @@ pub enum Effect {
         target: DoctorFixTarget,
         plan: Box<crate::diagnostics::FixPlan>,
     },
+    /// List, route, or prompt a Grok bot on the computer hub. The session snapshot is the route before the call.
+    BotSubmit {
+        agent_id: AgentId,
+        input: crate::bot::BotInput,
+        session: crate::bot::BotSession,
+    },
 }
 /// Wire params for `x.ai/session/rename`.
 /// Shared with the effect executor so dispatch tests can pin the exact camelCase payload.
@@ -3262,6 +3271,12 @@ pub enum TaskResult {
     DoctorFixApplied {
         target: DoctorFixTarget,
         result: Result<crate::diagnostics::FixOutcome, String>,
+    },
+    /// A `/bot` command or a routed plain prompt finished talking to the hub.
+    BotSubmit {
+        agent_id: AgentId,
+        session: crate::bot::BotSession,
+        outcome: crate::bot::SubmitOutcome,
     },
 }
 #[cfg(test)]

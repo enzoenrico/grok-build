@@ -1123,6 +1123,7 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ManageBilling => dispatch_manage_billing(app),
         Action::ShowQueue => dispatch_show_queue(app),
         Action::ShowTasks => dispatch_show_tasks(app),
+        Action::BotCommand(args) => dispatch_bot_command(app, args),
         Action::ShowPlan => dispatch_show_plan(app),
         Action::EnterPlanMode { description } => dispatch_enter_plan_mode(app, description),
         Action::SetPlanMode(kind) => set_plan_mode(app, kind),
@@ -1833,4 +1834,18 @@ pub(super) fn dispatch_action_result(
             }
         },
     }
+}
+
+fn dispatch_bot_command(app: &mut AppView, args: String) -> Vec<Effect> {
+    let ActiveView::Agent(agent_id) = app.active_view else {
+        return vec![];
+    };
+    let Some(session) = app.agents.get(&agent_id).map(|agent| agent.bot.clone()) else {
+        return vec![];
+    };
+    vec![Effect::BotSubmit {
+        agent_id,
+        input: crate::bot::BotInput::Command(args),
+        session,
+    }]
 }

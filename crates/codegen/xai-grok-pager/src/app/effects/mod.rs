@@ -5143,6 +5143,20 @@ pub(crate) fn execute(
                     }
                 });
         }
+        Effect::BotSubmit {
+            agent_id,
+            input,
+            session,
+        } => {
+            tasks.spawn(async move {
+                let run = crate::bot::run_with_hub(session, input).await;
+                TaskResult::BotSubmit {
+                    agent_id,
+                    session: run.session,
+                    outcome: run.outcome,
+                }
+            });
+        }
         Effect::FetchPromptSuggestion { agent_id, generation, model, session_id } => {
             let tx = acp_tx.clone();
             tasks

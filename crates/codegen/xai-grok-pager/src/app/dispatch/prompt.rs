@@ -739,6 +739,30 @@ pub(super) fn dispatch_send_prompt_submission(
         return prelude;
     };
 
+    // A routed session sends plain text to the Grok bot. Slash commands, including `/bot`, stay on the CLI.
+    if !literal
+        && !text.trim().starts_with('/')
+        && !crate::slash::commands::exit::is_exit_alias(text.trim())
+        && agent.bot.is_routed()
+    {
+        let session = agent.bot.clone();
+        if consume_input {
+            agent.record_prompt_in_history(text.trim());
+            push_and_page_flip(
+                &mut agent.scrollback,
+                RenderBlock::user_prompt(text.clone()),
+            );
+            agent.prompt.set_text("");
+        }
+        let mut effects = prelude;
+        effects.push(Effect::BotSubmit {
+            agent_id: id,
+            input: crate::bot::BotInput::Plain(text),
+            session,
+        });
+        return effects;
+    }
+
     // Paste-then-immediate-send: an image probe from a just-pasted Cmd+V is still off-thread
     // Stash this send and re-issue it once the probe completes so the image is never dropped from the built content blocks
     // Scoped to `consume_input` sends: only those clear the draft, so only they can drop a not-yet-attached image

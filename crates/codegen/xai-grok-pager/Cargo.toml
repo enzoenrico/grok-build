@@ -121,6 +121,11 @@ xai-grok-shell = { path = "../xai-grok-shell", default-features = false }
 # from upstream of the crate that fills it in.
 xai-grok-status-line = { workspace = true }
 xai-grok-workspace = { workspace = true }
+xai-computer-hub-sdk = { workspace = true }
+xai-tool-protocol = { workspace = true }
+xai-tool-runtime = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
 # Foreign coding-agent session discovery.
 xai-grok-foreign-sessions = { workspace = true }
 xai-token-estimation = { workspace = true }

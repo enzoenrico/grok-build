@@ -2,6 +2,7 @@
 pub mod always_approve;
 pub mod announcements;
 pub mod auto;
+pub mod bot;
 pub mod btw;
 pub mod cd;
 pub mod compact;
@@ -121,6 +122,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(find::FindCommand),
         Arc::new(usage::UsageCommand),
         Arc::new(tasks::TasksCommand),
+        Arc::new(bot::BotCommand),
         // Extending the agent.
         Arc::new(plugin::SkillsCommand),
         Arc::new(mcps::McpsCommand),

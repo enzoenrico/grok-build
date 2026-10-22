@@ -696,6 +696,9 @@ pub struct PromptWidget {
     /// One-shot: the last `handle_key` accepted an @-file completion, which can shrink a long `@query` into a short ref/chip.
     /// That big shrink is NOT a user wipe, so the clear detector must skip observing it (it resyncs on the next genuine edit).
     completion_accepted: bool,
+    /// When set, the left gutter of the input box is reserved for the bot image.
+    /// Terminals without an image protocol leave that gutter unused and draw no stand-in.
+    bot_icon: bool,
 }
 
 /// Prefix display width (`"❯ "` or `"> "`, both 2 columns).
@@ -745,6 +748,7 @@ impl PromptWidget {
             undo_tip_fire: false,
             plan_nudge_fire: false,
             completion_accepted: false,
+            bot_icon: false,
         };
         // Same fail-closed gate as AgentView: /dashboard is hidden in
         // CommandRegistry::new until dashboard_enabled() reveals it.
@@ -1121,6 +1125,11 @@ impl PromptWidget {
     /// No re-chip happens here: callers that restore an in-flight prompt follow with
     /// `restore_chip_elements` and `set_images`, and a re-chip first would bind a stale undo-stash
     /// record ahead of the restored one.
+    /// Show or hide the bot image in the composer gutter. The text is unchanged.
+    pub fn set_bot_icon(&mut self, on: bool) {
+        self.bot_icon = on;
+    }
+
     pub fn set_text(&mut self, text: &str) {
         self.post_insert_image_preview = None;
         self.hovered_image_element_id = None;
@@ -3090,8 +3099,19 @@ impl PromptWidget {
         }
 
         // Render prefix on first text row: search icon when history search is active, else ❯.
+        // A routed bot reserves a gutter for a real image. No protocol means no gutter and no glyph.
+        let preview_protocol = crate::terminal::image::prompt_preview_graphics_protocol();
+        let gutter_w = if self.bot_icon
+            && preview_protocol.supports_images()
+            && text_area_rect.width > PREFIX_WIDTH + crate::bot::GUTTER_COLS + 8
+        {
+            crate::bot::GUTTER_COLS
+        } else {
+            0
+        };
+        let gutter_origin = (text_area_rect.x, text_area_rect.y);
         let prefix_w = if style.show_prefix { PREFIX_WIDTH } else { 0 };
-        if style.show_prefix && text_area_rect.width > PREFIX_WIDTH {
+        if style.show_prefix && text_area_rect.width > gutter_w + PREFIX_WIDTH {
             let (prefix_str, accent_color) =
                 if self.history_search.is_active() && !self.history_search.is_browse() {
                     // Search-mode indicator, the highest prefix priority
@@ -3104,7 +3124,7 @@ impl PromptWidget {
                     (crate::glyphs::prompt_arrow(), style.accent_color(&theme))
                 };
             buf.set_string(
-                text_area_rect.x,
+                text_area_rect.x + gutter_w,
                 text_area_rect.y,
                 prefix_str,
                 Style::default().fg(accent_color).bg(bg),
@@ -3113,9 +3133,11 @@ impl PromptWidget {
 
         // TextArea content
         let ta_area = Rect {
-            x: text_area_rect.x + prefix_w,
+            x: text_area_rect.x + gutter_w + prefix_w,
             y: text_area_rect.y,
-            width: text_area_rect.width.saturating_sub(prefix_w),
+            width: text_area_rect
+                .width
+                .saturating_sub(gutter_w + prefix_w),
             height: text_area_rect.height,
         };
         self.textarea_area = ta_area;
@@ -3489,6 +3511,11 @@ impl PromptWidget {
                 theme.paste_fg,
                 theme.paste_dim,
             );
+        }
+
+        // The bot image uses the same placement as the preview, so a preview wins this frame.
+        if post_flush_escapes.is_none() && gutter_w > 0 {
+            post_flush_escapes = crate::bot::composer_escapes(gutter_origin.0, gutter_origin.1);
         }
 
         // Clear ID 1 whenever this frame did not replace it.
