@@ -5,6 +5,7 @@ pub mod auto;
 pub mod bot;
 pub mod btw;
 pub mod cd;
+pub mod cloud;
 pub mod compact;
 pub mod compact_mode;
 pub mod config_agents;
@@ -123,6 +124,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(usage::UsageCommand),
         Arc::new(tasks::TasksCommand),
         Arc::new(bot::BotCommand),
+        Arc::new(cloud::CloudCommand),
         // Extending the agent.
         Arc::new(plugin::SkillsCommand),
         Arc::new(mcps::McpsCommand),
