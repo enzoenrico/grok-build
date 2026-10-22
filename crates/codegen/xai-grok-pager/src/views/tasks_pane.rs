@@ -7,6 +7,7 @@ use super::list_pane::{
     ListItem, ListPane, ListPaneConfig, ListPaneState, ListPaneStyle, WrapMode,
 };
 use super::overlay::OverlayState;
+use crate::acp::cursor::cloud_jobs::CloudTaskRow;
 use crate::app::agent::{BgTaskState, BgTaskStatus, ScheduledTaskInfo};
 use crate::app::subagent::{SubagentInfo, format_context_badge, format_subagent_label};
 use crate::appearance::LayoutConfig;
@@ -135,8 +136,10 @@ pub enum GroupKind {
     /// Recurring background processes: `monitor` tasks and `/loop` scheduled tasks share one section.
     /// They stay contiguous (monitors first, then loops) via [`TaskEntry::type_order`].
     Watchers,
+    /// Cursor cloud jobs from the pager-owned list (`/cloud` reads the same rows).
+    Cloud,
 }
-const GROUP_KIND_COUNT: usize = 4;
+const GROUP_KIND_COUNT: usize = 5;
 impl GroupKind {
     /// Display label shown in the group header.
     fn label(self) -> &'static str {
@@ -145,6 +148,7 @@ impl GroupKind {
             GroupKind::Subagents => "Subagents",
             GroupKind::Tasks => "Tasks",
             GroupKind::Watchers => "Watchers",
+            GroupKind::Cloud => "Cloud",
         }
     }
     fn order(self) -> u8 {
@@ -153,6 +157,7 @@ impl GroupKind {
             GroupKind::Subagents => 1,
             GroupKind::Tasks => 2,
             GroupKind::Watchers => 3,
+            GroupKind::Cloud => 4,
         }
     }
 }
@@ -202,6 +207,12 @@ pub enum TaskEntry {
     Header {
         group: GroupKind,
         styled: Line<'static>,
+    },
+    Cloud {
+        id: u64,
+        label: String,
+        styled: Line<'static>,
+        running: bool,
     },
 }
 impl TaskEntry {
@@ -486,6 +497,27 @@ impl TaskEntry {
         ]);
         TaskEntry::Header { group, styled }
     }
+    fn from_cloud(row: &CloudTaskRow) -> Self {
+        let theme = Theme::current();
+        let desc_style = if row.running {
+            Style::default().fg(theme.text_primary)
+        } else {
+            Style::default().fg(theme.gray_bright)
+        };
+        let styled = Line::from(vec![
+            Span::styled("Cloud ", Style::default().fg(theme.accent_system)),
+            Span::styled(row.label.clone(), desc_style),
+        ]);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        "cloud:".hash(&mut hasher);
+        row.id.hash(&mut hasher);
+        TaskEntry::Cloud {
+            id: hasher.finish(),
+            label: format!("Cloud {}", row.label),
+            styled,
+            running: row.running,
+        }
+    }
     /// Which collapsible group this entry belongs to.
     fn group_kind(&self) -> GroupKind {
         match self {
@@ -498,6 +530,7 @@ impl TaskEntry {
             } => GroupKind::Watchers,
             TaskEntry::Scheduled { .. } => GroupKind::Watchers,
             TaskEntry::Workflow { .. } => GroupKind::Workflows,
+            TaskEntry::Cloud { .. } => GroupKind::Cloud,
             TaskEntry::Header { group, .. } => *group,
         }
     }
@@ -505,7 +538,8 @@ impl TaskEntry {
         match self {
             TaskEntry::BgTask { running, .. }
             | TaskEntry::Agent { running, .. }
-            | TaskEntry::Workflow { running, .. } => *running,
+            | TaskEntry::Workflow { running, .. }
+            | TaskEntry::Cloud { running, .. } => *running,
             TaskEntry::Scheduled { .. } => true,
             TaskEntry::Header { .. } => false,
         }
@@ -524,6 +558,7 @@ impl TaskEntry {
                 is_monitor: true, ..
             } => 3,
             TaskEntry::Scheduled { .. } => 4,
+            TaskEntry::Cloud { .. } => 5,
             TaskEntry::Header { group, .. } => group.order(),
         }
     }
@@ -535,6 +570,7 @@ impl ListItem for TaskEntry {
             | TaskEntry::Agent { styled, .. }
             | TaskEntry::Scheduled { styled, .. }
             | TaskEntry::Workflow { styled, .. }
+            | TaskEntry::Cloud { styled, .. }
             | TaskEntry::Header { styled, .. } => styled,
         }
     }
@@ -549,7 +585,8 @@ impl ListItem for TaskEntry {
             TaskEntry::BgTask { id, .. }
             | TaskEntry::Agent { id, .. }
             | TaskEntry::Scheduled { id, .. }
-            | TaskEntry::Workflow { id, .. } => *id,
+            | TaskEntry::Workflow { id, .. }
+            | TaskEntry::Cloud { id, .. } => *id,
             TaskEntry::Header { group, .. } => {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 "header:".hash(&mut hasher);
@@ -566,7 +603,8 @@ impl ListItem for TaskEntry {
             TaskEntry::BgTask { label, .. }
             | TaskEntry::Agent { label, .. }
             | TaskEntry::Scheduled { label, .. }
-            | TaskEntry::Workflow { label, .. } => label,
+            | TaskEntry::Workflow { label, .. }
+            | TaskEntry::Cloud { label, .. } => label,
             TaskEntry::Header { group, .. } => group.label(),
         }
     }
@@ -609,6 +647,8 @@ pub struct TasksPane {
     highlight_cache: HashMap<String, Vec<Span<'static>>>,
     last_theme: ThemeKind,
     workflow_runs: Vec<crate::views::workflows::WorkflowRunSnapshot>,
+    /// Cursor cloud jobs. [`Self::sync`] keeps whatever [`Self::sync_with_cloud`] last stored.
+    cloud_rows: Vec<CloudTaskRow>,
 }
 impl Default for TasksPane {
     fn default() -> Self {
@@ -693,7 +733,20 @@ impl TasksPane {
             highlight_cache: HashMap::new(),
             last_theme: Theme::current_kind(),
             workflow_runs: Vec::new(),
+            cloud_rows: Vec::new(),
         }
+    }
+    /// Same as [`Self::sync`], replacing the Cloud group with `cloud` from the pager job list.
+    pub(crate) fn sync_with_cloud(
+        &mut self,
+        bg_tasks: &std::collections::BTreeMap<String, BgTaskState>,
+        subagents: &HashMap<String, SubagentInfo>,
+        scheduled: &HashMap<String, ScheduledTaskInfo>,
+        workflow_runs: &[crate::views::workflows::WorkflowRunSnapshot],
+        cloud: &[CloudTaskRow],
+    ) {
+        self.cloud_rows = cloud.to_vec();
+        self.sync(bg_tasks, subagents, scheduled, workflow_runs);
     }
     pub fn sync(
         &mut self,
@@ -743,6 +796,9 @@ impl TasksPane {
                 self.items.push(TaskEntry::from_workflow_run(run));
             }
         }
+        for row in &self.cloud_rows {
+            self.items.push(TaskEntry::from_cloud(row));
+        }
         self.items.sort_by(|a, b| {
             a.type_order()
                 .cmp(&b.type_order())
@@ -787,7 +843,8 @@ impl TasksPane {
                 .retain(|g| present.get(g.order() as usize).copied().unwrap_or(false));
         }
         self.rebuild_entries();
-        let counts = Self::status_counts_from(bg_tasks, subagents, scheduled, workflow_runs);
+        let mut counts = Self::status_counts_from(bg_tasks, subagents, scheduled, workflow_runs);
+        counts.running += self.cloud_rows.iter().filter(|row| row.running).count();
         let running_count = counts.running.saturating_sub(
             bg_tasks
                 .values()
@@ -879,7 +936,9 @@ impl TasksPane {
         scheduled: &HashMap<String, ScheduledTaskInfo>,
         workflow_runs: &[crate::views::workflows::WorkflowRunSnapshot],
     ) -> TaskStatusCounts {
-        Self::status_counts_from(bg_tasks, subagents, scheduled, workflow_runs)
+        let mut counts = Self::status_counts_from(bg_tasks, subagents, scheduled, workflow_runs);
+        counts.running += self.cloud_rows.iter().filter(|row| row.running).count();
+        counts
     }
     fn status_counts_from(
         bg_tasks: &std::collections::BTreeMap<String, BgTaskState>,
@@ -1134,7 +1193,7 @@ impl TasksPane {
                         ..
                     } => OverlayEntryData::Scheduled(task_id.clone(), linked_subagent.clone()),
                     TaskEntry::Workflow { name, .. } => OverlayEntryData::Workflow(name.clone()),
-                    TaskEntry::Header { .. } => return None,
+                    TaskEntry::Cloud { .. } | TaskEntry::Header { .. } => return None,
                 };
                 Some((y, data))
             })
@@ -1879,6 +1938,42 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+    #[test]
+    fn cloud_group_reads_the_job_list() {
+        let mut pane = TasksPane::new();
+        let rows = vec![
+            CloudTaskRow {
+                id: "bc-1".to_owned(),
+                label: "bc-1  FINISHED  feature  Refactored auth.".to_owned(),
+                running: false,
+            },
+            CloudTaskRow {
+                id: "bc-2".to_owned(),
+                label: "bc-2  RUNNING  feature  write the docs".to_owned(),
+                running: true,
+            },
+        ];
+        pane.sync_with_cloud(
+            &std::collections::BTreeMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            &rows,
+        );
+        assert!(pane.entries.iter().any(|entry| matches!(
+            entry,
+            TaskEntry::Header {
+                group: GroupKind::Cloud,
+                ..
+            }
+        )));
+        let lines = render_pane_to_strings(&mut pane, &std::collections::BTreeMap::new(), 100, 8);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Cloud"), "{joined}");
+        assert!(joined.contains("bc-1"), "{joined}");
+        assert!(joined.contains("bc-2"), "{joined}");
+        assert!(joined.contains("RUNNING"), "{joined}");
     }
     #[test]
     fn render_shows_line_count_badge_for_bg_task_with_stdout() {

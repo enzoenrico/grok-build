@@ -7,6 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use super::cloud_jobs::{self, CloudJobList, JobOp};
 
 use serde_json::{Map, Value, json};
 use xai_grok_shell::sampling::types::{
@@ -109,6 +112,8 @@ pub(crate) struct CursorAdapter {
     session_lists: HashMap<String, SessionListRequest>,
     /// The resolved Cursor CLI, for catalog methods answered with `agent` subcommands.
     cursor_program: Option<PathBuf>,
+    /// Cloud jobs for this adapter. The live cursor thread replaces this with the pager's shared list.
+    jobs: Arc<Mutex<CloudJobList>>,
 }
 
 #[derive(Debug)]
@@ -123,7 +128,6 @@ struct CursorSession {
     skills: HashSet<String>,
     /// Cursor's latest `availableCommands`, normalized and before disabled skills are hidden.
     commands: Vec<Value>,
-    cloud_agent_id: Option<String>,
     cwd: Option<String>,
     model: Option<String>,
 }
@@ -276,10 +280,6 @@ impl CursorAdapter {
                     .and_then(|id| self.sessions.get(id))
                     .map(|session| session.skills.clone())
                     .unwrap_or_default();
-                let cloud_agent_id = session_id
-                    .as_deref()
-                    .and_then(|id| self.sessions.get(id))
-                    .and_then(|session| session.cloud_agent_id.clone());
                 let record = self.prompt_record(session_id.as_deref(), &msg);
                 let mut cloud_handoff = false;
                 let mut cloud_task = None;
@@ -312,19 +312,17 @@ impl CursorAdapter {
                         return end.into_iter().map(Routed::ToClient).collect();
                     };
                     let request = cloud_request(cloud_task);
-                    if matches!(request, CloudRequest::Refresh | CloudRequest::Cancel)
-                        && cloud_agent_id.is_none()
-                    {
-                        let mut out = vec![Routed::ToClient(
-                            protocol::agent_notice(
-                                &session_id,
-                                "No cloud agent on this session yet. Send & and a task to start one.\n",
-                            )
-                            .to_string(),
-                        )];
-                        out.extend(end.map(Routed::ToClient));
-                        return out;
-                    }
+                    let agent_id = match self.jobs().prepare(&session_id, &job_op(&request)) {
+                        Ok(agent_id) => agent_id,
+                        Err(message) => {
+                            let mut out = vec![Routed::ToClient(
+                                protocol::agent_notice(&session_id, &format!("{message}\n"))
+                                    .to_string(),
+                            )];
+                            out.extend(end.map(Routed::ToClient));
+                            return out;
+                        }
+                    };
                     let model = self
                         .sessions
                         .get(&session_id)
@@ -333,9 +331,9 @@ impl CursorAdapter {
                     let cloud = Routed::Cloud {
                         session_id: session_id.clone(),
                         request,
-                        repo: self.cloud_repo(cloud_agent_id.as_deref(), &session_id),
+                        repo: self.cloud_repo(agent_id.as_deref(), &session_id),
                         model,
-                        agent_id: cloud_agent_id,
+                        agent_id,
                         prompt_rpc_id: id,
                         prompt_id,
                     };
@@ -493,10 +491,7 @@ impl CursorAdapter {
                             .or_insert(Value::String(prompt_id));
                     }
                     if cloud_handoff && let Some(agent_id) = protocol::cloud_agent_id(result) {
-                        self.sessions
-                            .entry(session_id.clone())
-                            .or_default()
-                            .cloud_agent_id = Some(agent_id.clone());
+                        self.jobs().note_id(&session_id, &agent_id);
                         out.push(Routed::ToClient(
                             protocol::cloud_status_update(&session_id, &agent_id).to_string(),
                         ));
@@ -664,11 +659,36 @@ impl CursorAdapter {
         None
     }
 
+    fn jobs(&self) -> std::sync::MutexGuard<'_, CloudJobList> {
+        self.jobs.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Record a cloud agent id without arming a follow-up. The next `& <task>` still creates a job.
     pub(crate) fn note_cloud_agent(&mut self, session_id: &str, agent_id: &str) {
-        self.sessions
-            .entry(session_id.to_owned())
-            .or_default()
-            .cloud_agent_id = Some(agent_id.to_owned());
+        self.jobs().note_id(session_id, agent_id);
+    }
+
+    pub(crate) fn note_cloud_job(
+        &mut self,
+        session_id: &str,
+        agent: &super::cloud::CloudAgent,
+        prompt: &str,
+        repo: Option<&super::cloud::CloudRepo>,
+    ) {
+        self.jobs().commit(session_id, prompt, repo, agent);
+    }
+
+    /// `/cloud <id>`: the next `& <task>` follows this job.
+    pub(crate) fn focus_cloud_job(
+        &mut self,
+        session_id: &str,
+        agent_id: &str,
+    ) -> Result<(), String> {
+        self.jobs().focus(session_id, agent_id).map(|_| ())
+    }
+
+    pub(crate) fn use_shared_jobs(&mut self) {
+        self.jobs = cloud_jobs::process();
     }
 
     fn cloud_repo(
@@ -1296,6 +1316,14 @@ fn is_grok_extension(method: &str) -> bool {
         .strip_prefix('_')
         .unwrap_or(method)
         .starts_with("x.ai/")
+}
+
+fn job_op(request: &CloudRequest) -> JobOp {
+    match request {
+        CloudRequest::Send(task) => JobOp::Send(task.clone()),
+        CloudRequest::Refresh => JobOp::Refresh,
+        CloudRequest::Cancel => JobOp::Cancel,
+    }
 }
 
 fn cloud_request(task: Option<String>) -> CloudRequest {

@@ -1,6 +1,8 @@
 //! Cursor Cloud Agents HTTP API. ACP `session/prompt` does not create a cloud agent.
-//! A message that starts with `&` and a task is sent here. `&` and `& status` only read the latest run.
-//! `& cancel` stops that run. A run that is still going is followed on its event stream.
+//! A message that starts with `&` and a task is sent here. The pager owns the job list, so one
+//! session can have many runs. `& <task>` starts another job, or follows the job `/cloud <id>` focused.
+//! `&` and `& status` read that focused job. `& cancel` stops it. A run that is still going is followed
+//! on its event stream.
 //!
 //! Auth matches `agent login`. `CURSOR_AUTH_TOKEN` is sent as Bearer, then `CURSOR_API_KEY` as Basic,
 //! then the access token `agent login` stores.
@@ -21,6 +23,7 @@ pub(crate) struct CloudAgent {
     pub run_id: Option<String>,
     pub run_status: Option<String>,
     pub result: Option<String>,
+    pub branch: Option<String>,
     pub pr_url: Option<String>,
 }
 
@@ -84,7 +87,7 @@ pub(crate) struct StoredLogin {
     api_key: Option<String>,
 }
 
-const LOGIN_REQUIRED: &str =
+pub(crate) const LOGIN_REQUIRED: &str =
     "Run `agent login`, or set CURSOR_API_KEY, to send this to a Cursor cloud agent.";
 
 pub(crate) fn resolve_cloud_auth() -> Result<CloudAuth, String> {
@@ -439,29 +442,44 @@ pub(crate) fn parse_cloud_response(body: &str) -> Result<CloudAgent, String> {
         .pointer("/run/result")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let (branch, pr_url) = git_fields(&value);
     Ok(CloudAgent {
         id,
         url,
         run_id,
         run_status,
         result,
-        pr_url: pr_url(&value),
+        branch,
+        pr_url,
     })
 }
 
 fn pr_url(value: &Value) -> Option<String> {
+    git_fields(value).1
+}
+
+/// Branch name and pull request URL from a cloud agent or run payload.
+fn git_fields(value: &Value) -> (Option<String>, Option<String>) {
     for pointer in ["/run/git/branches", "/git/branches"] {
         let Some(branches) = value.pointer(pointer).and_then(Value::as_array) else {
             continue;
         };
-        if let Some(url) = branches
+        let branch = branches.iter().find_map(|entry| {
+            entry
+                .get("branchName")
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("name").and_then(Value::as_str))
+                .map(str::to_owned)
+        });
+        let pr = branches
             .iter()
-            .find_map(|branch| branch.get("prUrl").and_then(Value::as_str))
-        {
-            return Some(url.to_owned());
+            .find_map(|entry| entry.get("prUrl").and_then(Value::as_str))
+            .map(str::to_owned);
+        if branch.is_some() || pr.is_some() {
+            return (branch, pr);
         }
     }
-    None
+    (None, None)
 }
 
 fn refresh(api_base: &str, auth: &CloudAuth, agent: &mut CloudAgent) -> Result<(), String> {
@@ -501,8 +519,12 @@ fn refresh(api_base: &str, auth: &CloudAuth, agent: &mut CloudAgent) -> Result<(
         .and_then(Value::as_str)
         .map(str::to_owned)
         .or(agent.result.take());
+    let (branch, pr) = git_fields(&run);
+    if agent.branch.is_none() {
+        agent.branch = branch;
+    }
     if agent.pr_url.is_none() {
-        agent.pr_url = pr_url(&run);
+        agent.pr_url = pr;
     }
     Ok(())
 }
@@ -518,6 +540,7 @@ pub(crate) fn refresh_existing(
         run_id: None,
         run_status: None,
         result: None,
+        branch: None,
         pr_url: None,
     };
     refresh(api_base, auth, &mut agent)?;
