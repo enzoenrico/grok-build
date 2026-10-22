@@ -1018,7 +1018,7 @@ impl AgentView {
                     self.open_workflow_detail(&name);
                     return InputOutcome::Changed;
                 }
-                Some(TaskEntry::Header { .. }) => {}
+                Some(TaskEntry::Cloud { .. }) | Some(TaskEntry::Header { .. }) => {}
                 None => {}
             }
         }
@@ -1057,7 +1057,7 @@ impl AgentView {
                         ));
                     }
                 }
-                Some(TaskEntry::Header { .. }) => {}
+                Some(TaskEntry::Cloud { .. }) | Some(TaskEntry::Header { .. }) => {}
                 None => {}
             }
         }

@@ -6,6 +6,7 @@
 mod adapter;
 mod catalog;
 mod cloud;
+pub(crate) mod cloud_jobs;
 mod mcp;
 pub(crate) mod protocol;
 mod startup;
@@ -93,6 +94,14 @@ fn watch_cloud_run(
         let result = (|| {
             let auth = cloud::resolve_cloud_auth()?;
             cloud::follow_run(&base, &auth, &agent_id, &run_id, |event| {
+                if let cloud::CloudEvent::Result {
+                    status,
+                    text,
+                    pr_url,
+                } = &event
+                {
+                    cloud_jobs::note_stream_result(&agent_id, status, text, pr_url.as_deref());
+                }
                 let text = cloud::event_text(&event, saw_assistant);
                 if matches!(event, cloud::CloudEvent::Assistant(_)) {
                     saw_assistant = true;
@@ -368,10 +377,11 @@ impl CursorIo {
         let mut stdin = child.stdin.take().context("cursor-agent stdin")?;
         let stdout = child.stdout.take().context("cursor-agent stdout")?;
         let stderr = child.stderr.take().context("cursor-agent stderr")?;
-        let adapter = Arc::new(Mutex::new(
+        let mut cursor_adapter =
             CursorAdapter::new(command.default_model.clone(), command.forward_mcp_servers)
-                .with_cursor_program(resolve_cursor_program(&command.program)),
-        ));
+                .with_cursor_program(resolve_cursor_program(&command.program));
+        cursor_adapter.use_shared_jobs();
+        let adapter = Arc::new(Mutex::new(cursor_adapter));
         let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<String>();
 
         let deliver = {
@@ -414,6 +424,10 @@ impl CursorIo {
                             prompt_rpc_id,
                             prompt_id,
                         } => {
+                            let prompt = match &request {
+                                CloudRequest::Send(text) => text.clone(),
+                                CloudRequest::Refresh | CloudRequest::Cancel => String::new(),
+                            };
                             let (notice, recorded) = cloud_handoff_notice(
                                 &session_id,
                                 &request,
@@ -425,7 +439,7 @@ impl CursorIo {
                                 adapter
                                     .lock()
                                     .unwrap_or_else(|p| p.into_inner())
-                                    .note_cloud_agent(&session_id, &agent.id);
+                                    .note_cloud_job(&session_id, agent, &prompt, repo.as_ref());
                                 if !cloud::run_is_terminal(agent.run_status.as_deref())
                                     && let Some(run_id) = agent.run_id.clone()
                                 {

@@ -5,6 +5,7 @@ use super::{
     collect_citation_links, dropdown_content_inset, dropdown_items_width, record_dot_pulse,
     render_dropdown_chrome, supports_osc22,
 };
+use crate::acp::cursor::cloud_jobs;
 use crate::actions::{ActionId, ActionRegistry};
 use crate::key;
 use crate::render::SafeBuf;
@@ -987,11 +988,14 @@ impl AgentView {
                 }
             }
         }
-        self.tasks.sync(
+        let cloud_rows =
+            cloud_jobs::task_rows(self.session.session_id.as_ref().map(|id| id.0.as_ref()));
+        self.tasks.sync_with_cloud(
             &self.session.bg_tasks,
             &self.subagent_sessions,
             &self.session.scheduled_tasks,
             &self.workflow_runs,
+            &cloud_rows,
         );
         if self.active_pane == ActivePane::Tasks && !self.tasks.is_visible() {
             self.active_pane = ActivePane::Scrollback;

@@ -393,8 +393,21 @@ fn cloud_handoff_leaves_the_local_agent_and_a_later_ampersand_follows_up() {
     );
     assert!(parse(&local[0])["params"].get("_meta").is_none());
 
+    let another = adapter.outbound(
+        r#"{"jsonrpc":"2.0","id":6,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& write the docs"}]}}"#,
+    );
+    let Routed::Cloud {
+        request, agent_id, ..
+    } = &another[0]
+    else {
+        panic!("expected a second cloud job: {another:?}");
+    };
+    assert_eq!(request, &CloudRequest::Send("write the docs".to_owned()));
+    assert_eq!(agent_id, &None);
+
+    adapter.focus_cloud_job("s1", "bc-123").unwrap();
     let follow = adapter.outbound(
-        r#"{"jsonrpc":"2.0","id":6,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& add tests"}]}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"& add tests"}]}}"#,
     );
     let Routed::Cloud {
         request, agent_id, ..
@@ -513,6 +526,7 @@ fn two_sessions_keep_their_own_skills_and_cloud_agents() {
         "/review please the diff"
     );
     assert!(sent["params"].get("_meta").is_none());
+    adapter.focus_cloud_job("s2", "bc-two").unwrap();
     let again = adapter.outbound(
         r#"{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{"sessionId":"s2","prompt":[{"type":"text","text":"& keep going"}]}}"#,
     );
@@ -750,6 +764,7 @@ fn cloud_create_uses_the_session_git_remote() {
     assert_eq!(repo.starting_ref.as_deref(), Some("feature"));
 
     adapter.note_cloud_agent("s-repo", "bc-1");
+    adapter.focus_cloud_job("s-repo", "bc-1").unwrap();
     let follow = json!({
         "jsonrpc": "2.0",
         "id": 3,
