@@ -2278,5 +2278,27 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::FeatureOverridePersisted { feature, result } => {
             settings::handle_feature_override_persisted(app, feature, result)
         }
+        TaskResult::BotSubmit {
+            agent_id,
+            session,
+            outcome,
+        } => {
+            let Some(agent) = app.agents.get_mut(&agent_id) else {
+                return vec![];
+            };
+            let routed = session.is_routed();
+            agent.bot = session;
+            agent.prompt.set_bot_icon(routed);
+            match outcome {
+                crate::bot::SubmitOutcome::Model => {}
+                crate::bot::SubmitOutcome::Shown(message) => {
+                    push_and_page_flip(&mut agent.scrollback, RenderBlock::system(message));
+                }
+                crate::bot::SubmitOutcome::Reply(message) => {
+                    push_and_page_flip(&mut agent.scrollback, RenderBlock::agent_message(message));
+                }
+            }
+            vec![]
+        }
     }
 }
