@@ -284,6 +284,27 @@ pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>, model_id: Option
     body.to_string()
 }
 
+/// Same create body as [`create_body`], plus a distinct `branchName` for one swarm member.
+fn create_body_on_branch(
+    text: &str,
+    repo: Option<&CloudRepo>,
+    model_id: Option<&str>,
+    branch_name: &str,
+) -> String {
+    let mut body = json!({ "prompt": { "text": text } });
+    if let Some(repo) = repo {
+        let mut entry = json!({ "url": repo.url });
+        if let Some(starting_ref) = &repo.starting_ref {
+            entry["startingRef"] = json!(starting_ref);
+        }
+        entry["branchName"] = json!(branch_name);
+        body["repos"] = json!([entry]);
+    }
+    body["target"] = json!({ "branchName": branch_name });
+    attach_cloud_model(&mut body, model_id);
+    body.to_string()
+}
+
 fn attach_cloud_model(body: &mut Value, model_id: Option<&str>) {
     let Some(model) = model_id.and_then(cloud_model_from_id) else {
         return;
@@ -606,6 +627,26 @@ pub(crate) fn dispatch(
     };
     let mut agent = parse_cloud_response(&raw)?;
     let _ = refresh(api_base, auth, &mut agent);
+    Ok(agent)
+}
+
+/// Create one cloud agent on `branch_name`. A non-2xx response is an error for this member only.
+pub(crate) fn create_agent(
+    api_base: &str,
+    auth: &CloudAuth,
+    text: &str,
+    repo: Option<&CloudRepo>,
+    model_id: Option<&str>,
+    branch_name: &str,
+) -> Result<CloudAgent, String> {
+    let url = format!("{api_base}/v1/agents");
+    let body = create_body_on_branch(text, repo, model_id, branch_name);
+    let raw = request("POST", &url, auth, Some(&body))?;
+    let mut agent = parse_cloud_response(&raw)?;
+    let _ = refresh(api_base, auth, &mut agent);
+    if agent.branch.is_none() {
+        agent.branch = Some(branch_name.to_owned());
+    }
     Ok(agent)
 }
 
