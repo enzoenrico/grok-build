@@ -288,7 +288,13 @@ pub(crate) struct CloudRepo {
 }
 
 pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>, model_id: Option<&str>) -> String {
-    let mut body = json!({ "prompt": { "text": text } });
+    // The Agent SDK mints `agentId` on every create that does not pass session
+    // env vars. The live Cloud Agents API rejects a body without it:
+    // HTTP 400 "Missing required fields in request".
+    let mut body = json!({
+        "prompt": { "text": text },
+        "agentId": cloud_agent_id(),
+    });
     if let Some(repo) = repo {
         let mut entry = json!({ "url": repo.url });
         if let Some(starting_ref) = &repo.starting_ref {
@@ -300,6 +306,11 @@ pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>, model_id: Option
     body.to_string()
 }
 
+/// Client-supplied agent id, `bc-` plus a UUID, the same shape the Agent SDK sends.
+fn cloud_agent_id() -> String {
+    format!("bc-{}", uuid::Uuid::new_v4())
+}
+
 /// Same create body as [`create_body`], plus a distinct `branchName` for one swarm member.
 fn create_body_on_branch(
     text: &str,
@@ -307,7 +318,10 @@ fn create_body_on_branch(
     model_id: Option<&str>,
     branch_name: &str,
 ) -> String {
-    let mut body = json!({ "prompt": { "text": text } });
+    let mut body = json!({
+        "prompt": { "text": text },
+        "agentId": cloud_agent_id(),
+    });
     if let Some(repo) = repo {
         let mut entry = json!({ "url": repo.url });
         if let Some(starting_ref) = &repo.starting_ref {
@@ -1226,6 +1240,26 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    fn is_bc_agent_id(id: &str) -> bool {
+        let Some(rest) = id.strip_prefix("bc-") else {
+            return false;
+        };
+        let parts: Vec<&str> = rest.split('-').collect();
+        parts.len() == 5
+            && [8, 4, 4, 4, 12]
+                .into_iter()
+                .zip(parts.iter())
+                .all(|(len, part)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
+    }
+
+    fn req_has_bc_agent_id(req: &str) -> bool {
+        let Some(value) = req.split("\"agentId\":\"").nth(1) else {
+            return false;
+        };
+        let id = value.split('"').next().unwrap_or("");
+        is_bc_agent_id(id)
+    }
+
     #[test]
     fn create_and_follow_up_round_trip_against_a_local_server() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1724,7 +1758,8 @@ data: {}
             let ok = req.contains("https://github.com/acme/payments")
                 && req.contains("\"startingRef\":\"feature\"")
                 && req.contains("\"id\":\"grok-4.7\"")
-                && req.contains("\"value\":\"256k\"");
+                && req.contains("\"value\":\"256k\"")
+                && req_has_bc_agent_id(&req);
             let body = if ok {
                 r#"{"agent":{"id":"bc-1","url":"https://cursor.com/agents/bc-1"},"run":{"id":"run-1","status":"FINISHED","result":"on the repo"}}"#
             } else {
@@ -1749,6 +1784,47 @@ data: {}
         .unwrap();
         assert_eq!(created.result.as_deref(), Some("on the repo"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_body_sends_the_agent_id_the_api_requires() {
+        let repo = CloudRepo {
+            url: "https://github.com/acme/payments".to_owned(),
+            starting_ref: Some("main".to_owned()),
+        };
+        let body = create_body("fix the tests", Some(&repo), Some("composer-2.5"));
+        let value: Value = serde_json::from_str(&body).unwrap();
+        let agent_id = value["agentId"].as_str().unwrap_or("");
+        assert!(
+            is_bc_agent_id(agent_id),
+            "create body is missing agentId (the old body): {body}"
+        );
+        assert_eq!(value["prompt"]["text"], "fix the tests");
+        assert_eq!(value["repos"][0]["url"], "https://github.com/acme/payments");
+        assert_eq!(value["repos"][0]["startingRef"], "main");
+        assert_eq!(value["model"]["id"], "composer-2.5");
+
+        let again: Value = serde_json::from_str(&create_body(
+            "fix the tests",
+            Some(&repo),
+            Some("composer-2.5"),
+        ))
+        .unwrap();
+        assert!(is_bc_agent_id(again["agentId"].as_str().unwrap_or("")));
+        assert_ne!(again["agentId"], value["agentId"]);
+
+        let swarm: Value = serde_json::from_str(&create_body_on_branch(
+            "fix the tests",
+            Some(&repo),
+            None,
+            "cursor/swarm-1",
+        ))
+        .unwrap();
+        assert!(
+            is_bc_agent_id(swarm["agentId"].as_str().unwrap_or("")),
+            "swarm create body is missing agentId: {swarm}"
+        );
+        assert_ne!(swarm["agentId"], value["agentId"]);
     }
 
     #[test]
