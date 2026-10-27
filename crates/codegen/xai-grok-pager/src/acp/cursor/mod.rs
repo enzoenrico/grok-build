@@ -98,9 +98,16 @@ fn watch_cloud_run(
                     status,
                     text,
                     pr_url,
+                    branch,
                 } = &event
                 {
-                    cloud_jobs::note_stream_result(&agent_id, status, text, pr_url.as_deref());
+                    cloud_jobs::note_stream_result(
+                        &agent_id,
+                        status,
+                        text,
+                        pr_url.as_deref(),
+                        branch.as_deref(),
+                    );
                 }
                 let text = cloud::event_text(&event, saw_assistant);
                 if matches!(event, cloud::CloudEvent::Assistant(_)) {
