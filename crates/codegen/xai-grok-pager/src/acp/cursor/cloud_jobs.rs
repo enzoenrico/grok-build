@@ -67,7 +67,13 @@ pub(crate) fn task_rows(session_id: Option<&str>) -> Vec<CloudTaskRow> {
 }
 
 /// Apply a stream `result` event onto the shared list. The focused job is unchanged.
-pub(crate) fn note_stream_result(agent_id: &str, status: &str, text: &str, pr_url: Option<&str>) {
+pub(crate) fn note_stream_result(
+    agent_id: &str,
+    status: &str,
+    text: &str,
+    pr_url: Option<&str>,
+    branch: Option<&str>,
+) {
     let jobs = process();
     let mut jobs = jobs.lock().unwrap_or_else(|err| err.into_inner());
     let Some(job) = jobs.jobs.iter_mut().find(|job| job.id == agent_id) else {
@@ -79,6 +85,9 @@ pub(crate) fn note_stream_result(agent_id: &str, status: &str, text: &str, pr_ur
     }
     if let Some(url) = pr_url {
         job.pr_url = Some(url.to_owned());
+    }
+    if let Some(branch) = branch.filter(|name| !name.is_empty()) {
+        job.branch = Some(branch.to_owned());
     }
 }
 
@@ -355,7 +364,7 @@ impl CloudJobList {
         repo: Option<&CloudRepo>,
         model_id: Option<&str>,
     ) -> Result<RemoteJob, String> {
-        let auth = cloud::cloud_auth_from_sources(auth_token, api_key, stored)?;
+        let auth = cloud::cloud_auth_from_sources(auth_token, api_key, None, stored)?;
         let op = classify_ampersand(text)?;
         let prompt = match &op {
             JobOp::Send(task) => task.clone(),
@@ -713,7 +722,7 @@ mod tests {
                     Some(url) => format!(",\"prUrl\":{url:?}"),
                     None => String::new(),
                 };
-                format!(",\"git\":{{\"branches\":[{{\"name\":{name:?}{pr_field}}}]}}")
+                format!(",\"git\":{{\"branches\":[{{\"branch\":{name:?}{pr_field}}}]}}")
             }
         };
         format!(

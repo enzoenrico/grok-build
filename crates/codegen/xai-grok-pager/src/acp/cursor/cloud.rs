@@ -1,11 +1,14 @@
-//! Cursor Cloud Agents HTTP API. ACP `session/prompt` does not create a cloud agent.
-//! A message that starts with `&` and a task is sent here. The pager owns the job list, so one
-//! session can have many runs. `& <task>` starts another job, or follows the job `/cloud <id>` focused.
-//! `&` and `& status` read that focused job. `& cancel` stops it. A run that is still going is followed
-//! on its event stream.
+//! Cursor Cloud Agents API, the same launch, follow, status, and cancel path the Agent SDK and
+//! Cursor CLI use. ACP `session/prompt` does not create a cloud agent. A message that starts with
+//! `&` and a task is sent here. The pager owns the job list, so one session can have many runs.
+//! `& <task>` starts another job, or follows the job `/cloud <id>` focused. `&` and `& status` read
+//! that focused job. `& cancel` stops it. A run that is still going is followed on its event stream.
 //!
-//! Auth matches `agent login`. `CURSOR_AUTH_TOKEN` is sent as Bearer, then `CURSOR_API_KEY` as Basic,
-//! then the access token `agent login` stores.
+//! A dropped stream resumes with `Last-Event-ID`. `410 stream_expired` is read back with Get A Run.
+//! Cancel is a no-op once the run is terminal, including `409 run_not_cancellable`.
+//!
+//! Auth matches the CLI, then the Agent SDK service account. `CURSOR_AUTH_TOKEN` is Bearer,
+//! `CURSOR_API_KEY` and `CURSOR_SERVICE_ACCOUNT_KEY` are Basic, then the access token `agent login` stores.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -30,6 +33,7 @@ pub(crate) struct CloudAgent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CloudEvent {
     Assistant(String),
+    Thinking(String),
     ToolDone {
         name: String,
     },
@@ -37,6 +41,7 @@ pub(crate) enum CloudEvent {
         status: String,
         text: String,
         pr_url: Option<String>,
+        branch: Option<String>,
     },
     Error {
         message: String,
@@ -49,12 +54,13 @@ pub(crate) fn run_is_terminal(status: Option<&str>) -> bool {
 
 pub(crate) fn event_text(event: &CloudEvent, saw_assistant: bool) -> Option<String> {
     match event {
-        CloudEvent::Assistant(text) => Some(text.clone()),
+        CloudEvent::Assistant(text) | CloudEvent::Thinking(text) => Some(text.clone()),
         CloudEvent::ToolDone { name } => Some(format!("Tool {name}\n")),
         CloudEvent::Result {
             status,
             text,
             pr_url,
+            branch: _,
         } => {
             let mut msg = format!("Run {status}.\n");
             if !saw_assistant && !text.is_empty() {
@@ -93,19 +99,29 @@ pub(crate) const LOGIN_REQUIRED: &str =
 pub(crate) fn resolve_cloud_auth() -> Result<CloudAuth, String> {
     let auth_token = std::env::var("CURSOR_AUTH_TOKEN").ok();
     let api_key = std::env::var("CURSOR_API_KEY").ok();
+    let service_account_key = std::env::var("CURSOR_SERVICE_ACCOUNT_KEY").ok();
     let stored = read_stored_login()?;
-    cloud_auth_from_sources(auth_token.as_deref(), api_key.as_deref(), stored.as_ref())
+    cloud_auth_from_sources(
+        auth_token.as_deref(),
+        api_key.as_deref(),
+        service_account_key.as_deref(),
+        stored.as_ref(),
+    )
 }
 
 pub(crate) fn cloud_auth_from_sources(
     auth_token: Option<&str>,
     api_key: Option<&str>,
+    service_account_key: Option<&str>,
     stored: Option<&StoredLogin>,
 ) -> Result<CloudAuth, String> {
     if let Some(token) = nonempty(auth_token) {
         return Ok(CloudAuth::Bearer(token.to_owned()));
     }
     if let Some(key) = nonempty(api_key) {
+        return Ok(CloudAuth::Basic(key.to_owned()));
+    }
+    if let Some(key) = nonempty(service_account_key) {
         return Ok(CloudAuth::Basic(key.to_owned()));
     }
     if let Some(stored) = stored {
@@ -475,10 +491,6 @@ pub(crate) fn parse_cloud_response(body: &str) -> Result<CloudAgent, String> {
     })
 }
 
-fn pr_url(value: &Value) -> Option<String> {
-    git_fields(value).1
-}
-
 /// Branch name and pull request URL from a cloud agent or run payload.
 fn git_fields(value: &Value) -> (Option<String>, Option<String>) {
     for pointer in ["/run/git/branches", "/git/branches"] {
@@ -487,9 +499,11 @@ fn git_fields(value: &Value) -> (Option<String>, Option<String>) {
         };
         let branch = branches.iter().find_map(|entry| {
             entry
-                .get("branchName")
+                .get("branch")
                 .and_then(Value::as_str)
+                .or_else(|| entry.get("branchName").and_then(Value::as_str))
                 .or_else(|| entry.get("name").and_then(Value::as_str))
+                .filter(|name| !name.is_empty())
                 .map(str::to_owned)
         });
         let pr = branches
@@ -580,14 +594,27 @@ pub(crate) fn cancel_existing(
     let Some(run_id) = agent.run_id.clone() else {
         return Err("cloud agent has no run to cancel".to_owned());
     };
-    let _ = request(
+    if let Err(err) = request(
         "POST",
         &format!("{api_base}/v1/agents/{}/runs/{run_id}/cancel", agent.id),
         auth,
         None,
-    )?;
+    ) {
+        if !is_run_not_cancellable(&err) {
+            return Err(err);
+        }
+        let _ = refresh(api_base, auth, &mut agent);
+        if !run_is_terminal(agent.run_status.as_deref()) {
+            return Err(err);
+        }
+        return Ok(agent);
+    }
     let _ = refresh(api_base, auth, &mut agent);
     Ok(agent)
+}
+
+fn is_run_not_cancellable(err: &str) -> bool {
+    err.contains("run_not_cancellable")
 }
 
 pub(crate) fn dispatch(
@@ -650,130 +677,135 @@ pub(crate) fn create_agent(
     Ok(agent)
 }
 
+const STREAM_ATTEMPTS: u32 = 7;
+
+enum StreamStop {
+    Result,
+    Done,
+    Expired,
+    Dropped,
+}
+
+struct SseFrame {
+    id: Option<String>,
+    event: Option<CloudEvent>,
+    done: bool,
+}
+
+/// Follow one run the way `Run.stream()` does. A drop resumes with `Last-Event-ID`.
+/// `410 stream_expired` is not retried; the terminal run is read with Get A Run.
 pub(crate) fn follow_run(
     api_base: &str,
     auth: &CloudAuth,
     agent_id: &str,
     run_id: &str,
-    on_event: impl FnMut(CloudEvent),
+    mut on_event: impl FnMut(CloudEvent),
 ) -> Result<(), String> {
     let url = format!("{api_base}/v1/agents/{agent_id}/runs/{run_id}/stream");
+    let mut last_event_id = None;
+    for attempt in 0..STREAM_ATTEMPTS {
+        let resume_from = last_event_id.clone();
+        let stop = read_stream(
+            &url,
+            auth,
+            resume_from.as_deref(),
+            &mut last_event_id,
+            &mut on_event,
+        )?;
+        match stop {
+            StreamStop::Result | StreamStop::Done => return Ok(()),
+            StreamStop::Expired => {
+                return emit_terminal_run(api_base, auth, agent_id, run_id, &mut on_event);
+            }
+            StreamStop::Dropped => {
+                if emit_finished_run(api_base, auth, agent_id, run_id, &mut on_event)? {
+                    return Ok(());
+                }
+                if attempt + 1 == STREAM_ATTEMPTS {
+                    break;
+                }
+                std::thread::sleep(stream_backoff(attempt));
+            }
+        }
+    }
+    Err("cloud agent stream dropped before the run finished".to_owned())
+}
+
+/// First reconnect is immediate. Later ones use the SDK backoff, capped at 30s.
+fn stream_backoff(retry: u32) -> Duration {
+    if retry == 0 {
+        return Duration::from_millis(0);
+    }
+    let shift = retry.saturating_sub(1).min(5);
+    Duration::from_millis((1_000 * 2u64.pow(shift)).min(30_000))
+}
+
+fn read_stream(
+    url: &str,
+    auth: &CloudAuth,
+    last_event_id: Option<&str>,
+    resume_id: &mut Option<String>,
+    on_event: &mut impl FnMut(CloudEvent),
+) -> Result<StreamStop, String> {
     if url.starts_with("https://") {
-        return follow_via_curl(&url, auth, on_event);
-    }
-    let body = request("GET", &url, auth, None)?;
-    emit_sse(&body, on_event);
-    Ok(())
-}
-
-fn emit_sse(body: &str, mut on_event: impl FnMut(CloudEvent)) {
-    let mut parser = SseParser::default();
-    for line in body.split_inclusive('\n') {
-        let line = line.trim_end_matches(['\r', '\n']);
-        if let Some(event) = parser.push_line(line) {
-            on_event(event);
-        }
-    }
-    if let Some(event) = parser.finish() {
-        on_event(event);
+        follow_via_curl(url, auth, last_event_id, resume_id, on_event)
+    } else {
+        follow_via_tcp(url, auth, last_event_id, resume_id, on_event)
     }
 }
 
-#[derive(Default)]
-struct SseParser {
-    event: String,
-    data: String,
-}
-
-impl SseParser {
-    fn push_line(&mut self, line: &str) -> Option<CloudEvent> {
-        if line.is_empty() {
-            return self.finish();
-        }
-        if let Some(rest) = line.strip_prefix("event:") {
-            self.event = rest.trim().to_owned();
-        } else if let Some(rest) = line.strip_prefix("data:") {
-            if !self.data.is_empty() {
-                self.data.push('\n');
-            }
-            self.data.push_str(rest.trim_start());
-        }
-        None
+fn follow_via_tcp(
+    url: &str,
+    auth: &CloudAuth,
+    last_event_id: Option<&str>,
+    resume_id: &mut Option<String>,
+    on_event: &mut impl FnMut(CloudEvent),
+) -> Result<StreamStop, String> {
+    let mut headers = vec![("Accept", "text/event-stream")];
+    if let Some(id) = last_event_id {
+        headers.push(("Last-Event-ID", id));
     }
-
-    fn finish(&mut self) -> Option<CloudEvent> {
-        let event = std::mem::take(&mut self.event);
-        let data = std::mem::take(&mut self.data);
-        if event.is_empty() && data.is_empty() {
-            None
-        } else {
-            decode_event(&event, &data)
-        }
+    let (status, body) = exchange_tcp("GET", url, auth, None, &headers)?;
+    let code = status_code(&status);
+    if code == 410 {
+        return Ok(StreamStop::Expired);
     }
-}
-
-fn decode_event(event: &str, data: &str) -> Option<CloudEvent> {
-    let value: Value = serde_json::from_str(data).unwrap_or(Value::Null);
-    match event {
-        "assistant" => value
-            .get("text")
-            .and_then(Value::as_str)
-            .map(|text| CloudEvent::Assistant(text.to_owned())),
-        "tool_call" => {
-            if value.get("status").and_then(Value::as_str) == Some("completed") {
-                Some(CloudEvent::ToolDone {
-                    name: value
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("tool")
-                        .to_owned(),
-                })
-            } else {
-                None
-            }
-        }
-        "result" => Some(CloudEvent::Result {
-            status: value
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("FINISHED")
-                .to_owned(),
-            text: value
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned(),
-            pr_url: pr_url(&value),
-        }),
-        "error" => Some(CloudEvent::Error {
-            message: value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-                .to_owned(),
-        }),
-        _ => None,
+    if !(200..300).contains(&code) {
+        return Err(format!("{status}: {body}"));
     }
+    Ok(consume_sse(&body, resume_id, on_event))
 }
 
 fn follow_via_curl(
     url: &str,
     auth: &CloudAuth,
-    mut on_event: impl FnMut(CloudEvent),
-) -> Result<(), String> {
+    last_event_id: Option<&str>,
+    resume_id: &mut Option<String>,
+    on_event: &mut impl FnMut(CloudEvent),
+) -> Result<StreamStop, String> {
+    let header_path = std::env::temp_dir().join(format!(
+        "grok-cloud-stream-{}-{}.hdr",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _header_file = HeaderFile(header_path.clone());
     let mut args = vec![
         "-N".to_owned(),
         "-sS".to_owned(),
-        "-f".to_owned(),
+        "-D".to_owned(),
+        header_path.display().to_string(),
         "-X".to_owned(),
         "GET".to_owned(),
     ];
     args.extend(curl_auth_args(auth));
-    args.extend([
-        "-H".to_owned(),
-        "Accept: text/event-stream".to_owned(),
-        url.to_owned(),
-    ]);
+    args.extend(["-H".to_owned(), "Accept: text/event-stream".to_owned()]);
+    if let Some(id) = last_event_id {
+        args.extend(["-H".to_owned(), format!("Last-Event-ID: {id}")]);
+    }
+    args.push(url.to_owned());
     let mut child = std::process::Command::new("curl")
         .args(args)
         .stdout(std::process::Stdio::piped())
@@ -785,28 +817,288 @@ fn follow_via_curl(
         .take()
         .ok_or_else(|| "curl has no stdout".to_owned())?;
     let mut parser = SseParser::default();
+    let mut stop = StreamStop::Dropped;
     for line in BufReader::new(stdout).lines() {
         let line = line.map_err(|err| err.to_string())?;
-        if let Some(event) = parser.push_line(&line) {
-            on_event(event);
+        if let Some(frame) = parser.push_line(&line)
+            && apply_frame(&frame, resume_id, on_event, &mut stop)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(stop);
         }
     }
-    if let Some(event) = parser.finish() {
+    if let Some(frame) = parser.finish() {
+        let _ = apply_frame(&frame, resume_id, on_event, &mut stop);
+    }
+    let exit = child.wait().map_err(|err| err.to_string())?;
+    let code = std::fs::read_to_string(&header_path)
+        .ok()
+        .and_then(|headers| status_code_in(&headers));
+    if code == Some(410) {
+        return Ok(StreamStop::Expired);
+    }
+    if !matches!(stop, StreamStop::Dropped) {
+        return Ok(stop);
+    }
+    match code {
+        Some(code) if (200..300).contains(&code) => Ok(stop),
+        Some(code) => Err(format!("cloud agent HTTP {code}")),
+        None if exit.success() => Ok(stop),
+        None => {
+            let mut err = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = std::io::Read::read_to_string(&mut stderr, &mut err);
+            }
+            Err(if err.trim().is_empty() {
+                format!("curl exited {exit}")
+            } else {
+                err.trim().to_owned()
+            })
+        }
+    }
+}
+
+struct HeaderFile(PathBuf);
+
+impl Drop for HeaderFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn consume_sse(
+    body: &str,
+    resume_id: &mut Option<String>,
+    on_event: &mut impl FnMut(CloudEvent),
+) -> StreamStop {
+    let mut parser = SseParser::default();
+    let mut stop = StreamStop::Dropped;
+    for line in body.split_inclusive('\n') {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if let Some(frame) = parser.push_line(line)
+            && apply_frame(&frame, resume_id, on_event, &mut stop)
+        {
+            return stop;
+        }
+    }
+    if let Some(frame) = parser.finish() {
+        let _ = apply_frame(&frame, resume_id, on_event, &mut stop);
+    }
+    stop
+}
+
+fn apply_frame(
+    frame: &SseFrame,
+    resume_id: &mut Option<String>,
+    on_event: &mut impl FnMut(CloudEvent),
+    stop: &mut StreamStop,
+) -> bool {
+    if let Some(id) = frame.id.as_deref().filter(|id| !id.is_empty()) {
+        *resume_id = Some(id.to_owned());
+    }
+    if frame.done {
+        *stop = StreamStop::Done;
+        return true;
+    }
+    if let Some(event) = frame.event.clone() {
+        let finished = matches!(event, CloudEvent::Result { .. });
         on_event(event);
-    }
-    let status = child.wait().map_err(|err| err.to_string())?;
-    if status.success() {
-        Ok(())
-    } else {
-        let mut err = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = std::io::Read::read_to_string(&mut stderr, &mut err);
+        if finished {
+            *stop = StreamStop::Result;
+            return true;
         }
-        Err(if err.trim().is_empty() {
-            format!("curl exited {status}")
+    }
+    false
+}
+
+fn emit_terminal_run(
+    api_base: &str,
+    auth: &CloudAuth,
+    agent_id: &str,
+    run_id: &str,
+    on_event: &mut impl FnMut(CloudEvent),
+) -> Result<(), String> {
+    let event = run_result_event(api_base, auth, agent_id, run_id)?;
+    let still_running = match &event {
+        CloudEvent::Result { status, .. } => !run_is_terminal(Some(status.as_str())),
+        _ => true,
+    };
+    if still_running {
+        let status = match &event {
+            CloudEvent::Result { status, .. } => status.as_str(),
+            _ => "unknown",
+        };
+        return Err(format!(
+            "cloud agent stream expired while the run was still {status}"
+        ));
+    }
+    on_event(event);
+    Ok(())
+}
+
+/// `Ok(true)` when the run has already finished and its result was emitted.
+fn emit_finished_run(
+    api_base: &str,
+    auth: &CloudAuth,
+    agent_id: &str,
+    run_id: &str,
+    on_event: &mut impl FnMut(CloudEvent),
+) -> Result<bool, String> {
+    let event = match run_result_event(api_base, auth, agent_id, run_id) {
+        Ok(event) => event,
+        Err(_) => return Ok(false),
+    };
+    let CloudEvent::Result { status, .. } = &event else {
+        return Ok(false);
+    };
+    if !run_is_terminal(Some(status.as_str())) {
+        return Ok(false);
+    }
+    on_event(event);
+    Ok(true)
+}
+
+fn run_result_event(
+    api_base: &str,
+    auth: &CloudAuth,
+    agent_id: &str,
+    run_id: &str,
+) -> Result<CloudEvent, String> {
+    let body = request(
+        "GET",
+        &format!("{api_base}/v1/agents/{agent_id}/runs/{run_id}"),
+        auth,
+        None,
+    )?;
+    let value: Value = serde_json::from_str(&body).map_err(|err| err.to_string())?;
+    Ok(result_from_run(&value))
+}
+
+fn result_from_run(value: &Value) -> CloudEvent {
+    let (branch, pr_url) = git_fields(value);
+    CloudEvent::Result {
+        status: value
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("FINISHED")
+            .to_owned(),
+        text: value
+            .get("result")
+            .or_else(|| value.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        pr_url,
+        branch,
+    }
+}
+
+fn status_code(status_line: &str) -> u16 {
+    status_code_in(status_line).unwrap_or(0)
+}
+
+fn status_code_in(headers: &str) -> Option<u16> {
+    headers.lines().rev().find_map(|line| {
+        let line = line.trim();
+        if !line.starts_with("HTTP/") {
+            return None;
+        }
+        line.split_whitespace().nth(1)?.parse().ok()
+    })
+}
+
+#[derive(Default)]
+struct SseParser {
+    event: String,
+    data: String,
+    id: Option<String>,
+}
+
+impl SseParser {
+    fn push_line(&mut self, line: &str) -> Option<SseFrame> {
+        if line.is_empty() {
+            return self.finish();
+        }
+        if let Some(rest) = line.strip_prefix("id:") {
+            self.id = Some(rest.trim().to_owned());
+        } else if let Some(rest) = line.strip_prefix("event:") {
+            self.event = rest.trim().to_owned();
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            if !self.data.is_empty() {
+                self.data.push('\n');
+            }
+            self.data.push_str(rest.trim_start());
+        }
+        None
+    }
+
+    fn finish(&mut self) -> Option<SseFrame> {
+        let event_name = std::mem::take(&mut self.event);
+        let data = std::mem::take(&mut self.data);
+        let id = self.id.take();
+        if event_name.is_empty() && data.is_empty() && id.is_none() {
+            return None;
+        }
+        if event_name == "done" {
+            return Some(SseFrame {
+                id,
+                event: None,
+                done: true,
+            });
+        }
+        let event = if event_name.is_empty() && data.is_empty() {
+            None
         } else {
-            err.trim().to_owned()
-        })
+            decode_event(&event_name, &data)
+        };
+        if event.is_none() && id.is_none() {
+            None
+        } else {
+            Some(SseFrame {
+                id,
+                event,
+                done: false,
+            })
+        }
+    }
+}
+
+fn decode_event(event: &str, data: &str) -> Option<CloudEvent> {
+    let value: Value = serde_json::from_str(data).unwrap_or(Value::Null);
+    match event {
+        "assistant" => value
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| CloudEvent::Assistant(text.to_owned())),
+        "thinking" => value
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| CloudEvent::Thinking(text.to_owned())),
+        "tool_call" => {
+            let name = value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_owned();
+            match value.get("status").and_then(Value::as_str) {
+                Some("completed") => Some(CloudEvent::ToolDone { name }),
+                Some("error") => Some(CloudEvent::ToolDone {
+                    name: format!("{name} failed"),
+                }),
+                _ => None,
+            }
+        }
+        "result" => Some(result_from_run(&value)),
+        "error" => Some(CloudEvent::Error {
+            message: value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+                .to_owned(),
+        }),
+        _ => None,
     }
 }
 
@@ -866,6 +1158,20 @@ fn request_via_tcp(
     auth: &CloudAuth,
     body: Option<&str>,
 ) -> Result<String, String> {
+    let (status, payload) = exchange_tcp(method, url, auth, body, &[])?;
+    if !status.contains(" 2") {
+        return Err(format!("{status}: {payload}"));
+    }
+    Ok(payload)
+}
+
+fn exchange_tcp(
+    method: &str,
+    url: &str,
+    auth: &CloudAuth,
+    body: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> Result<(String, String), String> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("unsupported cloud API url {url}"))?;
@@ -879,8 +1185,15 @@ fn request_via_tcp(
         .map_err(|err| err.to_string())?;
     let header = authorization_header(auth);
     let body = body.unwrap_or("");
+    let mut extra = String::new();
+    for (name, value) in extra_headers {
+        extra.push_str(name);
+        extra.push_str(": ");
+        extra.push_str(value);
+        extra.push_str("\r\n");
+    }
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nAuthorization: {header}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {host_port}\r\nAuthorization: {header}\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
@@ -897,11 +1210,9 @@ fn request_via_tcp(
     let status = head
         .lines()
         .next()
-        .ok_or_else(|| "cloud API response has no status".to_owned())?;
-    if !status.contains(" 2") {
-        return Err(format!("{status}: {payload}"));
-    }
-    Ok(payload.to_owned())
+        .ok_or_else(|| "cloud API response has no status".to_owned())?
+        .to_owned();
+    Ok((status, payload.to_owned()))
 }
 
 fn basic_token(api_key: &str) -> String {
@@ -1099,6 +1410,7 @@ data: {}
                     status: "FINISHED".to_owned(),
                     text: "Added README.md.".to_owned(),
                     pr_url: Some("https://github.com/acme/app/pull/123".to_owned()),
+                    branch: None,
                 },
             ]
         );
@@ -1259,23 +1571,33 @@ data: {}
         )
         .unwrap();
         assert_eq!(
-            cloud_auth_from_sources(Some("env-token"), Some("env-key"), Some(&stored)).unwrap(),
+            cloud_auth_from_sources(
+                Some("env-token"),
+                Some("env-key"),
+                Some("sa-key"),
+                Some(&stored)
+            )
+            .unwrap(),
             CloudAuth::Bearer("env-token".to_owned())
         );
         assert_eq!(
-            cloud_auth_from_sources(None, Some("env-key"), Some(&stored)).unwrap(),
+            cloud_auth_from_sources(None, Some("env-key"), Some("sa-key"), Some(&stored)).unwrap(),
             CloudAuth::Basic("env-key".to_owned())
         );
         assert_eq!(
-            cloud_auth_from_sources(None, None, Some(&stored)).unwrap(),
+            cloud_auth_from_sources(None, None, Some("sa-key"), Some(&stored)).unwrap(),
+            CloudAuth::Basic("sa-key".to_owned())
+        );
+        assert_eq!(
+            cloud_auth_from_sources(None, None, None, Some(&stored)).unwrap(),
             CloudAuth::Bearer("login-token".to_owned())
         );
         let key_only = serde_json::from_str::<StoredLogin>(r#"{"apiKey":"stored-key"}"#).unwrap();
         assert_eq!(
-            cloud_auth_from_sources(None, Some("  "), Some(&key_only)).unwrap(),
+            cloud_auth_from_sources(None, Some("  "), None, Some(&key_only)).unwrap(),
             CloudAuth::Basic("stored-key".to_owned())
         );
-        let err = cloud_auth_from_sources(None, None, None).unwrap_err();
+        let err = cloud_auth_from_sources(None, None, None, None).unwrap_err();
         assert!(err.contains("agent login"), "{err}");
     }
 
@@ -1446,5 +1768,274 @@ data: {}
             Some(json!({ "id": "claude-opus-5-5" }))
         );
         assert_eq!(cloud_model_from_id("  "), None);
+    }
+
+    #[test]
+    fn active_cloud_runs_stay_open_until_they_terminate() {
+        assert!(!run_is_terminal(Some("CREATING")));
+        assert!(!run_is_terminal(Some("RUNNING")));
+        assert!(!run_is_terminal(Some("WAITING_FOR_BACKGROUND_WORK")));
+        assert!(run_is_terminal(Some("FINISHED")));
+        assert!(run_is_terminal(Some("ERROR")));
+        assert!(run_is_terminal(Some("CANCELLED")));
+        assert!(run_is_terminal(Some("EXPIRED")));
+    }
+
+    #[test]
+    fn sdk_stream_frames_show_thinking_and_a_failed_tool() {
+        let thinking = decode_event("thinking", r#"{"text":"Checking auth."}"#).unwrap();
+        assert_eq!(
+            event_text(&thinking, false).as_deref(),
+            Some("Checking auth.")
+        );
+        let failed = decode_event(
+            "tool_call",
+            r#"{"callId":"call-1","name":"read_file","status":"error"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            event_text(&failed, false).as_deref(),
+            Some("Tool read_file failed\n")
+        );
+        assert_eq!(
+            decode_event(
+                "tool_call",
+                r#"{"callId":"call-1","name":"read_file","status":"running"}"#,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn status_reads_the_pushed_branch_and_pull_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let replies = [
+                r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"IDLE","latestRunId":"run-1"}"#,
+                r#"{"id":"run-1","agentId":"bc-1","status":"FINISHED","result":"Added README.md with installation instructions.","git":{"branches":[{"repoUrl":"github.com/acme/app","branch":"cursor/add-readme-a1b2","prUrl":"https://github.com/acme/app/pull/123"}]}}"#,
+            ];
+            for body in replies {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let _ = sock.read(&mut buf).unwrap();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let base = format!("http://{addr}");
+        let agent =
+            refresh_existing(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1").unwrap();
+        assert_eq!(agent.run_status.as_deref(), Some("FINISHED"));
+        assert_eq!(
+            agent.result.as_deref(),
+            Some("Added README.md with installation instructions.")
+        );
+        assert_eq!(agent.branch.as_deref(), Some("cursor/add-readme-a1b2"));
+        assert_eq!(
+            agent.pr_url.as_deref(),
+            Some("https://github.com/acme/app/pull/123")
+        );
+    }
+
+    #[test]
+    fn a_dropped_stream_resumes_with_the_last_event_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for turn in 0..3 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = match turn {
+                    0 => {
+                        assert!(req.contains("/stream"), "{req}");
+                        assert!(!req.contains("Last-Event-ID"), "{req}");
+                        "id: 1713033000000-0\nevent: assistant\ndata: {\"text\":\"I'll update the README now.\"}\n\n"
+                    }
+                    1 => {
+                        assert!(req.starts_with("GET "), "{req}");
+                        assert!(req.contains("/runs/run-1"), "{req}");
+                        assert!(!req.contains("/stream"), "{req}");
+                        r#"{"id":"run-1","agentId":"bc-1","status":"RUNNING"}"#
+                    }
+                    _ => {
+                        assert!(req.contains("Last-Event-ID: 1713033000000-0"), "{req}");
+                        "event: result\ndata: {\"status\":\"FINISHED\",\"text\":\"Added README.md.\",\"git\":{\"branches\":[{\"branch\":\"cursor/add-readme-a1b2\",\"prUrl\":\"https://github.com/acme/app/pull/123\"}]}}\n\n"
+                    }
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let base = format!("http://{addr}");
+        let mut events = Vec::new();
+        follow_run(
+            &base,
+            &CloudAuth::Basic("test-key".to_owned()),
+            "bc-1",
+            "run-1",
+            |event| events.push(event),
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                CloudEvent::Assistant("I'll update the README now.".to_owned()),
+                CloudEvent::Result {
+                    status: "FINISHED".to_owned(),
+                    text: "Added README.md.".to_owned(),
+                    pr_url: Some("https://github.com/acme/app/pull/123".to_owned()),
+                    branch: Some("cursor/add-readme-a1b2".to_owned()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_expired_stream_reads_the_finished_run() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for turn in 0..2 {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (status, body) = if turn == 0 {
+                    assert!(req.contains("/stream"), "{req}");
+                    (
+                        "410 Gone",
+                        r#"{"code":"stream_expired","message":"stream expired"}"#,
+                    )
+                } else {
+                    assert!(!req.contains("/stream"), "{req}");
+                    (
+                        "200 OK",
+                        r#"{"id":"run-1","agentId":"bc-1","status":"FINISHED","result":"Added README.md with installation instructions.","git":{"branches":[{"repoUrl":"github.com/acme/app","branch":"cursor/add-readme-a1b2","prUrl":"https://github.com/acme/app/pull/123"}]}}"#,
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let base = format!("http://{addr}");
+        let mut events = Vec::new();
+        follow_run(
+            &base,
+            &CloudAuth::Basic("test-key".to_owned()),
+            "bc-1",
+            "run-1",
+            |event| events.push(event),
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![CloudEvent::Result {
+                status: "FINISHED".to_owned(),
+                text: "Added README.md with installation instructions.".to_owned(),
+                pr_url: Some("https://github.com/acme/app/pull/123".to_owned()),
+                branch: Some("cursor/add-readme-a1b2".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn cancel_of_an_uncancellable_run_reads_the_finished_run() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let steps = [
+                (
+                    "GET",
+                    "200 OK",
+                    r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"ACTIVE","latestRunId":"run-1"}"#,
+                ),
+                (
+                    "GET",
+                    "200 OK",
+                    r#"{"id":"run-1","agentId":"bc-1","status":"RUNNING"}"#,
+                ),
+                (
+                    "POST",
+                    "409 Conflict",
+                    r#"{"code":"run_not_cancellable","message":"run is already finished"}"#,
+                ),
+                (
+                    "GET",
+                    "200 OK",
+                    r#"{"id":"bc-1","url":"https://cursor.com/agents/bc-1","status":"IDLE","latestRunId":"run-1"}"#,
+                ),
+                (
+                    "GET",
+                    "200 OK",
+                    r#"{"id":"run-1","agentId":"bc-1","status":"FINISHED","result":"Already done."}"#,
+                ),
+            ];
+            for (method, status, body) in steps {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut buf = [0_u8; 8192];
+                let n = sock.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let ok = req.starts_with(method);
+                let (status, payload) = if ok {
+                    (status, body.to_owned())
+                } else {
+                    ("400 Bad Request", r#"{"error":"wrong method"}"#.to_owned())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                sock.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let base = format!("http://{addr}");
+        let agent =
+            cancel_existing(&base, &CloudAuth::Basic("test-key".to_owned()), "bc-1").unwrap();
+        assert_eq!(agent.run_status.as_deref(), Some("FINISHED"));
+        assert_eq!(agent.result.as_deref(), Some("Already done."));
+    }
+
+    #[test]
+    fn service_account_key_is_sent_as_basic() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected = authorization_header(&CloudAuth::Basic("sa-key".to_owned()));
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 8192];
+            let n = sock.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = if req.contains(&expected) && !req.contains("Authorization: Bearer") {
+                r#"{"agent":{"id":"bc-1","url":"https://cursor.com/agents/bc-1"},"run":{"id":"run-1","status":"FINISHED","result":"from service account"}}"#
+            } else {
+                r#"{"error":"missing basic"}"#
+            };
+            let status = if body.contains("bc-1") {
+                "200 OK"
+            } else {
+                "401 Unauthorized"
+            };
+            let resp = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).unwrap();
+        });
+        let base = format!("http://{addr}");
+        let auth = cloud_auth_from_sources(None, None, Some("sa-key"), None).unwrap();
+        let created = dispatch(&base, &auth, None, "refactor the auth module", None, None).unwrap();
+        assert_eq!(created.result.as_deref(), Some("from service account"));
     }
 }
