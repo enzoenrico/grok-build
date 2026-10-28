@@ -513,6 +513,10 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     {
         hit!("hooks");
     }
+    // `.cursor/worktrees.json` runs its commands when a worktree is created, and that only happens in a trusted folder
+    if crate::util::path_present_or_uncertain(&hook_root.join(".cursor").join("worktrees.json")) {
+        hit!("worktree-setup");
+    }
     // Project PLUGIN dirs: project-scoped plugins fall under folder-trust too, so a repo-local plugin dir is repo-controlled code-exec (hooks/MCP)
     // Else a plugin clone (e.g. `.grok/plugins/evil/`, even one in a subdir launched via `cd sub && grok`) would resolve trusted and run ungated.
     // Uses the shared cwd-to-git-root walk so detection matches exactly what `discover_plugins` scans for Project scope, erring on the secure side
@@ -603,6 +607,20 @@ mod tests {
     fn repo_configs_present_false_when_empty() {
         let tmp = repo_tmp();
         assert!(!repo_configs_present(tmp.path()));
+    }
+
+    #[test]
+    fn repo_configs_present_detects_cursor_worktree_setup() {
+        let tmp = repo_tmp();
+        let cursor = tmp.path().join(".cursor");
+        std::fs::create_dir_all(&cursor).unwrap();
+        std::fs::write(
+            cursor.join("worktrees.json"),
+            r#"{"setup-worktree": ["npm ci"]}"#,
+        )
+        .unwrap();
+        assert!(repo_configs_present(tmp.path()));
+        assert_eq!(repo_config_kinds(tmp.path()), vec!["worktree-setup"]);
     }
 
     #[test]
