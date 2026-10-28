@@ -3,6 +3,37 @@
 use super::*;
 use crate::app::dispatch::present_export_copy_tip;
 
+#[test]
+fn ask_enters_read_only_mode_and_a_second_bare_ask_leaves_it() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let entered = dispatch(Action::EnterAskMode { prompt: None }, &mut app);
+    assert!(
+        matches!(
+            entered.first(),
+            Some(Effect::SetSessionMode { mode_id, .. }) if mode_id.0.as_ref() == "ask"
+        ),
+        "expected SetSessionMode(ask), got {entered:?}"
+    );
+    assert_eq!(
+        test_agent(&app, id).effective_session_mode(),
+        xai_grok_tools::types::SessionMode::Ask
+    );
+
+    let left = dispatch(Action::EnterAskMode { prompt: None }, &mut app);
+    assert!(
+        matches!(
+            left.first(),
+            Some(Effect::SetSessionMode { mode_id, .. }) if mode_id.0.as_ref() == "default"
+        ),
+        "expected SetSessionMode(default), got {left:?}"
+    );
+    assert_eq!(
+        test_agent(&app, id).effective_session_mode(),
+        xai_grok_tools::types::SessionMode::Default
+    );
+}
+
 /// `ShowPlanNudge` is a no-op when its per-tip gate is off: no tip shown, no count burned, even on a drawable agent.
 #[test]
 fn show_plan_nudge_no_op_when_flag_off() {
