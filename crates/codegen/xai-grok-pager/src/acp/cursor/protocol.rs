@@ -166,11 +166,11 @@ pub(crate) fn normalize_commands(commands: Option<&mut Value>) {
             *meta = Value::Object(Map::new());
         }
         let meta = meta.as_object_mut().expect("_meta is an object");
-        if !meta.get("path").and_then(Value::as_str).is_some() {
+        if meta.get("path").and_then(Value::as_str).is_none() {
             let path = path.unwrap_or_else(|| format!("cursor://skills/{name}"));
             meta.insert("path".to_owned(), Value::String(path));
         }
-        if !meta.get("scope").and_then(Value::as_str).is_some() {
+        if meta.get("scope").and_then(Value::as_str).is_none() {
             meta.insert("scope".to_owned(), Value::String("user".to_owned()));
         }
     }
@@ -352,9 +352,13 @@ pub(crate) fn hoist_skill_prompt(params: &mut Map<String, Value>, skills: &HashS
     let Some(prompt) = params.get_mut("prompt").and_then(Value::as_array_mut) else {
         return;
     };
-    let first = indexes[0];
-    prompt[first]["text"] = Value::String(hoisted);
-    for index in indexes.into_iter().skip(1) {
+    let Some((&first, rest)) = indexes.split_first() else {
+        return;
+    };
+    if let Some(block) = prompt.get_mut(first).and_then(Value::as_object_mut) {
+        block.insert("text".to_owned(), Value::String(hoisted));
+    }
+    for &index in rest {
         if let Some(block) = prompt.get_mut(index) {
             block["text"] = Value::String(String::new());
         }
@@ -373,12 +377,12 @@ pub(crate) fn hoist_skill_text(text: &str, skills: &HashSet<String>) -> Option<S
     }
     let bytes = trimmed.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'/' {
+    while let Some(&byte) = bytes.get(i) {
+        if byte != b'/' {
             i += 1;
             continue;
         }
-        if i > 0 && !bytes[i - 1].is_ascii_whitespace() {
+        if i > 0 && !bytes.get(i - 1).is_some_and(u8::is_ascii_whitespace) {
             i += 1;
             continue;
         }

@@ -287,14 +287,21 @@ pub(crate) struct CloudRepo {
     pub starting_ref: Option<String>,
 }
 
+/// Sets `key` on a JSON object body; the bodies built here are always objects.
+fn put(target: &mut Value, key: &str, value: Value) {
+    if let Some(obj) = target.as_object_mut() {
+        obj.insert(key.to_owned(), value);
+    }
+}
+
 pub(crate) fn create_body(text: &str, repo: Option<&CloudRepo>, model_id: Option<&str>) -> String {
     let mut body = json!({ "prompt": { "text": text } });
     if let Some(repo) = repo {
         let mut entry = json!({ "url": repo.url });
         if let Some(starting_ref) = &repo.starting_ref {
-            entry["startingRef"] = json!(starting_ref);
+            put(&mut entry, "startingRef", json!(starting_ref));
         }
-        body["repos"] = json!([entry]);
+        put(&mut body, "repos", json!([entry]));
     }
     attach_cloud_model(&mut body, model_id);
     body.to_string()
@@ -311,12 +318,12 @@ fn create_body_on_branch(
     if let Some(repo) = repo {
         let mut entry = json!({ "url": repo.url });
         if let Some(starting_ref) = &repo.starting_ref {
-            entry["startingRef"] = json!(starting_ref);
+            put(&mut entry, "startingRef", json!(starting_ref));
         }
-        entry["branchName"] = json!(branch_name);
-        body["repos"] = json!([entry]);
+        put(&mut entry, "branchName", json!(branch_name));
+        put(&mut body, "repos", json!([entry]));
     }
-    body["target"] = json!({ "branchName": branch_name });
+    put(&mut body, "target", json!({ "branchName": branch_name }));
     attach_cloud_model(&mut body, model_id);
     body.to_string()
 }
@@ -806,12 +813,18 @@ fn follow_via_curl(
         args.extend(["-H".to_owned(), format!("Last-Event-ID: {id}")]);
     }
     args.push(url.to_owned());
-    let mut child = std::process::Command::new("curl")
+    let mut command = std::process::Command::new("curl");
+    command
         .args(args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|err| err.to_string())?;
+        .stderr(std::process::Stdio::piped());
+    xai_tty_utils::detach_std_command(&mut command);
+    #[allow(clippy::disallowed_methods)] // enrolled in the session scope below
+    let mut child = command.spawn().map_err(|err| err.to_string())?;
+    let _process_group = xai_tty_utils::global_process_scope()
+        .enroll_std(&child)
+        .inspect_err(|error| tracing::warn!(%error, "cursor cloud: curl left unenrolled"))
+        .ok();
     let stdout = child
         .stdout
         .take()

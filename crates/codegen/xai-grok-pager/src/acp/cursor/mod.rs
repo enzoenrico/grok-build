@@ -364,7 +364,9 @@ impl CursorIo {
 
         let mut cmd = command.tokio_command(yolo);
         cmd.stderr(Stdio::piped());
-        let mut child = match cmd.spawn().with_context(|| {
+        #[allow(clippy::disallowed_methods)] // enrolled in the session scope below
+        let spawned = cmd.spawn();
+        let mut child = match spawned.with_context(|| {
             format!(
                 "failed to start the Cursor agent ({}); install it with `curl https://cursor.com/install -fsS | bash` \
                  or set {CURSOR_AGENT_BIN_ENV}",
@@ -379,6 +381,10 @@ impl CursorIo {
             }
         };
         tracing::info!(program = %command.program.display(), args = ?command.args, pid = ?child.id(), "cursor backend: agent started");
+        let _process_group = xai_tty_utils::global_process_scope()
+            .enroll(&child)
+            .inspect_err(|error| tracing::warn!(%error, "cursor backend: agent left unenrolled"))
+            .ok();
         let _ = spawned_tx.send(Ok(()));
 
         let mut stdin = child.stdin.take().context("cursor-agent stdin")?;

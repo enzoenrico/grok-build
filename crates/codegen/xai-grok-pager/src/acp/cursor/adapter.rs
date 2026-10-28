@@ -1008,7 +1008,7 @@ impl CursorAdapter {
                 }
             }
             if windows.len() == 1 && spec.context_window.is_some() {
-                let alt = if windows[0] == 1_000_000 {
+                let alt = if windows.first() == Some(&1_000_000) {
                     200_000
                 } else {
                     1_000_000
@@ -1217,9 +1217,7 @@ impl CursorAdapter {
         }
 
         if params.is_empty() {
-            return catalog_match
-                .map(|m| m.id.clone())
-                .or_else(|| Some(canonical_base));
+            return catalog_match.map(|m| m.id.clone()).or(Some(canonical_base));
         }
 
         // Prefer an exact catalog variant when its parameter set matches.
@@ -1291,15 +1289,14 @@ fn extract_config_option_hints(config_options: &[Value]) -> (Vec<u64>, Vec<Strin
                 {
                     windows.push(w.get());
                 }
-            } else if category.contains("thought")
+            } else if (category.contains("thought")
                 || category.contains("effort")
-                || category.contains("reasoning")
+                || category.contains("reasoning"))
+                && let Some(eff) = parse_canonical_effort_token(raw)
             {
-                if let Some(eff) = parse_canonical_effort_token(raw) {
-                    let s = eff.to_string();
-                    if !efforts.contains(&s) {
-                        efforts.push(s);
-                    }
+                let s = eff.to_string();
+                if !efforts.contains(&s) {
+                    efforts.push(s);
                 }
             }
         }

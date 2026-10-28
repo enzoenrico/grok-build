@@ -246,10 +246,7 @@ fn bots_from_value(value: &Value) -> Result<Vec<HubBot>, HubError> {
         .or_else(|| value.as_array().map(|_| value))
         .and_then(Value::as_array)
         .ok_or_else(|| HubError::Message("bot list was not a list".to_string()))?;
-    list.iter()
-        .cloned()
-        .map(|item| bot_from_value(&item))
-        .collect()
+    list.iter().map(bot_from_value).collect()
 }
 
 fn bot_from_value(value: &Value) -> Result<HubBot, HubError> {
