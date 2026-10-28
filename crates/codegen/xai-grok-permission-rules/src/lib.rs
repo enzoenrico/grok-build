@@ -6,6 +6,7 @@
 pub mod bash_command_splitting;
 pub mod bash_permission_script;
 pub mod claude_settings;
+mod cursor_cli;
 pub mod domain;
 pub mod env_risk;
 pub mod exec_risk;

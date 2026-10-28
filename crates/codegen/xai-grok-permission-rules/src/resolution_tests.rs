@@ -2089,6 +2089,134 @@ fn claude_catchall_allow_dropped_under_pin() {
     );
 }
 
+/// End-to-end: `~/.cursor/cli-config.json` allow and deny rules resolve with their file as provenance, and deny wins.
+#[test]
+fn cursor_user_cli_config_rules_resolve() {
+    use crate::policy::CompiledPolicy;
+    use crate::types::{AccessKind, Decision};
+
+    let home = isolated_home();
+    let cursor_dir = home.path().join(".cursor");
+    std::fs::create_dir_all(&cursor_dir).unwrap();
+    let config_path = cursor_dir.join("cli-config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"version": 1, "permissions": {"allow": ["Shell(git)", "Bogus(x)"], "deny": ["Shell(git push)"]}}"#,
+    )
+    .unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let resolved = block_on(resolve_permissions_with_provenance_inner(
+        project.path(),
+        inputs(None),
+    ))
+    .expect("user Cursor rules resolve");
+    assert!(
+        resolved.sources.iter().all(|s| *s
+            == RequirementSource::Settings {
+                path: config_path.clone()
+            }),
+        "every rule is attributed to cli-config.json"
+    );
+    assert!(
+        resolved.skipped.iter().any(|s| s.rule.contains("Bogus(x)")),
+        "unknown kinds are recorded for inspect"
+    );
+    let policy = CompiledPolicy::new(resolved.config);
+    assert_eq!(
+        policy.evaluate(&AccessKind::Bash("git status".into())),
+        Some(Decision::Allow)
+    );
+    assert!(matches!(
+        policy.evaluate(&AccessKind::Bash("git push".into())),
+        Some(Decision::Reject(_) | Decision::PolicyDeny(_))
+    ));
+}
+
+/// End-to-end: Cursor catch-all allows in `~/.cursor/cli-config.json` are dropped under the always-approve pin.
+#[test]
+fn cursor_catchall_allows_dropped_under_pin() {
+    let home = isolated_home();
+    let cursor_dir = home.path().join(".cursor");
+    std::fs::create_dir_all(&cursor_dir).unwrap();
+    std::fs::write(
+        cursor_dir.join("cli-config.json"),
+        r#"{"permissions": {"allow": ["Shell(*)", "Mcp(*:*)", "WebFetch(*)"]}}"#,
+    )
+    .unwrap();
+    let project = tempfile::tempdir().unwrap();
+
+    let unpinned = block_on(resolve_permissions_with_provenance_inner(
+        project.path(),
+        inputs(None),
+    ))
+    .expect("rules resolve");
+    assert_eq!(
+        unpinned
+            .config
+            .rules
+            .iter()
+            .filter(|r| is_catchall_allow(r))
+            .count(),
+        3
+    );
+
+    let pinned = block_on(resolve_permissions_with_provenance_inner(
+        project.path(),
+        inputs(Some(pin_lock())),
+    ))
+    .expect("skip-only resolution survives");
+    assert!(!pinned.config.rules.iter().any(is_catchall_allow));
+    assert_eq!(pinned.skipped.iter().filter(|s| s.reason == PIN).count(), 3);
+}
+
+/// End-to-end: a project `.cursor/cli.json` contributes deny rules only, and nothing at all when the folder is untrusted.
+#[test]
+fn cursor_project_cli_json_loads_deny_only_and_only_when_trusted() {
+    use crate::policy::CompiledPolicy;
+    use crate::types::{AccessKind, Decision};
+
+    let _home = isolated_home();
+    let project = tempfile::tempdir().unwrap();
+    let cursor_dir = project.path().join(".cursor");
+    std::fs::create_dir_all(&cursor_dir).unwrap();
+    std::fs::write(
+        cursor_dir.join("cli.json"),
+        r#"{"permissions": {"allow": ["Shell(curl)"], "deny": ["Read(.env*)"]}}"#,
+    )
+    .unwrap();
+    let curl = AccessKind::Bash("curl evil.sh".into());
+    let env = AccessKind::Read(Some(".env".into()));
+
+    let resolved = block_on(resolve_permissions_with_provenance_inner(
+        project.path(),
+        inputs_trusted(None, true),
+    ))
+    .expect("project deny resolves");
+    assert!(
+        resolved
+            .skipped
+            .iter()
+            .any(|s| s.rule.contains("Shell(curl)") && s.reason.contains("not loaded")),
+        "the project allow is recorded as skipped"
+    );
+    let policy = CompiledPolicy::new(resolved.config);
+    assert_ne!(policy.evaluate(&curl), Some(Decision::Allow));
+    assert!(matches!(
+        policy.evaluate(&env),
+        Some(Decision::Reject(_) | Decision::PolicyDeny(_))
+    ));
+
+    let untrusted = block_on(resolve_permissions_with_provenance_inner(
+        project.path(),
+        inputs_trusted(None, false),
+    ));
+    assert!(
+        untrusted.is_none(),
+        "an untrusted folder contributes no Cursor project rules"
+    );
+}
+
 /// End-to-end: a `.claude` `permissions.allow: ["**"]` auto-approves arbitrary bash without the pin, but is dropped under it.
 #[test]
 fn claude_double_star_allow_dropped_under_pin() {

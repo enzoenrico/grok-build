@@ -1,4 +1,4 @@
-//! Merges native `.grok/config.toml`, managed/enterprise settings, and `.claude` settings into the effective `PermissionConfig`.
+//! Merges native `.grok/config.toml`, managed/enterprise settings, `.claude` settings, and Cursor CLI permission files into the effective `PermissionConfig`.
 //! Also holds the MCP-server and marketplace allowlists and the always-approve policy pin.
 
 use crate::claude_settings::*;
@@ -360,7 +360,7 @@ pub struct ResolvedPermissions {
     pub config: PermissionConfig,
     /// `sources[i]` is where `config.rules[i]` came from.
     pub sources: Vec<RequirementSource>,
-    /// Rules from `.claude/settings.json` that couldn't be parsed (empty for TOML).
+    /// Rules from `.claude/settings.json` or Cursor CLI files that were not loaded (empty for TOML).
     pub skipped: Vec<SkippedPermission>,
     /// The always-approve pin this resolution applied ([`yolo_policy_lock`]).
     pub yolo_lock: Option<YoloPolicyLock>,
@@ -558,6 +558,10 @@ async fn resolve_permissions_with_provenance_inner(
             RequirementSource::Settings { path },
         );
     }
+    let (cursor_rules, cursor_skipped) =
+        crate::cursor_cli::load_cursor_cli_permissions(cwd, project_trusted);
+    all_rules.extend(cursor_rules);
+    skipped.extend(cursor_skipped);
 
     // Must run while provenance is in scope (discarded by the unzip below)
     // CLI `--allow '*'` is filtered at its own merge site (acp_session)

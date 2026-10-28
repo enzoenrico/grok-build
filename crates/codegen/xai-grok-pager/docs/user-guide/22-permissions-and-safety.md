@@ -191,6 +191,8 @@ Permission rules can be global (all projects), project-scoped (one repository), 
 | Global (all projects) | `~/.grok/config.toml` | No |
 | Project (committed) | `<project>/.grok/config.toml` | Yes (commit it) |
 | Project (personal) | `<project>/.claude/settings.local.json` | No (gitignore it) |
+| Global, from Cursor | `~/.cursor/cli-config.json` | No |
+| Project deny, from Cursor | `<project>/.cursor/cli.json` | Yes |
 | Interactive grants | Stored internally by Grok, per project | No |
 
 Notes on scoping:
@@ -306,6 +308,29 @@ Supported `defaultMode` values include `default`, `auto`, `acceptEdits`, `bypass
 - `permissions.additionalDirectories` is parsed but not supported.
 
 You can import existing Claude settings interactively with **Ctrl+I** ("Import Claude settings").
+
+### 4. Cursor CLI Compatibility (`.cursor/cli.json`)
+
+Grok reads the `permissions.allow` and `permissions.deny` lists from the Cursor CLI's `~/.cursor/cli-config.json`. A rule you allowed in the Cursor CLI is allowed in Grok, and a rule you denied stays denied.
+
+A project's `<project>/.cursor/cli.json` (from your working directory up to the repo root) contributes only its `deny` rules, and only in a trusted folder. Its `allow` rules are not loaded, because a cloned repository could otherwise approve its own commands. They show up as skipped in `grok inspect`. Move rules you want to keep into `~/.cursor/cli-config.json` or `.grok/config.toml`.
+
+| Cursor rule | Grok rule | Notes |
+|-------------|-----------|-------|
+| `Shell(git)` | `Bash(git)` | `Shell(curl:*)` becomes `Bash(curl)`, and `Shell(git:push*)` becomes `Bash(git push*)`. |
+| `Read(src/**)` | `Read(./src/**)` | An `allow` is rooted at your working directory, so `Read(*)` becomes `Read(./**)`. A `deny` is kept as written. |
+| `Write(**/.env*)` | `Edit(**/.env*)` | Rooted the same way as `Read`. |
+| `Mcp(github:get_issue)` | `MCPTool(github__get_issue)` | `Mcp(github:*)` covers every tool on the server. `Mcp(*:search)` covers `search` on every server. |
+| `WebFetch(*.example.com)` | `WebFetch(domain:example.com)` | Also matches `example.com` itself. |
+| `WebFetch(example.com)` | `https://example.com/*` and `http://example.com/*` for `allow`. `WebFetch(domain:example.com)` for `deny`. | An `allow` stays exact-host, so it does not allow `evil.example.com`. A `deny` also covers subdomains. |
+
+Grok matches a `Bash` rule against the whole command line, while Cursor matches the command name against the first word. Where that would make a Grok rule wider than the Cursor one, an `allow` is skipped and a `deny` keeps the wider form:
+
+- A glob in the command name, as in `Shell(*sh)`. The `allow` is skipped. The `deny` becomes `Bash(*sh)` plus `Bash(*sh *)`.
+- Exact arguments, as in `Shell(git:status)`. Grok would also allow `git status --porcelain`, so the `allow` is skipped. End the arguments with `*` to allow the prefix on purpose.
+- `WebFetch(*.www.example.com)`. Grok ignores a leading `www.`, so the `allow` would cover all of `example.com`. It is skipped.
+
+Entries with any other kind, or that do not parse, are skipped and listed in `grok inspect`. Cursor's `approvalMode` and other settings are not read.
 
 ---
 
