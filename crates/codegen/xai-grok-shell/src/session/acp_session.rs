@@ -175,6 +175,7 @@ mod prompt_offload;
 pub(crate) use prompt_offload::LARGE_PROMPT_THRESHOLD;
 #[path = "acp_session_impl/session_mode.rs"]
 mod session_mode;
+pub(crate) use session_mode::builtin_session_modes;
 use session_mode::*;
 #[path = "acp_session_impl/child_tool_projection.rs"]
 mod child_tool_projection;

@@ -437,6 +437,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "agents-dashboard",
     "always-approve",
     "announcements",
+    "ask",
     "auto",
     "btw",
     "cd",

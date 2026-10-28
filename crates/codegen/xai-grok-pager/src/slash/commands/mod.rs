@@ -1,6 +1,7 @@
 //! Each command lives in its own submodule. This module re-exports command structs and provides `builtin_commands()` for registry construction.
 pub mod always_approve;
 pub mod announcements;
+pub mod ask;
 pub mod auto;
 pub mod bot;
 pub mod btw;
@@ -102,6 +103,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         // Steering the work in front of you.
         Arc::new(loop_cmd::LoopCommand),
         Arc::new(plan::PlanCommand),
+        Arc::new(ask::AskCommand),
         Arc::new(view_plan::ViewPlanCommand),
         Arc::new(remember::RememberCommand),
         Arc::new(memory::MemoryCommand),

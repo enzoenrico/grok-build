@@ -180,6 +180,86 @@ pub(super) fn set_plan_mode(
     }]
 }
 
+/// `/ask` toggles read-only ask mode. `/ask <prompt>` enters ask mode and sends the prompt after the mode switch.
+pub(super) fn dispatch_enter_ask_mode(app: &mut AppView, prompt: Option<String>) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+    if app.reconnect_pending {
+        agent.show_toast(super::prompt::RECONNECTING_NOTICE);
+        return vec![];
+    }
+    let Some(session_id) = agent.session.session_id.clone() else {
+        agent.show_toast(NO_SESSION_NOTICE);
+        return vec![];
+    };
+
+    let in_ask = agent.effective_session_mode() == SessionMode::Ask;
+    let prompt = prompt.filter(|text| !text.trim().is_empty());
+    if in_ask && prompt.is_none() {
+        agent.stage_session_mode(SessionMode::Default);
+        app.show_toast("Ask mode off");
+        return vec![Effect::SetSessionMode {
+            session_id,
+            mode_id: acp::SessionModeId::new(SessionMode::Default.as_id()),
+        }];
+    }
+    if !in_ask {
+        agent.stage_session_mode(SessionMode::Ask);
+        app.show_toast("Ask mode on");
+    }
+    let mode_id = acp::SessionModeId::new(SessionMode::Ask.as_id());
+    let Some(prompt) = prompt else {
+        return vec![Effect::SetSessionMode {
+            session_id,
+            mode_id,
+        }];
+    };
+
+    let agent = app.agents.get_mut(&id).unwrap();
+    let skill_token_ranges = agent
+        .prompt
+        .slash_controller
+        .recognized_token_ranges(&prompt, &agent.session.models);
+    agent
+        .session
+        .enqueue_prompt_with_skill_tokens(prompt, skill_token_ranges);
+    let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
+    note_peek_page_flip(app, id, drain.page_flip_entry);
+    let mut effects = Vec::new();
+    for eff in drain.effects {
+        match eff {
+            Effect::SendPrompt {
+                agent_id,
+                text,
+                prompt_id,
+                skill_token_ranges,
+                ..
+            } if !in_ask => {
+                effects.push(Effect::SetModeThenPrompt {
+                    session_id: session_id.clone(),
+                    mode_id: mode_id.clone(),
+                    agent_id,
+                    text,
+                    prompt_id,
+                    skill_token_ranges,
+                });
+            }
+            other => effects.push(other),
+        }
+    }
+    if effects.is_empty() && !in_ask {
+        effects.push(Effect::SetSessionMode {
+            session_id,
+            mode_id,
+        });
+    }
+    effects
+}
+
 /// Format the `Plan mode` toast.
 /// Non-destructive in both directions (unlike YOLO), so both ON and OFF use the uniform ✓ glyph.
 /// Uses lowercase "on"/"off" via `save_success_toast`.
