@@ -239,6 +239,16 @@ fn resolve_routes_builtin() {
 }
 
 #[test]
+fn compress_alias_resolves_to_compact() {
+    let blocks = vec![text_block("/compress")];
+    let outcome = resolve(blocks, &[], all_gated(), SkillSlashRewrite::default(), &[]).unwrap_err();
+    assert!(matches!(
+        outcome,
+        SlashCommandOutcome::Builtin(BuiltinAction::Compact)
+    ));
+}
+
+#[test]
 fn status_alias_resolves_to_session_info() {
     let outcome = resolve(
         vec![text_block("/status")],

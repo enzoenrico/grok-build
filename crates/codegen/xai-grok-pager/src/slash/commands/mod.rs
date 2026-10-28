@@ -722,6 +722,18 @@ mod tests {
         );
     }
     #[test]
+    fn compress_aliases_compact_and_queues_the_compaction() {
+        let reg = CommandRegistry::new(builtin_commands());
+        let compress = reg.get("compress").expect("/compress is registered");
+        assert_eq!(compress.name(), "compact");
+        let models = ModelState::default();
+        let mut ctx = make_ctx(&models);
+        assert!(matches!(
+            compress.run(&mut ctx, ""),
+            CommandResult::QueueCommand(cmd) if cmd == "/compact"
+        ));
+    }
+    #[test]
     fn gboom_bare_invocation_opens_game() {
         let models = ModelState::default();
         let mut ctx = make_ctx(&models);

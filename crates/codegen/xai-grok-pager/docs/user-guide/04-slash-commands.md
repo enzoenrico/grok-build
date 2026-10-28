@@ -26,7 +26,7 @@ Not `/config-agents` (alias `/agents`), which manages agent *definitions* and pe
 
 ### `/compact`
 
-Compress conversation history to reclaim context-window space.
+Compress conversation history to reclaim context-window space. `/compress` is an alias, matching the Cursor CLI.
 
 Grok also auto-compacts once the context window hits 85% (tune it with `[session] auto_compact_threshold_percent`).
 
