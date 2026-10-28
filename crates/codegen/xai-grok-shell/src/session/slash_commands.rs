@@ -442,6 +442,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "btw",
     "cd",
     "changelog",
+    "changes",
     "chat",
     "clear",
     "cloud",

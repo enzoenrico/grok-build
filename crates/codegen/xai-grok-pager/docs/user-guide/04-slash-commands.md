@@ -47,6 +47,10 @@ Branch the current session into a new agent, keeping history up to this point.
 
 Roll the conversation back to an earlier turn and discard everything after it. `/undo` is the same command.
 
+### `/changes`
+
+Review the files the agent changed in this session, one file at a time, built from the edit diffs in the conversation. Files are listed in the order they were first edited, and repeated edits to one file are grouped under it. `←`/`→` (or `h`/`l`) switch files and wrap around, `↑`/`↓`, `PgUp`/`PgDn` scroll the diff, `i` closes the review and starts a follow-up prompt about the current file (`About <path>: `), and `Esc` or `q` closes it.
+
 ### `/copy`
 
 Copy the most recent response's source markdown to the clipboard. Pass a number to copy the Nth-latest response instead, or a file path to write the text to a file rather than the clipboard (handy over SSH, where the local clipboard is often unreachable).

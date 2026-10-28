@@ -5,6 +5,7 @@ pub mod auto;
 pub mod bot;
 pub mod btw;
 pub mod cd;
+pub mod changes;
 pub mod cloud;
 pub mod compact;
 pub mod compact_mode;
@@ -109,6 +110,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(memory_ops::DreamCommand),
         Arc::new(recap::RecapCommand),
         Arc::new(rewind::RewindCommand),
+        Arc::new(changes::ChangesCommand),
         Arc::new(jump::JumpCommand),
         Arc::new(expand::ExpandCommand),
         Arc::new(edit_prompt::EditPromptCommand),

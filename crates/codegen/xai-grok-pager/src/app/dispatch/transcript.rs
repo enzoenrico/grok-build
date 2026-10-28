@@ -268,6 +268,27 @@ pub(crate) fn dispatch_open_transcript_pager(app: &mut AppView) {
     }
 }
 
+/// Open the `/changes` review built from the edit diffs in the active agent's scrollback.
+pub(super) fn dispatch_show_changes(app: &mut AppView) -> Vec<Effect> {
+    use crate::views::change_review::ChangeReview;
+    use crate::views::modal::ActiveModal;
+
+    with_active_agent(app, |agent| {
+        let review = ChangeReview::from_blocks(
+            agent
+                .scrollback
+                .iter_entries()
+                .map(|(_, entry)| &entry.block),
+            agent.scrollback.cwd(),
+        );
+        agent.active_modal = Some(ActiveModal::ChangeReview {
+            review,
+            window: crate::views::modal_window::ModalWindowState::new(),
+        });
+    });
+    vec![]
+}
+
 /// Open the fullscreen block viewer for the selected entry.
 /// Falls back to the image viewer only for entries without a normal block viewer.
 pub(super) fn dispatch_open_block_viewer(app: &mut AppView) {
