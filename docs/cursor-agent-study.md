@@ -113,14 +113,13 @@ Each row was checked in this tree. Paths are under `crates/codegen/`.
 
 ## What was ported
 
-Four ports landed, each in its own commit with build, clippy, and tests on the crates it touches.
+Five ports landed, each in its own commit with build, clippy, and tests on the crates it touches.
 
 - **Cursor permission files** (`xai-grok-permission-rules`). Grok reads `permissions.allow` and `permissions.deny` from `~/.cursor/cli-config.json`. A project's `.cursor/cli.json` loads only in a trusted folder, and the folder-trust gate counts the file through the same walk the loader reads. Grok matches `Bash` rules against the whole command line, while Cursor matches the first word. So an allow whose Grok form would be wider is skipped, as with a glob in the command name or exact `cmd:args` arguments, and a deny keeps the wider form. An exact-host `WebFetch(example.com)` allow becomes two scheme-anchored URL globs, so it does not also allow `evil.example.com`. Relative `Read` and `Write` allows are rooted at the working directory.
 - **Worktree setup** (`xai-grok-workspace`). Every worktree create path runs `.cursor/worktrees.json`, including the sync fork behind `grok -w`. It runs only for an explicitly trusted source folder, and the trust gate now counts the file. A failure keeps the worktree and becomes a creation warning. The parsed `WorktreeCreate` hook still does not fire, which is left for a later change.
 - **`/compress`** (`xai-grok-pager`). It is an alias of `/compact`.
 - **`--output-format cursor-stream-json`** (`xai-grok-pager`). It emits Cursor's `system/init`, `user`, `assistant`, `tool_call` `started`/`completed`, and `result` events. Reads and edits are keyed `readToolCall` and `writeToolCall`, and other tools are `function` calls. Errors go to stderr with no `result`, as in Cursor. `text` is accepted for `plain`, and `--stream-partial-output` for `--include-partial-messages`. The format has its own name because `stream-json` is the shape Grok's Claude-compatible `streaming-messages-json` follows.
-
-The change-review view (item 6) was not attempted. It is a new TUI screen, larger than the rest combined.
+- **`/changes`** (`xai-grok-pager`). It is a modal that reviews the files changed this session, built from the edit and write diffs already in the scrollback. Files are listed in first-edit order with each file's edits grouped. Left and Right switch files, Up and Down scroll, and `i` closes it with a follow-up on the current file in the prompt. It is a slash command because Grok's Ctrl+R opens the session picker.
 
 ## Building without DotSlash
 
