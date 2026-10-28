@@ -1317,6 +1317,13 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
             }
             vec![]
         }
+        CommandResult::Action(Action::EnterAskMode { .. }) => {
+            if let Some(d) = app.dashboard.as_mut() {
+                d.dispatch.set_text("");
+                d.set_error_toast("Open a session to use /ask.");
+            }
+            vec![]
+        }
         CommandResult::Action(action) => {
             if let Some(d) = app.dashboard.as_mut() {
                 d.dispatch.set_text("");

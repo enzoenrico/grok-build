@@ -437,7 +437,10 @@ impl SessionActor {
         };
 
         let plan_active = self.plan_mode.lock().is_active();
-        filter_cursor_tools_by_plan_mode(defs, plan_active)
+        let defs = filter_cursor_tools_by_plan_mode(defs, plan_active);
+        let prompt_mode = *self.current_prompt_mode.lock();
+        let kinds = bridge.toolset().tool_kind_map();
+        filter_tools_for_prompt_mode(defs, &kinds, prompt_mode)
     }
 
     /// Messages-backed models never see `use_tool`'s file forms: the Anthropic Messages API rejects the schema's

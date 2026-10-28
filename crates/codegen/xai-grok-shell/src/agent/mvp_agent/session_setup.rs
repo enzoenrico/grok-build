@@ -16,6 +16,21 @@ pub(super) const RESUME_REFUSES_EXTRA_DIRS: &str =
     "session/resume does not support additionalDirectories";
 const TOOL_OVERRIDES_ECHO_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 const BACKGROUND_TASKS_SNAPSHOT_ACK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+async fn read_prompt_mode(
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<SessionCommand>,
+) -> crate::session::plan_mode::PromptMode {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if cmd_tx
+        .send(SessionCommand::GetCurrentPromptMode { responds_to: tx })
+        .is_err()
+    {
+        return crate::session::plan_mode::PromptMode::Agent;
+    }
+    match tokio::time::timeout(TOOL_OVERRIDES_ECHO_BUDGET, rx).await {
+        Ok(Ok(mode)) => mode,
+        _ => crate::session::plan_mode::PromptMode::Agent,
+    }
+}
 async fn read_applied_tool_overrides(
     cmd_tx: &tokio::sync::mpsc::UnboundedSender<SessionCommand>,
 ) -> Option<xai_grok_sampling_types::ToolOverrides> {
@@ -871,7 +886,8 @@ impl MvpAgent {
         };
         self.report_setup_phase(SessionSetupPhase::ToolOverrides);
         let echo_timer = crate::instrumentation_timer!("session.new_session.tool_overrides_echo");
-        let applied_tool_overrides = match self.session_handle_waiting_for_load(&session_id).await {
+        let session_handle = self.session_handle_waiting_for_load(&session_id).await;
+        let applied_tool_overrides = match &session_handle {
             Some(handle) if resolved_custom_model.is_none() => {
                 spawn_snapshot_tool_overrides(&handle.spawn_snapshot)
             }
@@ -883,6 +899,10 @@ impl MvpAgent {
                 );
                 None
             }
+        };
+        let prompt_mode = match &session_handle {
+            Some(handle) => read_prompt_mode(&handle.cmd_tx).await,
+            None => crate::session::plan_mode::PromptMode::Agent,
         };
         drop(echo_timer);
         let mut meta = serde_json::json!({
@@ -916,6 +936,9 @@ impl MvpAgent {
         let config_options = self.acp_config_options(Some(&session_id), &models);
         self.report_setup_phase(SessionSetupPhase::ResponseReady);
         Ok(acp::NewSessionResponse::new(session_id)
+            .modes(Some(crate::session::acp_session::builtin_session_modes(
+                prompt_mode,
+            )))
             .models(Some(models))
             .config_options(Some(config_options))
             .meta(meta.as_object().cloned()))
@@ -1379,7 +1402,15 @@ impl MvpAgent {
             .await;
         xai_grok_telemetry::unified_log::info("session loaded", Some(session_id.0.as_ref()), None);
         let config_options = self.acp_config_options(Some(&session_id), &model_state);
+        let prompt_mode = if let Some(handle) = self.resident_handle(&session_id) {
+            read_prompt_mode(&handle.cmd_tx).await
+        } else {
+            crate::session::plan_mode::PromptMode::Agent
+        };
         let response = acp::LoadSessionResponse::new()
+            .modes(Some(crate::session::acp_session::builtin_session_modes(
+                prompt_mode,
+            )))
             .models(Some(model_state))
             .config_options(Some(config_options))
             .meta(response_meta.as_object().cloned());

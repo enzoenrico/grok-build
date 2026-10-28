@@ -66,6 +66,7 @@ fn process_identity(command: Option<&Command>, is_interactive: bool) -> Option<P
             | Command::Memory(_)
             | Command::Models
             | Command::Sessions(_)
+            | Command::Grokbot(_)
             | Command::Usage(_)
             | Command::Setup { .. }
             | Command::Share(_)
@@ -106,6 +107,7 @@ fn command_needs_pre_sandbox_policy_heal(command: Option<&Command>) -> bool {
             | Command::Plugin(_)
             | Command::Memory(_)
             | Command::Sessions(_)
+            | Command::Grokbot(_)
             | Command::Usage(_)
             | Command::Setup { .. }
             | Command::Share(_)
@@ -2307,6 +2309,10 @@ async fn async_main(mut args: PagerArgs) -> Result<()> {
                 let agent_config = xai_grok_shell::config::load_agent_config_disk_only()
                     .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
                 return xai_grok_pager::sessions_cmd::run(sessions_args, &agent_config).await;
+            }
+            Command::Grokbot(grokbot_args) => {
+                init_tracing_simple("cli");
+                return xai_grok_pager::grokbot_cmd::run(grokbot_args).await;
             }
             Command::Usage(usage_args) => {
                 init_tracing_simple("cli");
