@@ -88,16 +88,16 @@ Each row was checked in this tree. Paths are under `crates/codegen/`.
 
 | Cursor pattern | Grok | Evidence |
 |---|---|---|
-| Headless `text`/`json`/`stream-json` with `tool_call` events | Partial. Grok has `plain`, `json`, `streaming-json`, and Claude-shaped `streaming-messages-json`. Nothing emits Cursor's `tool_call` started/completed events. | `xai-grok-pager/src/headless/cli.rs` |
+| Headless `text`/`json`/`stream-json` with `tool_call` events | Partial before this branch. Grok had `plain`, `json`, `streaming-json`, and Claude-shaped `streaming-messages-json`, and nothing emitted Cursor's `tool_call` started/completed events. `cursor-stream-json` adds them (see below). | `xai-grok-pager/src/headless/cli.rs` |
 | Shell Mode | Present as `!`. The timeout is one hour, not 30 seconds. | `xai-grok-shell/src/session/acp_session_impl/tool_dispatch.rs:8` |
 | `&` cloud handoff | Partial. Only on the Cursor backend. | `xai-grok-pager/src/acp/cursor/cloud.rs` |
 | Agent/Plan/Ask rotation | Partial. Shift+Tab cycles permission modes. There is no native read-only Ask mode. | `xai-grok-pager/src/app/actions.rs` |
 | Ctrl+R change review | Missing. Ctrl+R opens the session picker. | `xai-grok-pager/docs/user-guide/03-keyboard-shortcuts.md:253` |
-| `/summarize` compaction | Different. `/summarize` is an alias of `/recap`, which prints a summary and does not compact. Compaction is `/compact`. | `xai-grok-pager/src/slash/commands/recap.rs:15` |
+| `/summarize` compaction | Different. `/summarize` is an alias of the hidden-by-default `/recap`, which prints a summary and does not compact. Compaction is `/compact`, and this branch adds the `/compress` alias. | `xai-grok-pager/src/slash/commands/recap.rs:15` |
 | Cursor permission files | Missing before this branch. Added by the port below. | `xai-grok-permission-rules/src/cursor_cli.rs` |
 | Title, notifications, running time, suggestions | Present. | `xai-grok-pager/src/notifications/`, `xai-grok-pager/src/views/prompt_suggestion.rs` |
-| Worktree setup scripts | Missing. `-w` exists. A `WorktreeCreate` hook is parsed and then dropped, and `.cursor/worktrees.json` is not read. | `xai-grok-hooks/src/config.rs:1448` |
-| Read tool metadata | Partial. Only the total line count is returned, and truncation is a text marker. | `xai-grok-tools/src/types/output.rs` |
+| Worktree setup scripts | Missing before this branch. `-w` exists. A `WorktreeCreate` hook is parsed and then dropped. This branch runs `.cursor/worktrees.json` (see below). | `xai-grok-hooks/src/config.rs:1448` |
+| Read tool metadata | Present in substance. Cursor's fields are structured, while Grok tells the model in text. That text covers an empty file, a truncated window with the total line count and the lines shown, and the `offset` to resume from. | `xai-grok-tools/src/implementations/grok_build/read_file/mod.rs` |
 | Rules, `AGENTS.md`, `CLAUDE.md` | Present, behind folder trust. | `xai-grok-agent/src/prompt/agents_md.rs` |
 | Masked sudo prompt | Partial. Works only when the user sets `SUDO_ASKPASS`. | `xai-grok-tools/src/computer/local/shell_state.rs` |
 | Bracket model parameters | Partial. Supported on the Cursor backend. Native Grok uses `--effort`, `--context-window`, and `--fast`. | `xai-grok-pager/src/acp/cursor/adapter.rs` |
@@ -106,21 +106,24 @@ Each row was checked in this tree. Paths are under `crates/codegen/`.
 
 1. **Cursor permission files.** A Cursor user's allowlist is the most direct carry-over. Without it, every command they already approved in Cursor prompts again in Grok. This lives in `xai-grok-permission-rules`. It is done on this branch.
 2. **Worktree setup.** Run `.cursor/worktrees.json` setup commands, and make the parsed `WorktreeCreate` hook fire, when Grok creates a worktree. A fresh worktree without dependencies installed is the first thing the agent trips on.
-3. **Read tool metadata.** Return `isEmpty`, `exceededLimit`, and `totalChars` as fields, not a text marker. The model then knows whether to page the rest of the file.
-4. **`/summarize` and `/compress` as compaction.** A Cursor user typing `/summarize` expects the context to shrink. Today they get a recap and a full context window.
+3. **Read tool metadata.** Dropped on inspection. Grok's read tool already tells the model what Cursor's `isEmpty`, `exceededLimit`, and `totalLines` fields carry, and it adds the exact offset to resume from.
+4. **`/compress` as compaction.** A Cursor user typing `/compress` expects the context to shrink. `/summarize` is a different story. Grok deliberately maps it to `/recap`, a hidden-by-default command that prints a summary, so repointing it is a product call left to Grok's owners.
 5. **Cursor-shaped `stream-json`.** Add `tool_call` started/completed events so scripts written against Cursor's headless output keep working.
 6. **A change-review view** for the files a turn changed. This is the largest UX item. Ctrl+R is already taken, so it needs a new key or slash command.
 
 ## What was ported
 
-Item 1 landed. Grok now reads `permissions.allow` and `permissions.deny` from `~/.cursor/cli-config.json`.
-From a project's `.cursor/cli.json`, Grok takes only the deny rules, and only in a trusted folder.
-Project allow rules are skipped, because the folder-trust gate in `xai-grok-workspace` does not yet count `.cursor/cli.json` as a trust-sensitive file. A cloned repository could otherwise approve its own commands.
-An exact-host `WebFetch(example.com)` allow becomes two scheme-anchored URL globs. Grok's domain mode would also have allowed `evil.example.com`.
-Grok matches `Bash` rules against the whole command line, while Cursor matches the first word. So an allow whose Grok form would be wider is skipped, as with a glob in the command name or exact `cmd:args` arguments. A deny keeps the wider form.
-Relative `Read` and `Write` allows are rooted at the working directory, matching Cursor's workspace scoping.
-The user guide documents the mapping in `22-permissions-and-safety.md`.
+Four ports landed, each in its own commit with build, clippy, and tests on the crates it touches.
 
-Items 2 through 6 live in `xai-grok-pager`, `xai-grok-tools`, `xai-grok-hooks`, or `xai-grok-shell`.
-Each of those crates depends on `xai-grok-tools-api`, whose build script needs `protoc`. The repository resolves `protoc` through DotSlash (`bin/protoc`).
-Neither DotSlash nor `protoc` was installed on the study machine, and fetching the pinned release was not permitted. Those crates could not be compiled, so changes to them were not attempted.
+- **Cursor permission files** (`xai-grok-permission-rules`). Grok reads `permissions.allow` and `permissions.deny` from `~/.cursor/cli-config.json`. From a project's `.cursor/cli.json` it takes only deny rules, and only in a trusted folder, because the trust gate does not count that file. Grok matches `Bash` rules against the whole command line, while Cursor matches the first word. So an allow whose Grok form would be wider is skipped, as with a glob in the command name or exact `cmd:args` arguments, and a deny keeps the wider form. An exact-host `WebFetch(example.com)` allow becomes two scheme-anchored URL globs, so it does not also allow `evil.example.com`. Relative `Read` and `Write` allows are rooted at the working directory.
+- **Worktree setup** (`xai-grok-workspace`). Every worktree create path runs `.cursor/worktrees.json`, including the sync fork behind `grok -w`. It runs only for an explicitly trusted source folder, and the trust gate now counts the file. A failure keeps the worktree and becomes a creation warning. The parsed `WorktreeCreate` hook still does not fire, which is left for a later change.
+- **`/compress`** (`xai-grok-pager`). It is an alias of `/compact`.
+- **`--output-format cursor-stream-json`** (`xai-grok-pager`). It emits Cursor's `system/init`, `user`, `assistant`, `tool_call` `started`/`completed`, and `result` events. Reads and edits are keyed `readToolCall` and `writeToolCall`, and other tools are `function` calls. Errors go to stderr with no `result`, as in Cursor. `text` is accepted for `plain`, and `--stream-partial-output` for `--include-partial-messages`. The format has its own name because `stream-json` is the shape Grok's Claude-compatible `streaming-messages-json` follows.
+
+The change-review view (item 6) was not attempted. It is a new TUI screen, larger than the rest combined.
+
+## Building without DotSlash
+
+The pager, tools, hooks, shell, and workspace crates depend on `xai-grok-tools-api`, whose build script runs `protoc` on `proto/grok-tools.proto`. The repository resolves `protoc` through DotSlash (`bin/protoc`), which was not installed, and fetching the pinned release was not permitted.
+These crates were verified with a small local stand-in instead. It is a dependency-free Python script that parses the proto3 subset that file uses and writes the `FileDescriptorSet` that `prost-build` reads. It was pointed to with `PROTOC`, and it lived outside the repository.
+`xai-grok-tools-api`'s own tests pass against its output, including the wire-shape test, and `xai-grok-pager-bin` builds with it. Builds with the real `protoc` remain the reference.
