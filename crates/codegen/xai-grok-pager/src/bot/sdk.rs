@@ -13,8 +13,6 @@ use xai_tool_protocol::{SessionId, ToolId};
 use xai_tool_runtime::{ContentBlock, ToolCallContext, ToolError, ToolErrorKind, ToolStreamItem};
 
 use super::hub::{AwaitedTurn, BotHub, HubBot, HubError, OnBusy, SendAccepted};
-use super::session::LOGIN_HINT;
-use super::{BotInput, BotSession, HubRun, SubmitOutcome};
 
 /// Talk to the computer hub with the grok.com credential the shell already uses.
 pub struct SdkBotHub {
@@ -151,24 +149,6 @@ async fn enable_bot_turn_notifications(harness: &ToolHarness) {
         }
     }
     tokio::spawn(async move { while notifications.recv().await.is_some() {} });
-}
-
-/// Open the hub once and run one `/bot` line or one plain prompt.
-pub async fn run_with_hub(mut session: BotSession, input: BotInput) -> HubRun {
-    match SdkBotHub::connect().await {
-        Ok(hub) => {
-            let outcome = session.submit(input, &hub).await;
-            HubRun { session, outcome }
-        }
-        Err(HubError::NeedsLogin) => HubRun {
-            session,
-            outcome: SubmitOutcome::Shown(LOGIN_HINT.to_string()),
-        },
-        Err(error) => HubRun {
-            session,
-            outcome: SubmitOutcome::Shown(error.to_string()),
-        },
-    }
 }
 
 async fn grok_com_token() -> Result<String, HubError> {

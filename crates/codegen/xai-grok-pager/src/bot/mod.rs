@@ -1,13 +1,17 @@
-//! Route a pager session to a Grok bot that already lives on the computer hub.
+//! Route a pager session to a Grok bot on the computer hub or the Grok Bot gateway.
 //!
 //! The route is not a cloud job. `/bot` lists and selects. Later plain prompts
-//! call `bot_send_prompt` then `bot_await_turn` until `/bot off`.
+//! call `send_prompt` then `await_turn` until `/bot off`. `[bot] provider` picks the service.
 
+mod gateway;
 mod hub;
 mod image;
+mod provider;
 mod sdk;
 mod session;
 
+#[cfg(test)]
+mod gateway_tests;
 #[cfg(test)]
 mod tests;
 
@@ -31,5 +35,5 @@ pub struct HubRun {
     pub outcome: SubmitOutcome,
 }
 
-pub use sdk::run_with_hub;
+pub use provider::run;
 pub(crate) use sdk::{awaited_turn_from_tool_result, bots_from_tool_result};
