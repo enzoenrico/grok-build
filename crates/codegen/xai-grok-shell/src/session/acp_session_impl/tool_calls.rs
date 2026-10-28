@@ -343,6 +343,7 @@ impl SessionActor {
         let mut final_result: Option<ToolLoop> = None;
         let mut deferred_followups: Vec<ConversationItem> = Vec::new();
         let tool_calls = self.reject_excess_media_gen_calls(tool_calls).await?;
+        let tool_calls = self.reject_ask_mode_mutations(tool_calls).await?;
         if !tool_calls.is_empty() {
             if tool_calls.len() > 1 {
                 let kind_of = |name: &str| self.agent.borrow().tool_bridge().tool_kind(name);
@@ -477,6 +478,46 @@ impl SessionActor {
             allowed = allowed.len(),
             "media_gen batch limit rejected tool calls"
         );
+        Ok(allowed)
+    }
+
+    /// Ask mode already hid mutating tools. This catches a call whose schema was from the previous mode.
+    async fn reject_ask_mode_mutations(
+        &self,
+        tool_calls: Vec<crate::sampling::types::ToolCallResponse>,
+    ) -> Result<Vec<crate::sampling::types::ToolCallResponse>, acp::Error> {
+        if *self.current_prompt_mode.lock() != crate::session::plan_mode::PromptMode::Ask {
+            return Ok(tool_calls);
+        }
+        let kind_of = |name: &str| self.agent.borrow().tool_bridge().tool_kind(name);
+        let mut allowed = Vec::with_capacity(tool_calls.len());
+        for call in tool_calls {
+            if ask_mode_allows_kind(kind_of(&call.function.name)) {
+                allowed.push(call);
+                continue;
+            }
+            let tool_name = call.function.name.clone();
+            let tool_call_id = acp::ToolCallId::new(std::sync::Arc::from(call.id.clone()));
+            let early_raw_input =
+                serde_json::from_str::<serde_json::Value>(&call.function.arguments).ok();
+            let meta = self.stamp_tool_meta(None, &tool_name, None);
+            self.send_update(
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(tool_call_id.clone(), tool_name.clone())
+                        .kind(acp::ToolKind::Other)
+                        .status(acp::ToolCallStatus::Pending)
+                        .raw_input(early_raw_input)
+                        .meta(meta),
+                ),
+                None,
+            )
+            .await;
+            let message = format!(
+                "Ask mode is read-only, so `{tool_name}` was not run. Leave ask mode with /ask to edit files or run commands."
+            );
+            self.handle_tool_not_executed(&call.id, &tool_call_id, message)
+                .await?;
+        }
         Ok(allowed)
     }
     /// Runs prepare, then dispatch, then post-flight.

@@ -45,6 +45,12 @@ impl CapabilityMode {
         }
     }
 
+    /// Whether a tool of `kind` may run in this mode.
+    /// The same table [`CapabilityMode::filter`] uses, so ask mode and read-only subagents agree.
+    pub fn allows(self, kind: ToolKind) -> bool {
+        kind_allowed(self, kind)
+    }
+
     /// Whether every kind allowed by `self` is also allowed by `other`.
     /// Used by `fork_session` to reject capability widening.
     pub fn is_subset_of(self, other: CapabilityMode) -> bool {

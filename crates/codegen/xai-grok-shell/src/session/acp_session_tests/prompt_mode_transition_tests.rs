@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use super::support::*;
 use super::*;
 use crate::session::plan_mode::PlanModeState;
+use xai_grok_tools::types::tool::ToolKind;
 /// An actor plus the `SessionEvent` channel that carries its mode updates.
 /// Plan-mode changes deliberately queue behind the turn's streaming deltas rather than emitting straight to the client.
 /// The assertions therefore read that channel and not the gateway.
@@ -50,6 +53,42 @@ fn fn_def(name: &str) -> ToolDefinition {
 fn names(defs: &[ToolDefinition]) -> Vec<&str> {
     defs.iter().map(|d| d.function.name.as_str()).collect()
 }
+
+#[test]
+fn ask_mode_hides_edit_and_shell_and_keeps_read_and_search() {
+    let defs = vec![
+        fn_def("read_file"),
+        fn_def("grep"),
+        fn_def("edit_file"),
+        fn_def("bash"),
+        fn_def("use_tool"),
+        fn_def("unknown_tool"),
+    ];
+    let kinds = HashMap::from([
+        ("read_file".to_string(), ToolKind::Read),
+        ("grep".to_string(), ToolKind::Search),
+        ("edit_file".to_string(), ToolKind::Edit),
+        ("bash".to_string(), ToolKind::Execute),
+        ("use_tool".to_string(), ToolKind::UseTool),
+    ]);
+    let asked = filter_tools_for_prompt_mode(defs.clone(), &kinds, PromptMode::Ask);
+    assert_eq!(names(&asked), vec!["read_file", "grep"]);
+    let agent = filter_tools_for_prompt_mode(defs, &kinds, PromptMode::Agent);
+    assert_eq!(names(&agent).len(), 6);
+}
+
+#[test]
+fn builtin_session_modes_publish_agent_plan_and_ask() {
+    let modes = builtin_session_modes(PromptMode::Ask);
+    assert_eq!(modes.current_mode_id.0.as_ref(), "ask");
+    let ids: Vec<&str> = modes
+        .available_modes
+        .iter()
+        .map(|mode| mode.id.0.as_ref())
+        .collect();
+    assert_eq!(ids, ["default", "plan", "ask"]);
+}
+
 #[test]
 fn cursor_filter_in_plan_mode_keeps_writes_and_shows_create_plan() {
     let defs = vec![

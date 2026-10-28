@@ -26,6 +26,45 @@ pub(super) fn filter_cursor_tools_by_plan_mode(
 ) -> Vec<ToolDefinition> {
     defs
 }
+
+/// Shown once on a user turn while ask mode is the current prompt mode.
+pub(super) const ASK_MODE_REMINDER: &str = "\
+Ask mode is read-only. Search and read the codebase, then answer. \
+Do not edit files or run commands. Leave ask mode with /ask when the user wants changes.";
+
+/// The modes a Cursor-style CLI session publishes: agent, plan, and ask.
+/// `current` is the mode the session is in now. Debug stays unpublished because this agent has no debug loop.
+pub(crate) fn builtin_session_modes(
+    current: crate::session::plan_mode::PromptMode,
+) -> acp::SessionModeState {
+    acp::SessionModeState::new(
+        session_mode_id_from_prompt_mode(current),
+        vec![
+            acp::SessionMode::new(xai_grok_tools::types::SessionMode::Default.as_id(), "Agent"),
+            acp::SessionMode::new(xai_grok_tools::types::SessionMode::Plan.as_id(), "Plan"),
+            acp::SessionMode::new(xai_grok_tools::types::SessionMode::Ask.as_id(), "Ask"),
+        ],
+    )
+}
+
+/// Ask mode keeps the read-only capability set. Plan and agent keep the catalog they already had.
+pub(super) fn filter_tools_for_prompt_mode(
+    defs: Vec<ToolDefinition>,
+    kinds: &std::collections::HashMap<String, xai_grok_tools::types::tool::ToolKind>,
+    mode: crate::session::plan_mode::PromptMode,
+) -> Vec<ToolDefinition> {
+    if mode != crate::session::plan_mode::PromptMode::Ask {
+        return defs;
+    }
+    defs.into_iter()
+        .filter(|def| ask_mode_allows_kind(kinds.get(def.function.name.as_str()).copied()))
+        .collect()
+}
+
+/// `None` is fail-closed: an unclassified name is not offered or executed in ask mode.
+pub(super) fn ask_mode_allows_kind(kind: Option<xai_grok_tools::types::tool::ToolKind>) -> bool {
+    kind.is_some_and(|kind| xai_grok_workspace::capability::CapabilityMode::ReadOnly.allows(kind))
+}
 impl SessionActor {
     pub(super) fn apply_prompt_modes_to_snapshot(&self, snapshot: &mut TurnDeltaSnapshot) {
         snapshot.start_prompt_mode = Some(self.turn_start_prompt_mode.lock().to_string());
@@ -363,5 +402,13 @@ impl SessionActor {
             .notifications
             .persistence_tx
             .send(PersistenceMsg::PlanModeState(snapshot));
+    }
+
+    /// One reminder per user turn so the model sees why write tools are gone.
+    pub(super) fn inject_ask_mode_reminder(&self) {
+        if *self.current_prompt_mode.lock() != crate::session::plan_mode::PromptMode::Ask {
+            return;
+        }
+        self.push_system_reminder(ASK_MODE_REMINDER);
     }
 }
