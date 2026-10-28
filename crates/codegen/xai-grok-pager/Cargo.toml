@@ -167,6 +167,9 @@ urlencoding = { workspace = true }
 
 # Parsing (web_search)
 url = { workspace = true }
+# Grok Bot gateway client for `/bot` with `[bot] provider = "gateway"`.
+reqwest = { workspace = true }
+xai-grok-extra-ca = { workspace = true }
 
 # Crash diagnostics
 xai-crash-handler = { path = "../xai-crash-handler" }

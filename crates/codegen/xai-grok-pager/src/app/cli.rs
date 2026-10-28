@@ -515,8 +515,8 @@ pub struct PagerArgs {
     #[clap(long = "output-format", value_enum, default_value = "plain")]
     pub output_format: OutputFormat,
     /// Emit incremental `stream_event` lines (text/thinking deltas) alongside whole messages.
-    /// Only affects `--output-format streaming-messages-json`.
-    #[clap(long = "include-partial-messages")]
+    /// Only affects `--output-format streaming-messages-json` and `cursor-stream-json`.
+    #[clap(long = "include-partial-messages", alias = "stream-partial-output")]
     pub include_partial_messages: bool,
     /// JSON Schema for structured output. When set, the model is constrained to produce JSON matching this schema.
     /// Implies --output-format json.

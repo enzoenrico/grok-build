@@ -108,7 +108,7 @@ use super::transcript::{
     dispatch_copy_assistant_message, dispatch_copy_block_content, dispatch_copy_block_meta,
     dispatch_dump_input_log, dispatch_export_conversation, dispatch_open_block_viewer,
     dispatch_open_config_agents_modal, dispatch_open_extensions_modal,
-    dispatch_open_transcript_pager,
+    dispatch_open_transcript_pager, dispatch_show_changes,
 };
 use super::turn::{
     dispatch_cancel_scheduled_task, dispatch_cancel_turn, dispatch_cancel_turn_choice,
@@ -1125,6 +1125,7 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::ShowTasks => dispatch_show_tasks(app),
         Action::BotCommand(args) => dispatch_bot_command(app, args),
         Action::ShowPlan => dispatch_show_plan(app),
+        Action::ShowChanges => dispatch_show_changes(app),
         Action::EnterPlanMode { description } => dispatch_enter_plan_mode(app, description),
         Action::SetPlanMode(kind) => set_plan_mode(app, kind),
         Action::OpenFeedbackModal(open) => dispatch_open_feedback_modal(app, open),

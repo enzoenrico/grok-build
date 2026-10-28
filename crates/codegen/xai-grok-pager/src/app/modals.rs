@@ -189,6 +189,23 @@ impl AgentView {
             }
         }
 
+        if let ActiveModal::ChangeReview { review, .. } = modal {
+            use crate::views::change_review::ChangeReviewInput;
+            match review.handle_key(key) {
+                ChangeReviewInput::Changed => return InputOutcome::Changed,
+                ChangeReviewInput::Unchanged => return InputOutcome::Unchanged,
+                ChangeReviewInput::Close => {
+                    self.active_modal = None;
+                    return InputOutcome::Changed;
+                }
+                ChangeReviewInput::FollowUp(stub) => {
+                    self.active_modal = None;
+                    self.seed_change_follow_up(&stub);
+                    return InputOutcome::Changed;
+                }
+            }
+        }
+
         // RememberNoteReview: modal preview for # remember notes.
         if let ActiveModal::RememberNoteReview {
             ref mut scroll,
@@ -486,7 +503,8 @@ impl AgentView {
             | ActiveModal::Settings { .. }
             | ActiveModal::UsageInfo { .. }
             | ActiveModal::ResetSettingsConfirm { .. }
-            | ActiveModal::RememberNoteReview { .. } => unreachable!(),
+            | ActiveModal::RememberNoteReview { .. }
+            | ActiveModal::ChangeReview { .. } => unreachable!(),
         }
     }
 
@@ -1352,6 +1370,18 @@ impl AgentView {
             InputOutcome::Changed
         }
     }
+    /// Close-out of `/changes` `i`: put the follow-up stub in the composer and focus it, keeping any draft.
+    fn seed_change_follow_up(&mut self, stub: &str) {
+        let draft = self.prompt.text().trim_end().to_string();
+        let text = if draft.is_empty() {
+            stub.to_string()
+        } else {
+            format!("{draft} {stub}")
+        };
+        self.prompt.set_text(&text);
+        self.set_active_pane(super::agent_view::AgentPane::Prompt, true);
+    }
+
     /// Handle mouse events while a modal is active.
     /// Clicking a button acts like pressing that key.
     /// Hovering updates `modal_hovered_key` for highlight.
@@ -1375,6 +1405,7 @@ impl AgentView {
                     | ActiveModal::DocViewer { .. }
                     | ActiveModal::ShortcutsHelp { .. }
                     | ActiveModal::RememberNoteReview { .. }
+                    | ActiveModal::ChangeReview { .. }
             )
         ) {
             // Extract window for handle_modal_mouse.
@@ -1386,6 +1417,7 @@ impl AgentView {
                 Some(ActiveModal::DocViewer { window, .. }) => window,
                 Some(ActiveModal::ShortcutsHelp { window, .. }) => window,
                 Some(ActiveModal::RememberNoteReview { window, .. }) => window,
+                Some(ActiveModal::ChangeReview { window, .. }) => window,
                 _ => unreachable!(),
             };
             let outcome = mw::handle_modal_mouse(window, mouse.kind, mouse.column, mouse.row);
@@ -1449,7 +1481,11 @@ impl AgentView {
                     // DocViewer / RememberNoteReview: wheel scrolls the markdown body.
                     if let Some(
                         ActiveModal::DocViewer { scroll, .. }
-                        | ActiveModal::RememberNoteReview { scroll, .. },
+                        | ActiveModal::RememberNoteReview { scroll, .. }
+                        | ActiveModal::ChangeReview {
+                            review: crate::views::change_review::ChangeReview { scroll, .. },
+                            ..
+                        },
                     ) = self.active_modal.as_mut()
                     {
                         if modal::apply_doc_mouse_scroll(mouse.kind, scroll) {
@@ -2200,6 +2236,11 @@ impl AgentView {
                     cached_lines,
                     compact,
                     &theme,
+                );
+            } else if let modal::ActiveModal::ChangeReview { review, window } = active_modal {
+                let compact = self.scrollback.appearance().prompt.compact;
+                crate::views::change_review::render_change_review(
+                    buf, area, window, review, compact, &theme,
                 );
             } else if let modal::ActiveModal::RememberNoteReview {
                 ref raw_content,

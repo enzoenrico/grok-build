@@ -504,6 +504,10 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     if crate::permission::claude_settings::project_claude_settings_present(cwd) {
         hit!("claude");
     }
+    // Project `.cursor/cli.json` allow rules auto-approve tools, so a clone shipping only that file must still be gated
+    if crate::permission::cursor_cli::project_cursor_cli_present(cwd) {
+        hit!("permission");
+    }
     // Hooks resolve from the git worktree root, not cwd, so a hooks-only clone
     // must not resolve trusted. Presence is type-agnostic: a directory or
     // symlink at a vendor hook path must gate too.
@@ -512,6 +516,10 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
         || crate::util::path_present_or_uncertain(&hook_root.join(".cursor").join("hooks.json"))
     {
         hit!("hooks");
+    }
+    // `.cursor/worktrees.json` runs its commands when a worktree is created, and that only happens in a trusted folder
+    if crate::util::path_present_or_uncertain(&hook_root.join(".cursor").join("worktrees.json")) {
+        hit!("worktree-setup");
     }
     // Project PLUGIN dirs: project-scoped plugins fall under folder-trust too, so a repo-local plugin dir is repo-controlled code-exec (hooks/MCP)
     // Else a plugin clone (e.g. `.grok/plugins/evil/`, even one in a subdir launched via `cd sub && grok`) would resolve trusted and run ungated.
@@ -603,6 +611,36 @@ mod tests {
     fn repo_configs_present_false_when_empty() {
         let tmp = repo_tmp();
         assert!(!repo_configs_present(tmp.path()));
+    }
+
+    #[test]
+    fn repo_configs_present_detects_cursor_cli_permissions_from_subdir() {
+        let tmp = repo_tmp();
+        let cursor = tmp.path().join(".cursor");
+        std::fs::create_dir_all(&cursor).unwrap();
+        std::fs::write(
+            cursor.join("cli.json"),
+            r#"{"permissions": {"allow": ["Shell(curl)"]}}"#,
+        )
+        .unwrap();
+        let sub = tmp.path().join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(repo_configs_present(&sub));
+        assert_eq!(repo_config_kinds(&sub), vec!["permission"]);
+    }
+
+    #[test]
+    fn repo_configs_present_detects_cursor_worktree_setup() {
+        let tmp = repo_tmp();
+        let cursor = tmp.path().join(".cursor");
+        std::fs::create_dir_all(&cursor).unwrap();
+        std::fs::write(
+            cursor.join("worktrees.json"),
+            r#"{"setup-worktree": ["npm ci"]}"#,
+        )
+        .unwrap();
+        assert!(repo_configs_present(tmp.path()));
+        assert_eq!(repo_config_kinds(tmp.path()), vec!["worktree-setup"]);
     }
 
     #[test]

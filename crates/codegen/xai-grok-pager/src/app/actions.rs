@@ -695,6 +695,8 @@ pub enum Action {
     BotCommand(String),
     /// Show the current plan: preview popover if exists, toast if not.
     ShowPlan,
+    /// `/changes`: open the per-file review of this session's edit diffs.
+    ShowChanges,
     /// Enter plan mode. If a description is provided, also start a turn with that text as the prompt.
     EnterPlanMode {
         description: Option<String>,

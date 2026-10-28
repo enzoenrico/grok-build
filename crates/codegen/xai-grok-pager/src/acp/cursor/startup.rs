@@ -104,9 +104,14 @@ async fn list_sessions_inner(
 ) -> Result<Vec<CursorSession>> {
     let mut cmd = command.tokio_command(false);
     cmd.current_dir(cwd).stderr(Stdio::null());
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("failed to start {}", command.program.display()))?;
+    #[allow(clippy::disallowed_methods)] // enrolled in the session scope below
+    let spawned = cmd.spawn();
+    let mut child =
+        spawned.with_context(|| format!("failed to start {}", command.program.display()))?;
+    let _process_group = xai_tty_utils::global_process_scope()
+        .enroll(&child)
+        .inspect_err(|error| tracing::warn!(%error, "cursor chat list: agent left unenrolled"))
+        .ok();
     let mut stdin = child.stdin.take().context("cursor-agent stdin")?;
     let stdout = child.stdout.take().context("cursor-agent stdout")?;
 

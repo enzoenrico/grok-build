@@ -11,6 +11,7 @@ pub struct CompactCommand;
 impl SlashCommand for CompactCommand {
     slash_meta! {
         name: "compact",
+        aliases: ["compress"],
         description: "Compact conversation history",
         usage: "/compact",
         session_scoped: true,

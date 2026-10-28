@@ -5149,7 +5149,7 @@ pub(crate) fn execute(
             session,
         } => {
             tasks.spawn(async move {
-                let run = crate::bot::run_with_hub(session, input).await;
+                let run = crate::bot::run(session, input).await;
                 TaskResult::BotSubmit {
                     agent_id,
                     session: run.session,

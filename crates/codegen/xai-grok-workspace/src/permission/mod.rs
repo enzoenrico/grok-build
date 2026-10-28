@@ -2,6 +2,7 @@ pub mod auto_mode;
 pub use xai_grok_permission_rules::bash_command_splitting;
 use xai_grok_permission_rules::bash_permission_script;
 pub use xai_grok_permission_rules::claude_settings;
+pub use xai_grok_permission_rules::cursor_cli;
 use xai_grok_permission_rules::exec_risk;
 use xai_grok_permission_rules::gate_preflight;
 mod grants;

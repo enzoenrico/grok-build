@@ -191,6 +191,8 @@ Permission rules can be global (all projects), project-scoped (one repository), 
 | Global (all projects) | `~/.grok/config.toml` | No |
 | Project (committed) | `<project>/.grok/config.toml` | Yes (commit it) |
 | Project (personal) | `<project>/.claude/settings.local.json` | No (gitignore it) |
+| Global, from Cursor | `~/.cursor/cli-config.json` | No |
+| Project, from Cursor | `<project>/.cursor/cli.json` | Yes |
 | Interactive grants | Stored internally by Grok, per project | No |
 
 Notes on scoping:
@@ -306,6 +308,29 @@ Supported `defaultMode` values include `default`, `auto`, `acceptEdits`, `bypass
 - `permissions.additionalDirectories` is parsed but not supported.
 
 You can import existing Claude settings interactively with **Ctrl+I** ("Import Claude settings").
+
+### 4. Cursor CLI Compatibility (`.cursor/cli.json`)
+
+Grok reads the `permissions.allow` and `permissions.deny` lists from the Cursor CLI's `~/.cursor/cli-config.json`. A rule you allowed in the Cursor CLI is allowed in Grok, and a rule you denied stays denied.
+
+A project's `<project>/.cursor/cli.json` (from your working directory up to the repo root) is read only in a trusted folder. Because its `allow` rules can approve commands, the file makes Grok ask for folder trust, the same as a project `.grok/config.toml` with permission rules.
+
+| Cursor rule | Grok rule | Notes |
+|-------------|-----------|-------|
+| `Shell(git)` | `Bash(git)` | `Shell(curl:*)` becomes `Bash(curl)`, and `Shell(git:push*)` becomes `Bash(git push*)`. |
+| `Read(src/**)` | `Read(./src/**)` | An `allow` is rooted at your working directory, so `Read(*)` becomes `Read(./**)`. A `deny` is kept as written. |
+| `Write(**/.env*)` | `Edit(**/.env*)` | Rooted the same way as `Read`. |
+| `Mcp(github:get_issue)` | `MCPTool(github__get_issue)` | `Mcp(github:*)` covers every tool on the server. `Mcp(*:search)` covers `search` on every server. |
+| `WebFetch(*.example.com)` | `WebFetch(domain:example.com)` | Also matches `example.com` itself. |
+| `WebFetch(example.com)` | `https://example.com/*` and `http://example.com/*` for `allow`. `WebFetch(domain:example.com)` for `deny`. | An `allow` stays exact-host, so it does not allow `evil.example.com`. A `deny` also covers subdomains. |
+
+Grok matches a `Bash` rule against the whole command line, while Cursor matches the command name against the first word. Where that would make a Grok rule wider than the Cursor one, an `allow` is skipped and a `deny` keeps the wider form:
+
+- A glob in the command name, as in `Shell(*sh)`. The `allow` is skipped. The `deny` becomes `Bash(*sh)` plus `Bash(*sh *)`.
+- Exact arguments, as in `Shell(git:status)`. Grok would also allow `git status --porcelain`, so the `allow` is skipped. End the arguments with `*` to allow the prefix on purpose.
+- `WebFetch(*.www.example.com)`. Grok ignores a leading `www.`, so the `allow` would cover all of `example.com`. It is skipped.
+
+Entries with any other kind, or that do not parse, are skipped and listed in `grok inspect`. Cursor's `approvalMode` and other settings are not read.
 
 ---
 
@@ -556,7 +581,7 @@ Recommended combination for untrusted code:
 
 1. **Prefer narrow patterns.** `Bash(git *)` grants less access than a bare `Bash` allow rule.
 2. **Combine layers.** `dontAsk`, narrow allow rules, a restrictive hook, and the sandbox each restrict independently.
-3. **Review project configuration from unfamiliar sources.** Folder trust gates project permission rules in `.grok/config.toml` and `.claude/settings.json`, plus startup loading of project instructions and skills. Headless startup with these sources requires `--trust` or a prior grant. Review them and any project hooks before trusting an unfamiliar checkout (see [10-hooks.md](10-hooks.md)).
+3. **Review project configuration from unfamiliar sources.** Folder trust gates project permission rules in `.grok/config.toml`, `.claude/settings.json`, and `.cursor/cli.json`, the setup commands in `.cursor/worktrees.json`, plus startup loading of project instructions and skills. Headless startup with these sources requires `--trust` or a prior grant. Review them and any project hooks before trusting an unfamiliar checkout (see [10-hooks.md](10-hooks.md)).
 4. **Test your policy.** With `defaultMode: "dontAsk"` set (or your `PreToolUse` hook installed), run representative commands and confirm what is blocked.
 5. **Treat the read-only command list as a convenience, not a security boundary.**
 

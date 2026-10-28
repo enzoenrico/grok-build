@@ -301,6 +301,10 @@ Worktree sessions are managed internally through the `x.ai/git/worktree/*` exten
 
 Resume a session in a fresh worktree with `grok -w -r <session-id>`.
 
+If the repository has a Cursor `.cursor/worktrees.json`, Grok runs its setup in each new worktree, after the worktree is created and before the session starts. On macOS and Linux it uses `setup-worktree-unix`, and on Windows `setup-worktree-windows`, falling back to `setup-worktree`. A list runs as shell commands in order inside the new worktree. A string names a script relative to `.cursor/`. `ROOT_WORKTREE_PATH` points at the checkout the worktree came from, so `cp "$ROOT_WORKTREE_PATH/.env" .env` copies an ignored file across. The first failing command stops the setup. The worktree is kept, and the failure is reported as a creation warning.
+
+Setup is code from the repository, so it runs only when you have trusted the folder. A `.cursor/worktrees.json` makes Grok ask for folder trust like other repository configuration does (see [Permissions and safety](22-permissions-and-safety.md)).
+
 `grok worktree create [NAME]` creates the same worktree `grok -w [NAME]` would, without starting a session. It prints the directory the session would have opened in. That path is the only output on stdout, so `cd "$(grok worktree create my-fix)"` works. By default the worktree starts from HEAD with your uncommitted changes copied over. Pass `--ref <ref>` to start from a clean checkout of a branch, tag, or commit. If the new worktree lacks the directory you ran from, such as a `--ref` checkout that predates it or an ignored directory, the command prints the worktree root.
 
 ### Manage Grove redirections

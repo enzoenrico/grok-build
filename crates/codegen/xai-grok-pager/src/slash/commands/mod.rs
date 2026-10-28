@@ -5,6 +5,7 @@ pub mod auto;
 pub mod bot;
 pub mod btw;
 pub mod cd;
+pub mod changes;
 pub mod cloud;
 pub mod compact;
 pub mod compact_mode;
@@ -109,6 +110,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(memory_ops::DreamCommand),
         Arc::new(recap::RecapCommand),
         Arc::new(rewind::RewindCommand),
+        Arc::new(changes::ChangesCommand),
         Arc::new(jump::JumpCommand),
         Arc::new(expand::ExpandCommand),
         Arc::new(edit_prompt::EditPromptCommand),
@@ -720,6 +722,18 @@ mod tests {
             Some("recap"),
             "/summarize should alias /recap"
         );
+    }
+    #[test]
+    fn compress_aliases_compact_and_queues_the_compaction() {
+        let reg = CommandRegistry::new(builtin_commands());
+        let compress = reg.get("compress").expect("/compress is registered");
+        assert_eq!(compress.name(), "compact");
+        let models = ModelState::default();
+        let mut ctx = make_ctx(&models);
+        assert!(matches!(
+            compress.run(&mut ctx, ""),
+            CommandResult::QueueCommand(cmd) if cmd == "/compact"
+        ));
     }
     #[test]
     fn gboom_bare_invocation_opens_game() {

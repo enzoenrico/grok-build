@@ -27,8 +27,8 @@ Grok processes the prompt, runs any necessary tools, and prints the result to st
 | `-r, --resume <ID_OR_TITLE>` | Resume an existing session by ID, or by title for the current directory, ignoring letter case (a sole manually renamed match wins among duplicates; remaining duplicates error with their IDs; UUID-shaped values always take the ID path; scripts should prefer IDs) |
 | `-c, --continue`        | Continue the most recent session in current directory  |
 | `--cwd <PATH>`          | Set working directory                                 |
-| `--output-format <FMT>` | Output format: `plain`, `json`, `streaming-json`, `streaming-messages-json` |
-| `--include-partial-messages` | Emit raw `stream_event` deltas. Only affects `--output-format streaming-messages-json`; ignored (with a warning) otherwise. |
+| `--output-format <FMT>` | Output format: `plain` (alias `text`), `json`, `streaming-json`, `streaming-messages-json`, `cursor-stream-json` |
+| `--include-partial-messages` | Emit partial text deltas. Alias `--stream-partial-output`. Only affects `--output-format streaming-messages-json` and `cursor-stream-json`; ignored (with a warning) otherwise. |
 | `--yolo`                | Auto-approve all tool executions                      |
 | `--rules <TEXT>`        | Custom rules for the system prompt                    |
 | `--tools <TOOLS>`       | Allowlist of built-in tools (comma-separated). MCP meta-tools remain available unless denied. Headless only. |
@@ -116,7 +116,7 @@ grok -p "Build the project" --allow "Bash"
 
 ## Output Formats
 
-Headless mode supports four output formats, selected with `--output-format`.
+Headless mode supports five output formats, selected with `--output-format`.
 
 ### plain (default)
 
@@ -325,6 +325,25 @@ Fidelity caveats apply to a few fields.
 Like `streaming-json`, this stream is read only. Tool approvals and other bidirectional flows use the ACP interface (`grok agent`).
 
 ---
+
+### cursor-stream-json
+
+Newline-delimited JSON in the event shapes of the Cursor CLI's `--output-format stream-json`, so a script written against Cursor's headless output can read Grok's. Each line has a `type`, and every line after the first carries `session_id`.
+
+| Line | When | Fields |
+|------|------|--------|
+| `system` / `init` | Once, first | `apiKeySource` (`env` or `login`), `cwd`, `session_id`, `model`, `permissionMode` |
+| `user` | When the prompt is sent | `message.content`, the prompt's text blocks |
+| `assistant` | Once per message between tool calls, and at turn end | `message.content[0].text` |
+| `tool_call` / `started` | When a tool call starts | `call_id`, `tool_call` |
+| `tool_call` / `completed` | When it completes or fails | the same `call_id`, `tool_call` with its `result` |
+| `result` / `success` | Once, last | `duration_ms`, `duration_api_ms`, `result` (the full assistant text), `request_id` |
+
+A read is `tool_call.readToolCall.args.path` and a file edit is `tool_call.writeToolCall.args.path`. Every other tool is `tool_call.function` with `name` and `arguments`, a JSON string. A successful result is `result.success` with `content`, `isEmpty`, and `totalChars`, plus `totalLines` for reads. A failure is `result.error.message`.
+
+With `--stream-partial-output` (or `--include-partial-messages`), each text delta is also an `assistant` line with `timestamp_ms`. The flush before a tool call adds `model_call_id`. Keep only lines with `timestamp_ms` and no `model_call_id` to avoid duplicate text.
+
+Thinking is not emitted. On an error, the message goes to stderr, the stream ends without a `result` line, and the exit code is non-zero. Fields Cursor reports that Grok has no source for, such as `linesCreated` and `fileSize`, are omitted.
 
 ## Session Management in Headless Mode
 

@@ -1129,7 +1129,11 @@ impl AgentView {
                     return;
                 }
                 ActiveModal::DocViewer { scroll, .. }
-                | ActiveModal::RememberNoteReview { scroll, .. } => {
+                | ActiveModal::RememberNoteReview { scroll, .. }
+                | ActiveModal::ChangeReview {
+                    review: crate::views::change_review::ChangeReview { scroll, .. },
+                    ..
+                } => {
                     crate::views::modal::apply_doc_scroll_delta(scroll, lines);
                     return;
                 }

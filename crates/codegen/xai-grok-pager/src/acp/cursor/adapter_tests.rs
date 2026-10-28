@@ -660,6 +660,7 @@ fn installed_agent_accepts_the_bridge_initialize() {
     if !std::path::Path::new(&bin).exists() {
         return;
     }
+    #[allow(clippy::disallowed_methods)] // a test child, killed before the test returns
     let mut child = std::process::Command::new(&bin)
         .arg("acp")
         .stdin(std::process::Stdio::piped())

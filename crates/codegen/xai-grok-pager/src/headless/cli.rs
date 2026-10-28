@@ -8,6 +8,7 @@ use clap::ValueEnum;
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
     #[default]
+    #[value(alias = "text")]
     Plain,
     Json,
     /// NDJSON: one ACP session update per line, the agent's native format.
@@ -16,6 +17,9 @@ pub enum OutputFormat {
     /// NDJSON in the Anthropic Messages API wire format.
     #[value(name = "streaming-messages-json")]
     StreamingMessagesJson,
+    /// NDJSON in the Cursor CLI `--output-format stream-json` event shapes.
+    #[value(name = "cursor-stream-json")]
+    CursorStreamJson,
 }
 
 pub fn parse_json_schema(input: &str) -> anyhow::Result<serde_json::Value> {

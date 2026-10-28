@@ -26,7 +26,7 @@ Not `/config-agents` (alias `/agents`), which manages agent *definitions* and pe
 
 ### `/compact`
 
-Compress conversation history to reclaim context-window space.
+Compress conversation history to reclaim context-window space. `/compress` is an alias, matching the Cursor CLI.
 
 Grok also auto-compacts once the context window hits 85% (tune it with `[session] auto_compact_threshold_percent`).
 
@@ -46,6 +46,10 @@ Branch the current session into a new agent, keeping history up to this point.
 ### `/rewind` (alias: `/undo`)
 
 Roll the conversation back to an earlier turn and discard everything after it. `/undo` is the same command.
+
+### `/changes`
+
+Review the files the agent changed in this session, one file at a time, built from the edit diffs in the conversation. Files are listed in the order they were first edited, and repeated edits to one file are grouped under it. `←`/`→` (or `h`/`l`) switch files and wrap around, `↑`/`↓`, `PgUp`/`PgDn` scroll the diff, `i` closes the review and starts a follow-up prompt about the current file (`About <path>: `), and `Esc` or `q` closes it.
 
 ### `/copy`
 

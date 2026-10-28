@@ -25,6 +25,7 @@ use crate::session::git::{
 };
 
 mod create_root;
+mod cursor_setup;
 mod identity;
 mod strategy;
 
@@ -1084,7 +1085,8 @@ pub async fn create_worktree_async<N: WorktreeNotificationSender + Clone + 'stat
     if !claim_worktree_in_progress(&session_id).await {
         return;
     }
-    let result = create_worktree_streaming(&req, &notifier).await;
+    let mut result = create_worktree_streaming(&req, &notifier).await;
+    cursor_worktree_setup_for_status(&req.source_path, &mut result, &notifier).await;
     mark_worktree_complete(&session_id).await;
 
     let should_copy_ignored_in_background =
@@ -1113,6 +1115,70 @@ pub async fn create_worktree_async<N: WorktreeNotificationSender + Clone + 'stat
             )
             .await;
         });
+    }
+}
+
+/// Runs `.cursor/worktrees.json` setup in a new worktree and returns a warning when it was skipped or failed; the worktree stays.
+/// `announce` runs only when there is setup to run. `source` is the checkout the worktree came from and `root` its git root.
+async fn cursor_worktree_setup(
+    worktree: &Path,
+    source: &Path,
+    root: &Path,
+    announce: impl std::future::Future<Output = ()>,
+) -> Option<String> {
+    let steps = match cursor_setup::load(worktree, root) {
+        Ok(Some(steps)) => steps,
+        Ok(None) => return None,
+        Err(e) => return Some(format!(".cursor/worktrees.json not run: {e}")),
+    };
+    let trusted = crate::folder_trust::folder_trust_inert()
+        || crate::folder_trust::is_trusted_this_process(&crate::trust::workspace_key(source));
+    if !trusted {
+        return Some(
+            ".cursor/worktrees.json not run: the source folder is not trusted. Trust it, then recreate the worktree."
+                .to_string(),
+        );
+    }
+    announce.await;
+    cursor_setup::run(&steps, worktree, root)
+        .await
+        .err()
+        .map(|e| format!(".cursor/worktrees.json setup failed: {e}"))
+}
+
+/// [`cursor_worktree_setup`] for a `Created` status, recording any warning on it.
+async fn cursor_worktree_setup_for_status<N: WorktreeNotificationSender>(
+    source_path: &str,
+    result: &mut WorktreeStatus,
+    notifier: &N,
+) {
+    let WorktreeStatus::Created {
+        session_id,
+        worktree_path,
+        source_git_root,
+        copied_changes,
+        ..
+    } = result
+    else {
+        return;
+    };
+    let announce = notifier.send_worktree_status(WorktreeStatus::Progress {
+        session_id: session_id.clone(),
+        message: "Running .cursor/worktrees.json setup".to_string(),
+    });
+    let warning = cursor_worktree_setup(
+        Path::new(worktree_path.as_str()),
+        Path::new(source_path),
+        Path::new(source_git_root.as_deref().unwrap_or(source_path)),
+        announce,
+    )
+    .await;
+    if let Some(warning) = warning {
+        tracing::warn!(target: WORKTREE_LOG, session_id = %session_id, "{warning}");
+        copied_changes
+            .get_or_insert_with(CopiedChangesSummary::default)
+            .warnings
+            .push(warning);
     }
 }
 
@@ -1867,7 +1933,8 @@ pub async fn create_worktree_from_worktree_async<N: WorktreeNotificationSender>(
         return;
     }
     let pinned_path = req.resolved_dest_path.take();
-    let result = create_worktree_from_worktree_streaming(&req, &notifier, pinned_path).await;
+    let mut result = create_worktree_from_worktree_streaming(&req, &notifier, pinned_path).await;
+    cursor_worktree_setup_for_status(&req.source_worktree_path, &mut result, &notifier).await;
     mark_worktree_complete(&session_id).await;
     notifier.send_worktree_status(result).await;
 }
@@ -2447,13 +2514,28 @@ pub async fn create_worktree_from_worktree_sync(
         0
     };
 
-    let copied_changes = CopiedChangesSummary {
+    let mut copied_changes = CopiedChangesSummary {
         staged_copied: report.unignored_copy.files_copied as u32,
         modified_copied: dirty_modified,
         untracked_copied: ignored_files_copied + dirty_untracked,
         deletions_applied: dirty_deleted,
         warnings,
     };
+    let setup_warning = cursor_worktree_setup(
+        &report.worktree_path,
+        source_path,
+        Path::new(
+            source_git_root
+                .as_deref()
+                .unwrap_or(&req.source_worktree_path),
+        ),
+        std::future::ready(()),
+    )
+    .await;
+    if let Some(warning) = setup_warning {
+        tracing::warn!(target: WORKTREE_LOG, session_id = %req.new_session_id, "{warning}");
+        copied_changes.warnings.push(warning);
+    }
 
     Ok(CreateWorktreeFromWorktreeResponse {
         status: "created".to_string(),
@@ -4080,6 +4162,52 @@ mod tests {
     #[async_trait::async_trait]
     impl WorktreeNotificationSender for NoopNotifier {
         async fn send_worktree_status(&self, _progress: WorktreeStatus) {}
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cursor_worktree_setup_runs_and_a_failure_becomes_a_created_warning() {
+        let src = tempfile::TempDir::new().unwrap();
+        let wt = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(src.path().join(".cursor")).unwrap();
+        std::fs::write(
+            src.path().join(".cursor").join("worktrees.json"),
+            r#"{"setup-worktree": ["touch ran.txt", "exit 4"]}"#,
+        )
+        .unwrap();
+        let req = CreateWorktreeRequest {
+            session_id: "cursor-setup".into(),
+            source_path: src.path().to_string_lossy().into_owned(),
+            worktree_path: None,
+            copy_mode: WorktreeCopyMode::Clean,
+            git_ref: None,
+            copy_ignored_in_background: false,
+            ignored_skip_patterns: vec![],
+            worktree_type: None,
+            label: None,
+            grove_worktree: None,
+            grove_gate_source: None,
+            resolved_source_git_root: None,
+        };
+        let mut status = WorktreeStatus::Created {
+            session_id: "cursor-setup".into(),
+            worktree_path: wt.path().to_string_lossy().into_owned(),
+            commit: "abc".into(),
+            source_git_root: None,
+            copied_changes: None,
+            strategy: None,
+        };
+        cursor_worktree_setup_for_status(&req.source_path, &mut status, &NoopNotifier).await;
+        assert!(
+            wt.path().join("ran.txt").exists(),
+            "setup ran in the worktree"
+        );
+        let WorktreeStatus::Created { copied_changes, .. } = status else {
+            panic!("setup failure must not turn creation into an error");
+        };
+        let warnings = copied_changes.expect("a warning is recorded").warnings;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("exit 4"), "{warnings:?}");
     }
 
     #[tokio::test]

@@ -326,6 +326,11 @@ pub enum ActiveModal {
         /// It keeps stale results from populating a different note's review modal.
         rewrite_nonce: u64,
     },
+    /// `/changes`: per-file review of the diffs the agent made this session.
+    ChangeReview {
+        review: crate::views::change_review::ChangeReview,
+        window: ModalWindowState,
+    },
 }
 /// Snapshot of the command palette state, saved when opening an arg picker and restored on Esc.
 #[derive(Debug, Clone)]
@@ -667,7 +672,8 @@ impl ActiveModal {
             | ActiveModal::MemoryBrowser { .. }
             | ActiveModal::Settings { .. }
             | ActiveModal::UsageInfo { .. }
-            | ActiveModal::RememberNoteReview { .. } => vec![],
+            | ActiveModal::RememberNoteReview { .. }
+            | ActiveModal::ChangeReview { .. } => vec![],
         }
     }
     pub fn message(&self, drain_blocked: bool) -> &str {
@@ -698,6 +704,7 @@ impl ActiveModal {
             ActiveModal::Settings { .. } => crate::views::settings_modal::MODAL_TITLE,
             ActiveModal::ResetSettingsConfirm { .. } => "Reset setting?",
             ActiveModal::RememberNoteReview { .. } => "Memory Note",
+            ActiveModal::ChangeReview { .. } => "Changes",
             ActiveModal::UsageInfo { .. } => "Usage",
         }
     }
