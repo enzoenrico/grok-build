@@ -192,7 +192,7 @@ Permission rules can be global (all projects), project-scoped (one repository), 
 | Project (committed) | `<project>/.grok/config.toml` | Yes (commit it) |
 | Project (personal) | `<project>/.claude/settings.local.json` | No (gitignore it) |
 | Global, from Cursor | `~/.cursor/cli-config.json` | No |
-| Project deny, from Cursor | `<project>/.cursor/cli.json` | Yes |
+| Project, from Cursor | `<project>/.cursor/cli.json` | Yes |
 | Interactive grants | Stored internally by Grok, per project | No |
 
 Notes on scoping:
@@ -313,7 +313,7 @@ You can import existing Claude settings interactively with **Ctrl+I** ("Import C
 
 Grok reads the `permissions.allow` and `permissions.deny` lists from the Cursor CLI's `~/.cursor/cli-config.json`. A rule you allowed in the Cursor CLI is allowed in Grok, and a rule you denied stays denied.
 
-A project's `<project>/.cursor/cli.json` (from your working directory up to the repo root) contributes only its `deny` rules, and only in a trusted folder. Its `allow` rules are not loaded, because a cloned repository could otherwise approve its own commands. They show up as skipped in `grok inspect`. Move rules you want to keep into `~/.cursor/cli-config.json` or `.grok/config.toml`.
+A project's `<project>/.cursor/cli.json` (from your working directory up to the repo root) is read only in a trusted folder. Because its `allow` rules can approve commands, the file makes Grok ask for folder trust, the same as a project `.grok/config.toml` with permission rules.
 
 | Cursor rule | Grok rule | Notes |
 |-------------|-----------|-------|
@@ -581,7 +581,7 @@ Recommended combination for untrusted code:
 
 1. **Prefer narrow patterns.** `Bash(git *)` grants less access than a bare `Bash` allow rule.
 2. **Combine layers.** `dontAsk`, narrow allow rules, a restrictive hook, and the sandbox each restrict independently.
-3. **Review project configuration from unfamiliar sources.** Folder trust gates project permission rules in `.grok/config.toml` and `.claude/settings.json`, plus startup loading of project instructions and skills. Headless startup with these sources requires `--trust` or a prior grant. Review them and any project hooks before trusting an unfamiliar checkout (see [10-hooks.md](10-hooks.md)).
+3. **Review project configuration from unfamiliar sources.** Folder trust gates project permission rules in `.grok/config.toml`, `.claude/settings.json`, and `.cursor/cli.json`, the setup commands in `.cursor/worktrees.json`, plus startup loading of project instructions and skills. Headless startup with these sources requires `--trust` or a prior grant. Review them and any project hooks before trusting an unfamiliar checkout (see [10-hooks.md](10-hooks.md)).
 4. **Test your policy.** With `defaultMode: "dontAsk"` set (or your `PreToolUse` hook installed), run representative commands and confirm what is blocked.
 5. **Treat the read-only command list as a convenience, not a security boundary.**
 

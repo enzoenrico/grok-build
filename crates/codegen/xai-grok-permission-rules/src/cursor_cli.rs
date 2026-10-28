@@ -2,8 +2,8 @@
 //! `~/.cursor/cli-config.json` and `<project>/.cursor/cli.json` hold `permissions.allow` / `permissions.deny` lists of
 //! `Shell(..)`, `Read(..)`, `Write(..)`, `WebFetch(..)`, and `Mcp(server:tool)` entries. Deny beats allow in both engines.
 //!
-//! A project file contributes deny rules only. The folder-trust gate does not yet count `.cursor/cli.json` as a
-//! trust-sensitive config, so a clone shipping only that file resolves trusted; its allows would auto-approve tools.
+//! A project file loads only in a trusted folder; [`project_cursor_cli_present`] is the folder-trust gate's probe, so a
+//! clone shipping one cannot approve its own commands without a trust decision.
 
 use std::path::{Path, PathBuf};
 
@@ -14,15 +14,7 @@ use crate::types::{
     PatternMode, PermissionRule, RequirementSource, RuleAction, Sourced, ToolFilter,
 };
 
-const PROJECT_ALLOW_SKIP_REASON: &str = "allow rules from a project .cursor/cli.json are not loaded; add them to ~/.cursor/cli-config.json or .grok/config.toml";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tier {
-    User,
-    Project,
-}
-
-/// Rules from `~/.cursor/cli-config.json` and, when `project_trusted`, the deny rules of each `.cursor/cli.json` from `cwd` up to the repo root.
+/// Rules from `~/.cursor/cli-config.json` and, when `project_trusted`, each `.cursor/cli.json` from `cwd` up to the repo root.
 pub(crate) fn load_cursor_cli_permissions(
     cwd: &Path,
     project_trusted: bool,
@@ -31,19 +23,22 @@ pub(crate) fn load_cursor_cli_permissions(
     let mut skipped = Vec::new();
     let mut files = Vec::new();
     if let Some(home) = xai_dirs::home_dir() {
-        files.push((home.join(".cursor").join("cli-config.json"), Tier::User));
+        files.push(home.join(".cursor").join("cli-config.json"));
     }
     if project_trusted {
-        files.extend(
-            project_cli_json_paths(cwd)
-                .into_iter()
-                .map(|path| (path, Tier::Project)),
-        );
+        files.extend(project_cli_json_paths(cwd));
     }
-    for (path, tier) in files {
-        load_file(&path, tier, &mut rules, &mut skipped);
+    for path in files {
+        load_file(&path, &mut rules, &mut skipped);
     }
     (rules, skipped)
+}
+
+/// Whether a project `.cursor/cli.json` exists on the walk the loader reads; the folder-trust gate shares it so they cannot drift.
+pub fn project_cursor_cli_present(cwd: &Path) -> bool {
+    project_cli_json_paths(cwd)
+        .iter()
+        .any(|p| crate::util::path_present_or_uncertain(p))
 }
 
 /// `.cursor/cli.json` in `cwd` and each parent up to the repo root, cwd first. Outside a repo only `cwd` is probed.
@@ -65,7 +60,6 @@ fn project_cli_json_paths(cwd: &Path) -> Vec<PathBuf> {
 
 fn load_file(
     path: &Path,
-    tier: Tier,
     rules: &mut Vec<Sourced<PermissionRule>>,
     skipped: &mut Vec<SkippedPermission>,
 ) {
@@ -99,13 +93,6 @@ fn load_file(
                 });
                 continue;
             };
-            if tier == Tier::Project && action == RuleAction::Allow {
-                skipped.push(SkippedPermission {
-                    rule: format!("permissions.{label}: {entry}"),
-                    reason: PROJECT_ALLOW_SKIP_REASON.to_string(),
-                });
-                continue;
-            }
             match translate(entry, action) {
                 Ok(translated) => rules.extend(translated.into_iter().map(|rule| Sourced {
                     value: rule,

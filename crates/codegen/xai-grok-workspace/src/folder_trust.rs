@@ -504,6 +504,10 @@ fn collect_repo_config_kinds(cwd: &Path, first_only: bool) -> Vec<&'static str> 
     if crate::permission::claude_settings::project_claude_settings_present(cwd) {
         hit!("claude");
     }
+    // Project `.cursor/cli.json` allow rules auto-approve tools, so a clone shipping only that file must still be gated
+    if crate::permission::cursor_cli::project_cursor_cli_present(cwd) {
+        hit!("permission");
+    }
     // Hooks resolve from the git worktree root, not cwd, so a hooks-only clone
     // must not resolve trusted. Presence is type-agnostic: a directory or
     // symlink at a vendor hook path must gate too.
@@ -607,6 +611,22 @@ mod tests {
     fn repo_configs_present_false_when_empty() {
         let tmp = repo_tmp();
         assert!(!repo_configs_present(tmp.path()));
+    }
+
+    #[test]
+    fn repo_configs_present_detects_cursor_cli_permissions_from_subdir() {
+        let tmp = repo_tmp();
+        let cursor = tmp.path().join(".cursor");
+        std::fs::create_dir_all(&cursor).unwrap();
+        std::fs::write(
+            cursor.join("cli.json"),
+            r#"{"permissions": {"allow": ["Shell(curl)"]}}"#,
+        )
+        .unwrap();
+        let sub = tmp.path().join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(repo_configs_present(&sub));
+        assert_eq!(repo_config_kinds(&sub), vec!["permission"]);
     }
 
     #[test]

@@ -2170,9 +2170,9 @@ fn cursor_catchall_allows_dropped_under_pin() {
     assert_eq!(pinned.skipped.iter().filter(|s| s.reason == PIN).count(), 3);
 }
 
-/// End-to-end: a project `.cursor/cli.json` contributes deny rules only, and nothing at all when the folder is untrusted.
+/// End-to-end: a project `.cursor/cli.json` loads allow and deny rules in a trusted folder, and nothing when untrusted.
 #[test]
-fn cursor_project_cli_json_loads_deny_only_and_only_when_trusted() {
+fn cursor_project_cli_json_loads_only_when_trusted() {
     use crate::policy::CompiledPolicy;
     use crate::types::{AccessKind, Decision};
 
@@ -2182,26 +2182,22 @@ fn cursor_project_cli_json_loads_deny_only_and_only_when_trusted() {
     std::fs::create_dir_all(&cursor_dir).unwrap();
     std::fs::write(
         cursor_dir.join("cli.json"),
-        r#"{"permissions": {"allow": ["Shell(curl)"], "deny": ["Read(.env*)"]}}"#,
+        r#"{"permissions": {"allow": ["Shell(cargo test)"], "deny": ["Read(.env*)"]}}"#,
     )
     .unwrap();
-    let curl = AccessKind::Bash("curl evil.sh".into());
+    assert!(crate::cursor_cli::project_cursor_cli_present(
+        project.path()
+    ));
+    let tests = AccessKind::Bash("cargo test -p foo".into());
     let env = AccessKind::Read(Some(".env".into()));
 
-    let resolved = block_on(resolve_permissions_with_provenance_inner(
+    let trusted = block_on(resolve_permissions_with_provenance_inner(
         project.path(),
         inputs_trusted(None, true),
     ))
-    .expect("project deny resolves");
-    assert!(
-        resolved
-            .skipped
-            .iter()
-            .any(|s| s.rule.contains("Shell(curl)") && s.reason.contains("not loaded")),
-        "the project allow is recorded as skipped"
-    );
-    let policy = CompiledPolicy::new(resolved.config);
-    assert_ne!(policy.evaluate(&curl), Some(Decision::Allow));
+    .expect("project rules resolve");
+    let policy = CompiledPolicy::new(trusted.config);
+    assert_eq!(policy.evaluate(&tests), Some(Decision::Allow));
     assert!(matches!(
         policy.evaluate(&env),
         Some(Decision::Reject(_) | Decision::PolicyDeny(_))
