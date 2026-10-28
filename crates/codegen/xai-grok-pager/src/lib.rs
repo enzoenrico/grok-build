@@ -16,6 +16,8 @@ pub mod app;
 pub mod best_effort_stderr;
 pub mod bot;
 pub mod client_identity;
+pub mod grokbot_cmd;
+pub mod grokbot_http;
 pub mod completions_cmd;
 mod config_toml_edit;
 pub mod diagnostics;

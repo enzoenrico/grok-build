@@ -50,6 +50,8 @@ pub enum Command {
     Models,
     /// List, search, or restore sessions
     Sessions(crate::sessions_cmd::SessionsArgs),
+    /// Call a GrokBot gateway over HTTP. Separate from `/bot`, which uses the computer hub.
+    Grokbot(crate::grokbot_cmd::GrokbotArgs),
     /// Print persisted token and cost usage for a session
     Usage(crate::usage_cmd::UsageArgs),
     /// Fetch and install managed configuration
