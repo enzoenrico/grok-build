@@ -42,6 +42,7 @@ xai-grok-mermaid = { workspace = true }
 syntect = { workspace = true }
 
 # Data
+reqwest = { workspace = true }
 similar = { workspace = true }
 indexmap = { workspace = true }
 blake3 = { workspace = true }
