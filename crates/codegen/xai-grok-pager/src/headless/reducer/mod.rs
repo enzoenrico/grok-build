@@ -9,9 +9,11 @@ use serde_json::{Value, json};
 use crate::headless::OutputFormat;
 
 mod acp;
+mod cursor;
 mod messages;
 
 use self::acp::AcpReducer;
+use self::cursor::CursorReducer;
 use self::messages::MessagesReducer;
 use xai_grok_shell::extensions::notification::ResponseUsage;
 
@@ -410,6 +412,11 @@ pub(crate) trait Reducer {
         Vec::new()
     }
 
+    /// Lines for the prompt as it is sent.
+    fn prompt_sent(&mut self, _blocks: &[proto::ContentBlock]) -> Vec<Value> {
+        Vec::new()
+    }
+
     fn reduce(&mut self, event: StreamEvent) -> Vec<Value>;
 
     fn max_turns(&mut self) -> Vec<Value> {
@@ -433,6 +440,7 @@ pub(crate) fn reducer_for(format: OutputFormat) -> Option<Box<dyn Reducer>> {
     match format {
         OutputFormat::StreamingJson => Some(Box::new(AcpReducer)),
         OutputFormat::StreamingMessagesJson => Some(Box::new(MessagesReducer::new())),
+        OutputFormat::CursorStreamJson => Some(Box::new(CursorReducer::new())),
         OutputFormat::Plain | OutputFormat::Json => None,
     }
 }

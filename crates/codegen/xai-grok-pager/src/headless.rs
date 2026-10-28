@@ -203,10 +203,20 @@ impl HeadlessEmitter {
         match self.format {
             OutputFormat::Plain => eprint_line(&event.plain_message()),
             OutputFormat::Json => {}
-            OutputFormat::StreamingJson | OutputFormat::StreamingMessagesJson => {
+            OutputFormat::StreamingJson
+            | OutputFormat::StreamingMessagesJson
+            | OutputFormat::CursorStreamJson => {
                 self.reduce_and_emit(StreamEvent::Lifecycle(event));
             }
         }
+    }
+    /// Emit the reducer's lines for the prompt as it is sent.
+    fn on_prompt_sent(&mut self, blocks: &[acp::ContentBlock]) {
+        let Some(reducer) = self.reducer.as_mut() else {
+            return;
+        };
+        let lines = reducer.prompt_sent(blocks);
+        self.emit_lines(lines);
     }
     /// Fold one event through the reducer and emit its lines; a no-op for `plain`/`json`.
     fn reduce_and_emit(&mut self, event: StreamEvent) {
@@ -251,7 +261,7 @@ impl HeadlessEmitter {
             OutputFormat::Json => {
                 self.text_buffer.push_str(text);
             }
-            OutputFormat::StreamingMessagesJson => {
+            OutputFormat::StreamingMessagesJson | OutputFormat::CursorStreamJson => {
                 self.text_buffer.push_str(text);
                 self.reduce_and_emit(StreamEvent::AgentMessage(text.to_string()));
             }
@@ -266,7 +276,9 @@ impl HeadlessEmitter {
             OutputFormat::Json => {
                 self.thought_buffer.push_str(text);
             }
-            OutputFormat::StreamingJson | OutputFormat::StreamingMessagesJson => {
+            OutputFormat::StreamingJson
+            | OutputFormat::StreamingMessagesJson
+            | OutputFormat::CursorStreamJson => {
                 self.reduce_and_emit(StreamEvent::AgentThought(text.to_string()));
             }
         }
@@ -320,7 +332,9 @@ impl HeadlessEmitter {
                 rendered.push('\n');
                 let _ = self.write_out(rendered.as_bytes(), false);
             }
-            OutputFormat::StreamingJson | OutputFormat::StreamingMessagesJson => {
+            OutputFormat::StreamingJson
+            | OutputFormat::StreamingMessagesJson
+            | OutputFormat::CursorStreamJson => {
                 let usage = self.usage.clone();
                 let structured_output = self.resolved_structured_output();
                 let result_text = self.text_buffer.clone();
@@ -348,7 +362,9 @@ impl HeadlessEmitter {
         match self.format {
             OutputFormat::Plain => eprint_line("Max turns reached"),
             OutputFormat::Json => {}
-            OutputFormat::StreamingJson | OutputFormat::StreamingMessagesJson => {
+            OutputFormat::StreamingJson
+            | OutputFormat::StreamingMessagesJson
+            | OutputFormat::CursorStreamJson => {
                 let lines = self.reducer.as_mut().map(|reducer| reducer.max_turns());
                 if let Some(lines) = lines {
                     self.emit_lines(lines);
@@ -359,7 +375,7 @@ impl HeadlessEmitter {
     /// Emit the terminal error; `stop_reason_override` stamps a Messages stop reason (e.g. `max_tokens`).
     fn on_error(&mut self, message: &str, stop_reason_override: Option<&str>) {
         match self.format {
-            OutputFormat::Plain => eprint_line(message),
+            OutputFormat::Plain | OutputFormat::CursorStreamJson => eprint_line(message),
             OutputFormat::Json => {
                 let mut err = serde_json::json!({"type":"error","message": message});
                 if let Some(usage) = &self.usage {
@@ -863,10 +879,13 @@ pub async fn run_single_turn(
     };
     let mut emitter = HeadlessEmitter::new(options.output_format, options.json_schema.is_some());
     if options.include_partial_messages
-        && options.output_format != OutputFormat::StreamingMessagesJson
+        && !matches!(
+            options.output_format,
+            OutputFormat::StreamingMessagesJson | OutputFormat::CursorStreamJson
+        )
     {
         eprint_line(
-            "warning: --include-partial-messages only affects --output-format streaming-messages-json; ignoring it",
+            "warning: --include-partial-messages only affects --output-format streaming-messages-json and cursor-stream-json; ignoring it",
         );
     }
     let t_spawn = Instant::now();
@@ -1228,6 +1247,7 @@ pub async fn run_single_turn(
     let (prompt_fut, mut prompt_ack) = match prompt {
         Some(prompt) => {
             let prompt_blocks = prompt.into_content_blocks();
+            emitter.on_prompt_sent(&prompt_blocks);
             let mut meta = serde_json::Map::new();
             if verbatim {
                 meta.insert("verbatim".to_string(), serde_json::Value::Bool(true));
